@@ -1326,13 +1326,13 @@ fn resolve_chat_template_overrides(model_path: &str) -> Option<String> {
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = hipfire_config::home_dir() {
         let basename = std::path::Path::new(model_path)
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
         if !basename.is_empty() {
-            let per_model = std::path::Path::new(&home)
+            let per_model = home
                 .join(".hipfire")
                 .join("templates")
                 .join(format!("{basename}.j2"));

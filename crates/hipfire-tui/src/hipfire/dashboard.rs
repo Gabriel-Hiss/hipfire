@@ -352,7 +352,7 @@ fn kernel_cache_dir() -> Option<PathBuf> {
     if let Some(v) = env::var_os("HIPFIRE_KERNEL_CACHE") {
         return Some(PathBuf::from(v));
     }
-    let home = env::var_os("HOME").map(PathBuf::from)?;
+    let home = hipfire_config::home_dir()?;
     let primary = home.join(".hipfire_kernels");
     if primary.exists() {
         return Some(primary);

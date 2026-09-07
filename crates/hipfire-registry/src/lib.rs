@@ -544,7 +544,7 @@ impl RegistryPaths {
     pub fn discover() -> Self {
         let root = env::var_os("HIPFIRE_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
+            .or_else(|| hipfire_config::home_dir().map(|home| home.join(".hipfire")))
             .unwrap_or_else(|| PathBuf::from(".hipfire"));
         Self {
             cache: root.join("registry.cache.json"),

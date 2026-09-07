@@ -22,6 +22,34 @@ use thiserror::Error;
 
 pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 
+/// The user's home directory, or `None` when the host exposes no usable one.
+///
+/// `HOME` stays authoritative on every platform, including Windows where
+/// MSYS/Git-Bash shells and CI runners set it deliberately. Windows then falls
+/// back to `USERPROFILE` and finally `HOMEDRIVE` + `HOMEPATH`, because a plain
+/// `cmd.exe` or PowerShell session sets none of the POSIX variables. Without
+/// that fallback every `~/.hipfire` path degrades to a CWD-relative
+/// `.hipfire`, so `hipfire pull` writes models into whatever directory the user
+/// happened to be standing in and the daemon looks for them somewhere else.
+pub fn home_dir() -> Option<PathBuf> {
+    if let Some(home) = env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    {
+        if let Some(profile) = env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(profile));
+        }
+        let drive = env::var_os("HOMEDRIVE").filter(|v| !v.is_empty())?;
+        let path = env::var_os("HOMEPATH").filter(|v| !v.is_empty())?;
+        let mut joined = std::ffi::OsString::from(drive);
+        joined.push(path);
+        Some(PathBuf::from(joined))
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("unknown configuration key '{0}'")]
@@ -470,8 +498,8 @@ fn valid_advanced_kv(value: &str) -> bool {
 
 fn expand_tilde(value: &str) -> PathBuf {
     if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = home_dir() {
+            return home.join(rest);
         }
     }
     PathBuf::from(value)
@@ -3472,7 +3500,7 @@ impl ConfigPaths {
     pub fn discover() -> Self {
         let root = env::var_os("HIPFIRE_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
+            .or_else(|| home_dir().map(|home| home.join(".hipfire")))
             .unwrap_or_else(|| PathBuf::from(".hipfire"));
         let mut paths = Self::under(root);
         if let Some(models) = env::var_os("HIPFIRE_MODELS_DIR") {

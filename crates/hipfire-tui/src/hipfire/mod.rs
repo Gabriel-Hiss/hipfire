@@ -29,7 +29,7 @@ pub fn native_cli_path() -> Option<PathBuf> {
     }
     let home = env::var_os("HIPFIRE_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
+        .or_else(|| hipfire_config::home_dir().map(|home| home.join(".hipfire")))
         .unwrap_or_else(|| PathBuf::from(".hipfire"));
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target");
     let sibling = env::current_exe()
@@ -68,7 +68,7 @@ impl HipfirePaths {
     pub fn discover() -> Self {
         let root = env::var_os("HIPFIRE_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
+            .or_else(|| hipfire_config::home_dir().map(|home| home.join(".hipfire")))
             .unwrap_or_else(|| PathBuf::from(".hipfire"));
         let models = env::var_os("HIPFIRE_MODELS_DIR")
             .map(PathBuf::from)
