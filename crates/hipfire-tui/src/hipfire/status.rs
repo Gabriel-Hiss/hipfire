@@ -4,6 +4,9 @@
 
 use std::{fs, process::Stdio};
 
+#[cfg(windows)]
+use std::process::Command;
+
 use anyhow::{anyhow, Result};
 
 use super::{dashboard::Dashboard, HipfirePaths};
@@ -19,19 +22,18 @@ pub struct StatusState {
 }
 
 impl StatusState {
-    /// Load ONLY the fast local state — pure file I/O (serve.pid read + `~/.hipfire`
-    /// path-existence checks). Performs NO network (/health) or hardware (lspci)
-    /// probe, so it is safe to call synchronously on the UI thread (startup and
-    /// the `r` reload). The live fields (`serve_http_ok`, `health_text`,
-    /// `gpu_lines`) start empty and are filled in by [`StatusState::overlay_live`]
-    /// from the background `DashboardWorker` snapshot.
+    /// Load ONLY fast local state — `serve.pid`, path-existence checks, and a
+    /// one-shot local PID lookup. It performs NO network (/health) or hardware
+    /// (lspci) probe, so it is safe to call synchronously on startup and `r`;
+    /// the timer-driven dashboard worker never calls this path. The live fields
+    /// (`serve_http_ok`, `health_text`, `gpu_lines`) start empty and are filled
+    /// in by [`StatusState::overlay_live`] from the background
+    /// `DashboardWorker` snapshot.
     pub fn load_local(paths: &HipfirePaths) -> Self {
         let serve_pid = fs::read_to_string(&paths.serve_pid)
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
-        let serve_pid_alive = serve_pid
-            .map(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists())
-            .unwrap_or(false);
+        let serve_pid_alive = serve_pid.map(serve_pid_alive).unwrap_or(false);
         let paths_ok = vec![
             ("~/.hipfire".into(), paths.root.exists()),
             ("models".into(), paths.models.exists()),
@@ -86,6 +88,50 @@ impl StatusState {
     }
 }
 
+/// Return whether a PID is still present without depending on platform FFI.
+///
+/// Windows has no `/proc`; `tasklist` filters locally and emits the matching
+/// process as CSV. This runs only for startup/manual local-state refreshes, not
+/// the timer-driven dashboard worker, avoiding a subprocess per dashboard tick.
+fn serve_pid_alive(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| tasklist_has_pid(&output.stdout, pid))
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+}
+
+#[cfg(windows)]
+fn tasklist_has_pid(stdout: &[u8], pid: u32) -> bool {
+    let expected = format!("\"{pid}\"");
+    stdout.split(|&byte| byte == b'\n').any(|line| {
+        line.split(|&byte| byte == b',')
+            .nth(1)
+            .is_some_and(|field| field == expected.as_bytes())
+    })
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::tasklist_has_pid;
+
+    #[test]
+    fn tasklist_csv_matches_only_the_requested_pid() {
+        let output = b"hipfire.exe,\"4242\",Console,1,\"20,000 K\"\r\n";
+        assert!(tasklist_has_pid(output, 4242));
+        assert!(!tasklist_has_pid(output, 17));
+        assert!(!tasklist_has_pid(b"INFO: No tasks are running.\r\n", 4242));
+    }
+}
 pub fn start_background_serve() -> Result<()> {
     let mut cmd = super::native_cli_command().ok_or_else(|| {
         anyhow!("native hipfire binary not found (set HIPFIRE_CLI_BIN or install hipfire)")

@@ -1364,7 +1364,13 @@ fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(MUTED),
                 )));
                 for c in &report.checks {
-                    let (mark, color) = if c.ok { ("ok ", GREEN) } else { ("XX ", RED) };
+                    let (mark, color) = if !c.applicable {
+                        ("N/A", MUTED)
+                    } else if c.ok {
+                        ("ok ", GREEN)
+                    } else {
+                        ("XX ", RED)
+                    };
                     diagnostic_lines.push(Line::from(vec![
                         Span::styled(format!("  {mark}"), Style::default().fg(color)),
                         Span::styled(format!("{}: ", c.name), Style::default().fg(TEXT)),
@@ -2181,12 +2187,22 @@ mod render_tests {
                     DoctorCheck {
                         name: "amdgpu module".into(),
                         ok: true,
+                        applicable: true,
                         detail: "loaded".into(),
                     },
+                    // This is intentionally failing fixture data: it verifies that the System
+                    // tab still renders a real failed doctor check.
                     DoctorCheck {
                         name: "/dev/kfd".into(),
                         ok: false,
+                        applicable: true,
                         detail: "missing".into(),
+                    },
+                    DoctorCheck {
+                        name: "Windows compute kernel objects".into(),
+                        ok: false,
+                        applicable: false,
+                        detail: "WDDM does not provide Linux kernel objects".into(),
                     },
                 ],
                 error: None,
@@ -2195,6 +2211,11 @@ mod render_tests {
         assert!(text.contains("Doctor (hipfire diag)"), "doctor section");
         assert!(text.contains("amdgpu module"), "check name shown");
         assert!(text.contains("missing"), "failed-check detail shown");
+        assert!(
+            text.contains("N/A"),
+            "inapplicable check has a neutral marker"
+        );
+        assert!(text.contains("WDDM"), "inapplicable-check detail shown");
     }
 
     #[test]

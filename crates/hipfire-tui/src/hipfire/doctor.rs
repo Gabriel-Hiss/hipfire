@@ -24,11 +24,16 @@ use crate::hipfire::native_cli_command;
 /// thread or an orphan holding VRAM forever.
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One diagnostic line: a name, whether it passed, and a short detail.
+/// One diagnostic line: a name, whether it passed, whether it applies, and a
+/// short detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DoctorCheck {
     pub name: String,
     pub ok: bool,
+    /// False when the platform cannot provide the thing being checked. When
+    /// false, `ok` is meaningless; consumers MUST gate failure handling on
+    /// `applicable` before reading `ok`.
+    pub applicable: bool,
     pub detail: String,
 }
 
@@ -94,6 +99,16 @@ fn check(name: &str, ok: bool, detail: impl Into<String>) -> DoctorCheck {
     DoctorCheck {
         name: name.into(),
         ok,
+        applicable: true,
+        detail: detail.into(),
+    }
+}
+
+fn inapplicable_check(name: &str, detail: impl Into<String>) -> DoctorCheck {
+    DoctorCheck {
+        name: name.into(),
+        ok: false,
+        applicable: false,
         detail: detail.into(),
     }
 }
@@ -113,26 +128,38 @@ pub fn parse_diag_json(body: &str) -> DoctorReport {
 
     let mut checks = Vec::new();
 
+    let platform = v["platform"].as_str().unwrap_or("unknown");
+
     // Platform — informational, always shown ok.
-    checks.push(check(
-        "platform",
-        true,
-        v["platform"].as_str().unwrap_or("unknown"),
-    ));
+    checks.push(check("platform", true, platform));
 
-    let amdgpu = v["amdgpu_loaded"].as_bool().unwrap_or(false);
-    checks.push(check(
-        "amdgpu module",
-        amdgpu,
-        if amdgpu { "loaded" } else { "not loaded" },
-    ));
+    // Windows uses AMD's WDDM compute stack instead of the Linux amdgpu module
+    // and KFD character device, so reporting either as failed would be false.
+    let windows_wddm = platform.starts_with("windows");
+    if windows_wddm {
+        checks.push(inapplicable_check(
+            "amdgpu module",
+            "not applicable: Windows AMD compute uses WDDM, not an amdgpu kernel module",
+        ));
+        checks.push(inapplicable_check(
+            "/dev/kfd",
+            "not applicable: Windows AMD compute uses WDDM, so there is no /dev/kfd",
+        ));
+    } else {
+        let amdgpu = v["amdgpu_loaded"].as_bool().unwrap_or(false);
+        checks.push(check(
+            "amdgpu module",
+            amdgpu,
+            if amdgpu { "loaded" } else { "not loaded" },
+        ));
 
-    let kfd = v["kfd"].as_bool().unwrap_or(false);
-    checks.push(check(
-        "/dev/kfd",
-        kfd,
-        if kfd { "present" } else { "missing" },
-    ));
+        let kfd = v["kfd"].as_bool().unwrap_or(false);
+        checks.push(check(
+            "/dev/kfd",
+            kfd,
+            if kfd { "present" } else { "missing" },
+        ));
+    }
 
     let hipcc = v["rocm"]["hipcc"].as_str().filter(|s| !s.is_empty());
     checks.push(check(
@@ -200,14 +227,16 @@ mod tests {
         }"#;
         let r = parse_diag_json(body);
         assert!(r.error.is_none());
-        let by = |n: &str| r.checks.iter().find(|c| c.name == n).unwrap().ok;
-        assert!(by("amdgpu module"));
-        assert!(by("/dev/kfd"));
-        assert!(by("hipcc (ROCm)"));
-        assert!(by("daemon binary"));
-        assert!(by("GPU (PCI)"));
-        assert!(by("local models"));
-        assert!(by("live GPU probe"));
+        let by = |n: &str| r.checks.iter().find(|c| c.name == n).unwrap();
+        assert!(by("amdgpu module").ok);
+        assert!(by("amdgpu module").applicable);
+        assert!(by("/dev/kfd").ok);
+        assert!(by("/dev/kfd").applicable);
+        assert!(by("hipcc (ROCm)").ok);
+        assert!(by("daemon binary").ok);
+        assert!(by("GPU (PCI)").ok);
+        assert!(by("local models").ok);
+        assert!(by("live GPU probe").ok);
     }
 
     #[test]
@@ -232,6 +261,39 @@ mod tests {
         assert!(!c("live GPU probe").ok);
         assert_eq!(c("live GPU probe").detail, "no device");
         assert!(c("platform").ok, "platform is informational");
+    }
+
+    #[test]
+    fn parse_diag_marks_linux_kernel_checks_inapplicable_on_windows() {
+        let body = r#"{
+            "platform": "windows-x86_64",
+            "amdgpu_loaded": false,
+            "kfd": false,
+            "rocm": { "hipcc": "HIP version 6.2" },
+            "daemon": "found",
+            "gpus": ["AMD Radeon RX 7900 XTX"],
+            "models": [],
+            "gpu": { "arch": "gfx1100" }
+        }"#;
+        let r = parse_diag_json(body);
+        let c = |n: &str| r.checks.iter().find(|c| c.name == n).unwrap();
+        let inapplicable_failures = r
+            .checks
+            .iter()
+            .filter(|check| check.applicable && !check.ok)
+            .count();
+        assert_eq!(
+            inapplicable_failures, 1,
+            "only the empty local-models row contributes a failure"
+        );
+        for name in ["amdgpu module", "/dev/kfd"] {
+            assert!(!c(name).applicable, "{name} is unavailable on Windows");
+            assert!(!c(name).ok, "{name} is not reported as a passing check");
+            assert!(
+                c(name).detail.contains("WDDM"),
+                "{name} explains the Windows compute stack"
+            );
+        }
     }
 
     #[test]

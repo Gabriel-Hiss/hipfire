@@ -898,7 +898,11 @@ impl App {
         match &report.error {
             Some(err) => self.toast_error(format!("doctor: {err}")),
             None => {
-                let fails = report.checks.iter().filter(|c| !c.ok).count();
+                let fails = report
+                    .checks
+                    .iter()
+                    .filter(|c| c.applicable && !c.ok)
+                    .count();
                 if fails == 0 {
                     self.toast_info("doctor: all checks passed");
                 } else {
