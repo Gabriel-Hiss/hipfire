@@ -6172,6 +6172,16 @@ pub fn generate_lfm2moe(
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
+    // Streaming UTF-8 reassembly. A per-token `tokenizer.decode(&[tok])` is
+    // wrong on a byte-level BPE: one code point can span several tokens, and
+    // decoding each in isolation runs `from_utf8_lossy` over half of it, so the
+    // client receives U+FFFD. Observed on LFM2.5-1.2B, where `\u{00f7}` arrives
+    // as two tokens and rendered as "252 \u{fffd}\u{fffd} 2 = 126". Decode the
+    // whole run and emit only the delta's longest valid UTF-8 prefix, carrying
+    // a truncated trailing code point into the next step. Same pattern as the
+    // Qwen/LLaMA/Maple AR bodies.
+    let mut streamed_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut bytes_emitted: usize = 0;
     let decode_t0 = Instant::now();
     loop {
         if check_abort(id) {
@@ -6187,27 +6197,45 @@ pub fn generate_lfm2moe(
             break;
         }
 
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
         // String-level EOS-class guard. The id-based `stop_toks` above misses
         // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
         // to the special-token id (it yields subwords), so the real token id is
-        // never in the set. The daemon decodes one token at a time, so the
-        // leaking turn-end token arrives as its own frag — catch it on the
-        // decoded text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
-        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
+        // never in the set. A turn-end marker is always one whole token, so a
+        // single-token decode is the right test here even though emission below
+        // works on byte deltas. Stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
+        let marker = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        if matches!(marker.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
             break;
         }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        streamed_tokens.push(next_tok);
+        let all_bytes = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode_bytes(&streamed_tokens)
+        };
+        let pending = &all_bytes[bytes_emitted.min(all_bytes.len())..];
+        let valid_len = match std::str::from_utf8(pending) {
+            Ok(_) => pending.len(),
+            // Only a truncated final code point may be held back. Genuinely
+            // invalid bytes (`error_len().is_some()`) must not be buffered
+            // forever — emit them lossily so the stream cannot stall.
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => pending.len(),
+        };
+        if valid_len > 0 {
+            let frag = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
+            bytes_emitted += valid_len;
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -6243,6 +6271,27 @@ pub fn generate_lfm2moe(
         let ep = production_fail_closed_rollback(m, gpu, None, None);
         emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         return;
+    }
+
+    // Flush bytes still held back by the UTF-8 carry. Reaching here with a
+    // non-empty tail means the run ended (stop token or max_tokens) mid-code
+    // point; dropping it would silently truncate the reply's last character.
+    if !streamed_tokens.is_empty() {
+        let all_bytes = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode_bytes(&streamed_tokens)
+        };
+        if bytes_emitted < all_bytes.len() {
+            let frag = String::from_utf8_lossy(&all_bytes[bytes_emitted..]).into_owned();
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
     }
 
     m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
