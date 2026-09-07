@@ -17,12 +17,12 @@ pub mod toolchain;
 
 pub use arch::{ArchProfile, CodeObjectIdentity, IsaVersion};
 pub use campaign::{
-    CAMPAIGN_SCHEMA_VERSION, CampaignError, CampaignEvent, CampaignLedger, CampaignPolicy,
-    CampaignResult, CampaignStarted, CandidateRecord, CandidateSubmission, CandidateVerdict,
-    DEFAULT_MAX_COMPLETED_GPU_BATTERIES_PER_TARGET, PromotionRecord, RecordDisposition,
+    CampaignError, CampaignEvent, CampaignLedger, CampaignPolicy, CampaignResult, CampaignStarted,
+    CandidateRecord, CandidateSubmission, CandidateVerdict, PromotionRecord, RecordDisposition,
+    CAMPAIGN_SCHEMA_VERSION, DEFAULT_MAX_COMPLETED_GPU_BATTERIES_PER_TARGET,
 };
 pub use contracts::{
-    RESOURCE_CONTRACT_SCHEMA_VERSION, ResourceAssessment, ResourceContract, ResourceRejection,
+    ResourceAssessment, ResourceContract, ResourceRejection, RESOURCE_CONTRACT_SCHEMA_VERSION,
 };
 
 use serde::{Deserialize, Serialize};
@@ -878,17 +878,37 @@ fn absolute_from(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
+/// Executable filename candidates for `name` on this host, most preferred
+/// first.
+///
+/// Windows needs the `.exe` suffix on every `is_file` probe: the LLVM tools
+/// ship as `llvm-objdump.exe`, `clang-offload-bundler.exe`, and so on. Probing
+/// only the bare name makes a complete toolchain look absent, the probe falls
+/// through to a bare command name, and `CreateProcess` then reports
+/// `program not found` — a missing-toolchain error from an install that has
+/// every tool. An already-suffixed name is left alone.
+pub(crate) fn tool_filenames(name: &str) -> Vec<String> {
+    if !cfg!(windows) || Path::new(name).extension().is_some() {
+        return vec![name.to_owned()];
+    }
+    vec![name.to_owned(), format!("{name}.exe")]
+}
+
+/// The first existing `name` executable in `dir`, honoring host suffixes.
+pub(crate) fn tool_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    tool_filenames(name)
+        .into_iter()
+        .map(|file| dir.join(file))
+        .find(|path| path.is_file())
+}
+
 fn configured_tool(variable: &str, root: &Path, name: &str) -> PathBuf {
     if let Some(path) = env::var_os(variable) {
         return path.into();
     }
-    for candidate in [
-        root.join("lib/llvm/bin").join(name),
-        root.join("llvm/bin").join(name),
-        root.join("bin").join(name),
-    ] {
-        if candidate.is_file() {
-            return candidate;
+    for dir in ["lib/llvm/bin", "llvm/bin", "bin"] {
+        if let Some(found) = tool_in_dir(&root.join(dir), name) {
+            return found;
         }
     }
     name.into()
@@ -1722,10 +1742,9 @@ amdhsa.kernels:
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>();
         assert!(args.iter().any(|arg| arg == "-misched=gcn-max-ilp"));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "-amdgpu-igrouplp-exact-solver")
-        );
+        assert!(args
+            .iter()
+            .any(|arg| arg == "-amdgpu-igrouplp-exact-solver"));
         let scheduler = args
             .iter()
             .position(|arg| arg == "-misched=gcn-max-ilp")

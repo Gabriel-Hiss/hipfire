@@ -246,21 +246,32 @@ pub fn parse_rocminfo_arches(text: &str) -> Vec<String> {
     out
 }
 
+/// Path to `name` next to `tool`, resolved to an existing executable when one
+/// is there (Windows `.exe` included) and otherwise left as the plain join so
+/// callers can still report what they looked for.
 fn sibling_of(tool: &Path, name: &str) -> PathBuf {
-    tool.parent()
-        .map(|p| p.join(name))
-        .unwrap_or_else(|| PathBuf::from(name))
+    let Some(dir) = tool.parent() else {
+        return PathBuf::from(name);
+    };
+    crate::tool_in_dir(dir, name).unwrap_or_else(|| dir.join(name))
 }
 
 fn llc_present(hipcc: &Path, installed_dir: Option<&Path>) -> bool {
-    let mut candidates = vec![sibling_of(hipcc, "llc")];
+    if sibling_of(hipcc, "llc").is_file() {
+        return true;
+    }
     if let Some(dir) = installed_dir {
-        candidates.push(dir.join("llc"));
+        if crate::tool_in_dir(dir, "llc").is_some() {
+            return true;
+        }
     }
     // Canonical 7.14 llvm bin (ROCM_PATH=/opt/rocm/core layout).
-    candidates.push(PathBuf::from("/opt/rocm/core/lib/llvm/bin/llc"));
-    candidates.push(PathBuf::from("/opt/rocm/core-7.14/lib/llvm/bin/llc"));
-    candidates.iter().any(|p| p.is_file())
+    [
+        "/opt/rocm/core/lib/llvm/bin/llc",
+        "/opt/rocm/core-7.14/lib/llvm/bin/llc",
+    ]
+    .iter()
+    .any(|p| Path::new(p).is_file())
 }
 
 fn resolve_resource_dir(
@@ -335,8 +346,8 @@ fn probe_offload_arches(hipcc: &Path) -> Result<Vec<String>> {
             .parent()
             .map(|root| root.join("lib").join("llvm").join("bin"));
         if let Some(llvm_bin) = llvm_bin {
-            tools.push(llvm_bin.join("offload-arch"));
-            tools.push(llvm_bin.join("amdgpu-arch"));
+            tools.extend(crate::tool_in_dir(&llvm_bin, "offload-arch"));
+            tools.extend(crate::tool_in_dir(&llvm_bin, "amdgpu-arch"));
         }
     }
     // Documented TheRock / core fallbacks only after hipcc-local tools.
