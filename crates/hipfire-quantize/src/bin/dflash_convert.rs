@@ -715,14 +715,17 @@ fn resolve_model_path(input: &str) -> String {
         if parts.len() == 2 {
             let org = parts[0];
             let name = parts[1];
-            let home = std::env::var("HOME").unwrap_or_default();
-            let cache_root =
-                format!("{home}/.cache/huggingface/hub/models--{org}--{name}/snapshots");
-            if let Ok(entries) = std::fs::read_dir(&cache_root) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.join("config.json").exists() {
-                        return p.to_string_lossy().into_owned();
+            if let Some(snapshots_dir) = hipfire_quantize::hf_hub_cache_root().map(|cache_root| {
+                cache_root
+                    .join(format!("models--{org}--{name}"))
+                    .join("snapshots")
+            }) {
+                if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        if p.join("config.json").exists() {
+                            return p.to_string_lossy().into_owned();
+                        }
                     }
                 }
             }

@@ -44,19 +44,23 @@ pub(crate) fn resolve_model_path(input: &str) -> String {
             let org = parts[0];
             let name = parts[1];
 
-            // Check HF cache: ~/.cache/huggingface/hub/models--{org}--{name}/snapshots/*/
-            let home = std::env::var("HOME").unwrap_or_default();
-            let cache_dir = format!("{home}/.cache/huggingface/hub/models--{org}--{name}");
-            let snapshots_dir = Path::new(&cache_dir).join("snapshots");
+            // Hugging Face stores every revision below the hub cache's model directory.
+            let snapshots_dir = hipfire_quantize::hf_hub_cache_root().map(|cache_root| {
+                cache_root
+                    .join(format!("models--{org}--{name}"))
+                    .join("snapshots")
+            });
 
-            if snapshots_dir.exists() {
-                // Find the first snapshot directory
-                if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-                    for entry in entries.flatten() {
-                        let snap_path = entry.path();
-                        if snap_path.is_dir() && snap_path.join("config.json").exists() {
-                            eprintln!("Resolved {input} -> {}", snap_path.display());
-                            return snap_path.to_string_lossy().to_string();
+            if let Some(snapshots_dir) = &snapshots_dir {
+                if snapshots_dir.exists() {
+                    // Find the first snapshot directory
+                    if let Ok(entries) = std::fs::read_dir(snapshots_dir) {
+                        for entry in entries.flatten() {
+                            let snap_path = entry.path();
+                            if snap_path.is_dir() && snap_path.join("config.json").exists() {
+                                eprintln!("Resolved {input} -> {}", snap_path.display());
+                                return snap_path.to_string_lossy().to_string();
+                            }
                         }
                     }
                 }
@@ -70,13 +74,15 @@ pub(crate) fn resolve_model_path(input: &str) -> String {
 
             match status {
                 Ok(s) if s.success() => {
-                    // Retry cache lookup after download
-                    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-                        for entry in entries.flatten() {
-                            let snap_path = entry.path();
-                            if snap_path.is_dir() && snap_path.join("config.json").exists() {
-                                eprintln!("Downloaded {input} -> {}", snap_path.display());
-                                return snap_path.to_string_lossy().to_string();
+                    // Retry cache lookup after download.
+                    if let Some(snapshots_dir) = &snapshots_dir {
+                        if let Ok(entries) = std::fs::read_dir(snapshots_dir) {
+                            for entry in entries.flatten() {
+                                let snap_path = entry.path();
+                                if snap_path.is_dir() && snap_path.join("config.json").exists() {
+                                    eprintln!("Downloaded {input} -> {}", snap_path.display());
+                                    return snap_path.to_string_lossy().to_string();
+                                }
                             }
                         }
                     }
