@@ -529,8 +529,26 @@ fn resolve_rocm_root_with(
 }
 
 /// Prefer a canonical absolute path; keep `path` if canonicalize fails.
+///
+/// The Windows canonical form is a `\\?\` verbatim path, which the Win32 file
+/// APIs accept but `cmd.exe` does not resolve. Every ROCm path here ends up in
+/// `hipcc.bat`'s argv or in `ROCM_PATH`, so a verbatim root makes hipcc lose
+/// its own `.hipVersion` and every kernel compile fail with
+/// "the system cannot find the path specified". The prefix is stripped, which
+/// also re-imposes MAX_PATH; that is the same limit hipcc itself is bound by.
 fn canonicalize_or_keep(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let text = canonical.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    canonical
 }
 
 /// Roots with a usable device compiler, canonicalized and deduped (first-seen order).

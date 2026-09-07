@@ -67,15 +67,15 @@ fn main() -> ExitCode {
         );
     };
 
-    let root = std::fs::canonicalize(&toolchain.root).unwrap_or(toolchain.root.clone());
-    let hipcc = std::fs::canonicalize(&hipcc).unwrap_or(hipcc);
+    let root = hipfire_config::rocm::canonicalize_plain(&toolchain.root);
+    let hipcc = hipfire_config::rocm::canonicalize_plain(&hipcc);
     let compiler_root = toolchain
         .compiler_root
         .as_ref()
-        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .map(|p| hipfire_config::rocm::canonicalize_plain(p))
         .unwrap_or_else(|| root.clone());
     let runtime_lib = hipfire_config::rocm::runtime_library(&root)
-        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .map(|p| hipfire_config::rocm::canonicalize_plain(&p))
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "not found".to_string());
     let source = toolchain

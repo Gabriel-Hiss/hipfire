@@ -627,6 +627,42 @@ fn main() {
         std::process::exit(1);
     }
 }
+/// Publish `developer.rocm_path` as `HIPFIRE_ROCM_PATH` when no ROCm variable
+/// is already set.
+///
+/// `hipfire_config::rocm` resolves the toolchain from the environment, and the
+/// config key was only ever documentation: nothing wrote it anywhere the
+/// resolver could see, so setting it had no effect. On Linux that went
+/// unnoticed because discovery falls back to `/opt/rocm`. Windows has no
+/// conventional location, so without this the user has to export the variable
+/// in every shell and a bare `hipfire run` fails with "hipcc is unavailable"
+/// on a machine whose SDK is configured.
+///
+/// The documented precedence is preserved: `HIPFIRE_ROCM_PATH`, then
+/// `ROCM_PATH`, then `HIP_PATH`, and this only fills in when all three are
+/// absent. Every child process — the daemon, a detached serve, the installer —
+/// inherits it, which is what makes one place enough.
+fn export_configured_rocm_root(paths: &Paths) {
+    if ["HIPFIRE_ROCM_PATH", "ROCM_PATH", "HIP_PATH"]
+        .iter()
+        .any(|var| env::var_os(var).is_some_and(|value| !value.is_empty()))
+    {
+        return;
+    }
+    let Ok((_, resolved)) = resolved_global(paths, true) else {
+        return;
+    };
+    let Ok(configured) = config_string(&resolved, "developer.rocm_path") else {
+        return;
+    };
+    let configured = configured.trim();
+    if configured.is_empty() {
+        return;
+    }
+    // SAFETY: single-threaded startup, before any command dispatch.
+    unsafe { env::set_var("HIPFIRE_ROCM_PATH", configured) };
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse_from(env::args_os().map(|argument| {
         if argument == "-md" {
@@ -636,6 +672,7 @@ fn run() -> Result<()> {
         }
     }));
     let paths = Paths::discover();
+    export_configured_rocm_root(&paths);
     match cli.command {
         None => launch_tui(&paths, &[]),
         Some(Commands::Tui(args)) => launch_tui(&paths, &args.arguments),
