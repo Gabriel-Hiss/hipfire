@@ -7,7 +7,7 @@ Where hipfire's Windows behavior matches Linux, where it differs, and why.
 | Page state | current (update with the change that moves a row) |
 | Verified on | Windows 11 26200, MSVC, rustc 1.97, RX 7900 GRE (`gfx1100`) |
 | HIP stack | `rocm-sdk` 10.1.0a wheels, HIP 7.16, Adrenalin 32.0.31041.1004 |
-| Model exercised | `lfm2.5:1.2b` (arch 11) |
+| Model exercised | `lfm2.5:1.2b` (arch 11), `qwen3.8:27b-mq3` (arch 20) |
 
 Windows needs a HIP **development** stack, not just the driver: hipfire
 JIT-compiles its kernels. Install routes are in
@@ -69,6 +69,47 @@ the installed SDK and the whole filesystem.
 | Graceful daemon shutdown on `stop` | `SIGTERM`, the daemon runs its shutdown path | `TerminateProcess`; Windows has no cooperative termination signal, so shutdown code does not run |
 | Process identity for the serve PID guard | `/proc/<pid>/cmdline`, full argv | ToolHelp image name only, so the guard matches `hipfire.exe` rather than argv containing `serve` |
 | Pidfile permissions | `0o600` | inherits the `%USERPROFILE%` ACL; no std-level `chmod` equivalent |
+
+## VRAM ceiling under WDDM
+
+WDDM virtualizes video memory per process and overcommits it. An allocation
+that does not fit in dedicated VRAM still succeeds, backed by system memory
+over PCIe, so a model too large for the card loads and decodes instead of
+failing. Sizing a model by the card's nameplate capacity therefore produces a
+silent 5x throughput loss rather than an out-of-memory error.
+
+Two consequences for measurement:
+
+- `hipMemGetInfo` is not a residency check here. With a 15 GB model resident it
+  reported 17.01 GB of 17.16 GB free, because it answers for the calling
+  process, not the device.
+- The desktop competes for the same dedicated pool. On the verified host `dwm`
+  alone held 1.50 GB and the logged-in session about 3.8 GB, leaving roughly
+  12.4 GB for a compute process on a 16 GB card.
+
+Read the real split from the WDDM counters:
+
+```powershell
+$d = (Get-CimInstance Win32_Process -Filter "Name='daemon.exe'").ProcessId
+Get-Counter "\GPU Process Memory(pid_${d}*)\Dedicated Usage",
+            "\GPU Process Memory(pid_${d}*)\Shared Usage"
+```
+
+Measured on `gfx1100` (16 GB) with Qwen3.8-27B, `--spec off`, 3 runs,
+`benchmarks/prompts/merge_sort_thinking_off.txt`
+(md5 `46c8d9674dcc8a8f18638bbd2d42c9ae`):
+
+| Tier | Weights | Dedicated | Shared | Decode |
+|---|---|---|---|---|
+| `mq3-xt` | 11.78 GB | 12.42 GB | 0.01 GB | 30.0 tok/s |
+| `mq3` | 12.62 GB | 12.30 GB | 0.97 GB | 29.5 tok/s |
+| `mq3-pro` | 13.18 GB | ~12.3 GB | ~1.5 GB | 5.6 tok/s |
+| `mq4-xt` | 14.98 GB | 12.19 GB | 3.21 GB | 5.5 tok/s |
+
+The cost is not proportional to the overflow. Just under 1 GB of shared memory
+costs nothing measurable, and the next 0.5 GB costs 5x. Pick the largest tier
+whose weights leave the dedicated budget untouched, and confirm with the
+counters rather than with reported free memory.
 
 ## Environment note for isolated runs
 
