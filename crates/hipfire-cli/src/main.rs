@@ -6676,14 +6676,18 @@ mod tests {
         fs::write(&nested, b"fixture").unwrap();
         let registry = hipfire_registry::bundled().unwrap();
 
-        assert_eq!(
-            find_model_path(&paths, &registry, "example-model"),
-            Some(fs::canonicalize(&nested).unwrap())
-        );
+        // Compare the resolved file, not the path spelling: `fs::canonicalize`
+        // returns a `\\?\` verbatim path on Windows and discovery returns a
+        // plain one, so string equality would pin the host rather than the
+        // behavior under test.
+        let found = find_model_path(&paths, &registry, "example-model")
+            .expect("nested model must be discovered");
+        let target = fs::canonicalize(&nested).unwrap();
+        assert_eq!(fs::canonicalize(&found).unwrap(), target);
         assert!(list_local_models(&paths, &registry)
             .unwrap()
             .iter()
-            .any(|model| model.path == fs::canonicalize(&nested).unwrap()));
+            .any(|model| fs::canonicalize(&model.path).is_ok_and(|path| path == target)));
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -7481,55 +7485,7 @@ mod tests {
 
     #[test]
     fn update_fetches_and_checks_out_branch_from_local_origin() {
-        fn git(repo: &Path, args: &[&str]) {
-            let status = Command::new("git")
-                .current_dir(repo)
-                .args(args)
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {}", args.join(" "));
-        }
-
-        let root = env::temp_dir().join(format!(
-            "hipfire-update-ref-test-{}-{}",
-            std::process::id(),
-            unix_timestamp()
-        ));
-        let origin = root.join("origin.git");
-        let seed = root.join("seed");
-        let installed = root.join("installed");
-        fs::create_dir_all(&root).unwrap();
-        git(&root, &["init", "--bare", origin.to_str().unwrap()]);
-        fs::create_dir_all(&seed).unwrap();
-        git(&seed, &["init"]);
-        git(&seed, &["config", "user.name", "hipfire test"]);
-        git(
-            &seed,
-            &["config", "user.email", "hipfire-test@example.invalid"],
-        );
-        fs::write(seed.join("channel"), "master\n").unwrap();
-        git(&seed, &["add", "channel"]);
-        git(&seed, &["commit", "-m", "master"]);
-        git(&seed, &["branch", "-M", "master"]);
-        git(
-            &seed,
-            &["remote", "add", "origin", origin.to_str().unwrap()],
-        );
-        git(&seed, &["push", "-u", "origin", "master"]);
-        git(&seed, &["checkout", "-b", "beta"]);
-        fs::write(seed.join("channel"), "beta\n").unwrap();
-        git(&seed, &["commit", "-am", "beta"]);
-        git(&seed, &["push", "-u", "origin", "beta"]);
-        git(
-            &root,
-            &[
-                "clone",
-                "--branch",
-                "master",
-                origin.to_str().unwrap(),
-                installed.to_str().unwrap(),
-            ],
-        );
+        let (root, installed) = init_update_fixture("ref-test");
 
         let resolved = fetch_revision(
             &installed,
@@ -7662,6 +7618,11 @@ mod tests {
         git_test(&root, &["init", "--bare", origin.to_str().unwrap()]);
         fs::create_dir_all(&seed).unwrap();
         git_test(&seed, &["init"]);
+        // These fixtures assert byte-exact file contents after a checkout or a
+        // stash apply. A host with `core.autocrlf=true` rewrites LF to CRLF on
+        // the way out of the object store, so pin it off per repo rather than
+        // relaxing the assertions.
+        git_test(&seed, &["config", "core.autocrlf", "false"]);
         git_test(&seed, &["config", "user.name", "hipfire test"]);
         git_test(
             &seed,
@@ -7695,6 +7656,9 @@ mod tests {
             &installed,
             &["config", "user.email", "hipfire-test@example.invalid"],
         );
+        git_test(&installed, &["config", "core.autocrlf", "false"]);
+        // The clone predates that setting, so re-materialize the worktree.
+        git_test(&installed, &["reset", "--hard", "HEAD"]);
         (root, installed)
     }
 

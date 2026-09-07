@@ -1500,13 +1500,17 @@ mod tests {
         let source = Path::new("/tmp/hipfire-src-example");
         let mut cmd = Command::new("cargo");
         pin_cargo_to_source_target(&mut cmd, source);
-        let debug = format!("{cmd:?}");
-        assert!(
-            debug.contains("--target-dir") && debug.contains("hipfire-src-example/target"),
-            "expected pinned target-dir in {debug}"
+        // Read the argv rather than the Debug rendering: Debug escapes the
+        // separator, so a substring check pins one host's path spelling.
+        let args: Vec<_> = cmd.get_args().map(|arg| arg.to_owned()).collect();
+        let flag = args
+            .iter()
+            .position(|arg| arg == "--target-dir")
+            .unwrap_or_else(|| panic!("expected --target-dir in {args:?}"));
+        assert_eq!(
+            args.get(flag + 1).map(|arg| PathBuf::from(arg)),
+            Some(source.join("target"))
         );
-        // Env is set on the Command; Debug may or may not show it depending on
-        // std version — flag coverage is the hard requirement.
     }
 
     #[test]
