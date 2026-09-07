@@ -135,6 +135,20 @@ difference live in [docs/windows-parity.md](docs/windows-parity.md).
   prefix, carrying a truncated trailing code point to the next step, and flushes
   the carry when the run ends. Greedy output is byte-identical to the n-gram
   speculative path across code, prose, math, CJK, and emoji fixtures.
+- **`hipfire pull` fetched large models on a single connection.** Hugging Face's
+  CDN caps one connection near 10 MB/s regardless of the client's link, so a
+  15 GB model took over 20 minutes on a gigabit host. `download_verified` now
+  probes the server with a one-byte range, and when the response is a 206 for a
+  file of at least 64 MB it pre-sizes the destination and fills it from eight
+  workers pulling 32 MB chunks, each writing its own offset. A worker takes the
+  next chunk when it finishes, so a slow connection cannot strand a long tail.
+  Verification is unchanged and now reads back what actually landed on disk: the
+  SHA-256 covers the assembled file rather than the arriving stream. Measured on
+  the Qwen3.8-27B tiers, 24.4 GB fell from about 34 minutes to 357 seconds
+  (68 MB/s aggregate), with both digests matching the registry. Ranges are
+  honored or the single-stream path runs unchanged;
+  `HIPFIRE_DOWNLOAD_STREAMS` overrides the worker count, and `1` restores the
+  old behavior.
 
 ## v0.3.0 — MQ V2 wire schema, Bonsai, Redline across RDNA
 

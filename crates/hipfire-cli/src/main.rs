@@ -37,7 +37,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Condvar, Mutex,
     },
     thread,
@@ -1692,18 +1692,44 @@ pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
     )
 }
 
-pub(crate) fn download_verified(
-    url: &str,
-    destination: &Path,
-    expected_sha256: Option<&str>,
-    expected_size: Option<u64>,
-    quiet: bool,
-) -> Result<()> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+/// Bytes fetched per range request. Large enough that per-request overhead is
+/// negligible against the transfer, small enough that a slow connection cannot
+/// strand a long tail: workers pull the next chunk as they finish, so stream
+/// speeds self-balance without pre-partitioning the file.
+const DOWNLOAD_CHUNK: u64 = 32 * 1024 * 1024;
+
+/// Smallest total size worth splitting across connections. Below this the
+/// probe round trip and the hash read-back cost more than they save.
+const DOWNLOAD_PARALLEL_FLOOR: u64 = 64 * 1024 * 1024;
+
+/// Parallel connections used for a ranged download.
+///
+/// Hugging Face's CDN caps one connection near 10 MB/s regardless of the
+/// client's link, so a 15 GB model pulls for 20+ minutes single-stream. Eight
+/// streams measured 38 MB/s on the same host and file. `HIPFIRE_DOWNLOAD_STREAMS=1`
+/// restores the single-stream path.
+fn download_streams() -> usize {
+    env::var("HIPFIRE_DOWNLOAD_STREAMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8)
+        .clamp(1, 32)
+}
+
+fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(24 * 60 * 60)))
         .http_status_as_error(false)
         .build()
-        .into();
+        .into()
+}
+
+/// GET `url`, optionally for one byte range, carrying the HF token when set.
+fn download_get(
+    agent: &ureq::Agent,
+    url: &str,
+    range: Option<(u64, u64)>,
+) -> Result<ureq::http::Response<ureq::Body>> {
     let mut request = agent.get(url);
     if let Some(token) = env::var_os("HF_TOKEN").or_else(|| env::var_os("HUGGING_FACE_HUB_TOKEN")) {
         request = request.header(
@@ -1711,9 +1737,194 @@ pub(crate) fn download_verified(
             &format!("Bearer {}", token.to_string_lossy()),
         );
     }
-    let mut response = request
+    if let Some((start, end)) = range {
+        request = request.header("Range", &format!("bytes={start}-{end}"));
+    }
+    request
         .call()
-        .map_err(|error| anyhow!("download request failed: {error}"))?;
+        .map_err(|error| anyhow!("download request failed: {error}"))
+}
+
+/// Total size when the server honors ranges, `None` when it does not.
+///
+/// A one-byte range is the cheapest probe that proves both facts at once: a
+/// 206 answer means ranges work, and its `content-range` carries the total.
+fn probe_ranged_size(agent: &ureq::Agent, url: &str) -> Option<u64> {
+    let response = download_get(agent, url, Some((0, 0))).ok()?;
+    if response.status().as_u16() != 206 {
+        return None;
+    }
+    let header = response.headers().get("content-range")?.to_str().ok()?;
+    header.rsplit('/').next()?.trim().parse::<u64>().ok()
+}
+
+/// Write `buf` at `offset` without disturbing any other worker's file cursor.
+fn write_all_at(file: &fs::File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0_usize;
+        let mut at = offset;
+        while done < buf.len() {
+            let count = file.seek_write(&buf[done..], at)?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "positioned write made no progress",
+                ));
+            }
+            done += count;
+            at += count as u64;
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+}
+
+/// Fetch one chunk into `buffer`, retrying a transient failure a few times.
+fn download_chunk(
+    agent: &ureq::Agent,
+    url: &str,
+    start: u64,
+    end: u64,
+    buffer: &mut Vec<u8>,
+) -> Result<()> {
+    let expected = (end - start + 1) as usize;
+    let mut attempt = 0_u32;
+    loop {
+        attempt += 1;
+        let outcome = (|| -> Result<()> {
+            buffer.clear();
+            buffer.reserve(expected);
+            let mut response = download_get(agent, url, Some((start, end)))?;
+            if response.status().as_u16() != 206 {
+                bail!(
+                    "server stopped honoring Range (HTTP {})",
+                    response.status().as_u16()
+                );
+            }
+            response.body_mut().as_reader().read_to_end(buffer)?;
+            if buffer.len() != expected {
+                bail!(
+                    "short chunk at {start}: expected {expected} bytes, received {}",
+                    buffer.len()
+                );
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 4 => {
+                thread::sleep(Duration::from_millis(250 * u64::from(attempt)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Fill `path` from parallel range requests. The file is pre-sized so workers
+/// can write their own offsets concurrently.
+fn download_ranged(
+    agent: &ureq::Agent,
+    url: &str,
+    path: &Path,
+    total: u64,
+    streams: usize,
+    quiet: bool,
+) -> Result<()> {
+    let file =
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    file.set_len(total)
+        .with_context(|| format!("failed to size {} to {total} bytes", path.display()))?;
+    if !quiet {
+        eprintln!("  {streams} parallel range streams");
+    }
+    let next = AtomicU64::new(0);
+    let progress = AtomicU64::new(0);
+    let finished = AtomicBool::new(false);
+    let started = Instant::now();
+    thread::scope(|scope| -> Result<()> {
+        if !quiet {
+            scope.spawn(|| {
+                while !finished.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(500));
+                    report_progress(
+                        progress.load(Ordering::Relaxed),
+                        Some(total),
+                        started.elapsed(),
+                    );
+                }
+            });
+        }
+        let workers: Vec<_> = (0..streams)
+            .map(|_| {
+                scope.spawn(|| -> Result<()> {
+                    let mut buffer = Vec::new();
+                    loop {
+                        let start = next.fetch_add(DOWNLOAD_CHUNK, Ordering::Relaxed);
+                        if start >= total {
+                            return Ok(());
+                        }
+                        let end = (start + DOWNLOAD_CHUNK).min(total) - 1;
+                        download_chunk(agent, url, start, end, &mut buffer)?;
+                        write_all_at(&file, start, &buffer)?;
+                        progress.fetch_add(buffer.len() as u64, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        let mut outcome = Ok(());
+        for worker in workers {
+            match worker.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if outcome.is_ok() => outcome = Err(error),
+                Ok(Err(_)) => {}
+                Err(_) if outcome.is_ok() => outcome = Err(anyhow!("download worker panicked")),
+                Err(_) => {}
+            }
+        }
+        finished.store(true, Ordering::Relaxed);
+        outcome
+    })?;
+    file.sync_all()?;
+    if !quiet {
+        report_progress(total, Some(total), started.elapsed());
+        eprintln!();
+    }
+    Ok(())
+}
+
+/// SHA-256 the bytes that actually landed on disk, returning (size, hex).
+fn hash_downloaded(path: &Path) -> Result<(u64, String)> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to reopen {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        size += count as u64;
+    }
+    Ok((size, format!("{:x}", hasher.finalize())))
+}
+
+/// Single-connection streaming download, hashing as the bytes arrive.
+fn download_streamed(
+    agent: &ureq::Agent,
+    url: &str,
+    path: &Path,
+    expected_size: Option<u64>,
+    quiet: bool,
+) -> Result<(u64, String)> {
+    let mut response = download_get(agent, url, None)?;
     if !response.status().is_success() {
         bail!("download returned HTTP {} for {url}", response.status());
     }
@@ -1722,40 +1933,63 @@ pub(crate) fn download_verified(
         .get("content-length")
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    let temporary = destination.with_extension(format!("part.{}", std::process::id()));
-    let mut output = fs::File::create(&temporary)
-        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    let mut output =
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     let mut reader = response.body_mut().as_reader();
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     let mut downloaded = 0_u64;
     let started = Instant::now();
     let mut last_report = Instant::now();
-    let result = (|| -> Result<()> {
-        loop {
-            let count = reader.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            output.write_all(&buffer[..count])?;
-            hasher.update(&buffer[..count]);
-            downloaded += count as u64;
-            if !quiet && last_report.elapsed() >= Duration::from_millis(500) {
-                report_progress(downloaded, announced.or(expected_size), started.elapsed());
-                last_report = Instant::now();
-            }
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
         }
-        output.sync_all()?;
-        if !quiet {
+        output.write_all(&buffer[..count])?;
+        hasher.update(&buffer[..count]);
+        downloaded += count as u64;
+        if !quiet && last_report.elapsed() >= Duration::from_millis(500) {
             report_progress(downloaded, announced.or(expected_size), started.elapsed());
-            eprintln!();
+            last_report = Instant::now();
         }
+    }
+    output.sync_all()?;
+    if !quiet {
+        report_progress(downloaded, announced.or(expected_size), started.elapsed());
+        eprintln!();
+    }
+    Ok((downloaded, format!("{:x}", hasher.finalize())))
+}
+
+pub(crate) fn download_verified(
+    url: &str,
+    destination: &Path,
+    expected_sha256: Option<&str>,
+    expected_size: Option<u64>,
+    quiet: bool,
+) -> Result<()> {
+    let agent = download_agent();
+    let temporary = destination.with_extension(format!("part.{}", std::process::id()));
+    let streams = download_streams();
+    let result = (|| -> Result<()> {
+        let ranged = if streams > 1 {
+            probe_ranged_size(&agent, url).filter(|total| *total >= DOWNLOAD_PARALLEL_FLOOR)
+        } else {
+            None
+        };
+        let (downloaded, actual) = match ranged {
+            Some(total) => {
+                download_ranged(&agent, url, &temporary, total, streams, quiet)?;
+                hash_downloaded(&temporary)?
+            }
+            None => download_streamed(&agent, url, &temporary, expected_size, quiet)?,
+        };
         if let Some(expected) = expected_size {
             if downloaded != expected {
                 bail!("size mismatch: expected {expected} bytes, received {downloaded}");
             }
         }
-        let actual = format!("{:x}", hasher.finalize());
         if let Some(expected) = expected_sha256 {
             if !actual.eq_ignore_ascii_case(expected) {
                 bail!("SHA-256 mismatch: expected {expected}, received {actual}");
@@ -6313,6 +6547,31 @@ mod tests {
             root,
             config,
         }
+    }
+    /// Concurrent range workers write their own offsets into one pre-sized
+    /// file. Landing a chunk at the wrong offset silently corrupts the model
+    /// and only shows up as a SHA-256 mismatch after a multi-GB download, so
+    /// pin the placement here: out-of-order writes must reassemble exactly.
+    #[test]
+    fn positioned_writes_reassemble_out_of_order() {
+        let path = env::temp_dir().join(format!(
+            "hipfire-write-at-{}-{:?}.bin",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let expected: Vec<u8> = (0..4096_u32).map(|i| (i % 251) as u8).collect();
+        let file = fs::File::create(&path).expect("create scratch file");
+        file.set_len(expected.len() as u64).expect("size file");
+        // Descending order, and a final chunk shorter than the others.
+        for start in [3072_usize, 1024, 2048, 0] {
+            let end = (start + 1024).min(expected.len());
+            write_all_at(&file, start as u64, &expected[start..end]).expect("positioned write");
+        }
+        file.sync_all().expect("flush");
+        drop(file);
+        let landed = fs::read(&path).expect("read back");
+        let _ = fs::remove_file(&path);
+        assert_eq!(landed, expected);
     }
 
     fn idle_test_meta() -> ServeMeta {
