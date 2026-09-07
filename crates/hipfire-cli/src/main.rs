@@ -1962,6 +1962,48 @@ fn download_streamed(
     Ok((downloaded, format!("{:x}", hasher.finalize())))
 }
 
+/// Remove `.part.<pid>` siblings of `destination` whose writer is gone.
+///
+/// A killed pull leaves its staging file behind, and the ranged path pre-sizes
+/// that file, so the debris is the model's full size rather than the bytes
+/// actually fetched. The pid in the name makes reclaiming safe: a live writer
+/// keeps its own file, and this process skips `keep`.
+fn reclaim_stale_parts(destination: &Path, keep: &Path) {
+    let Some(directory) = destination.parent() else {
+        return;
+    };
+    // `with_extension` replaces the tier suffix, so the staging file is
+    // `<file_stem>.part.<pid>`, not `<file_name>.part.<pid>`.
+    let Some(stem) = destination.file_stem().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let prefix = format!("{stem}.part.");
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(pid) = name
+            .strip_prefix(&prefix)
+            .and_then(|tail| tail.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if crate::serve::process_is_alive(pid) {
+            continue;
+        }
+        if fs::remove_file(&path).is_ok() {
+            eprintln!("  reclaimed stale download {name}");
+        }
+    }
+}
+
 pub(crate) fn download_verified(
     url: &str,
     destination: &Path,
@@ -1971,6 +2013,7 @@ pub(crate) fn download_verified(
 ) -> Result<()> {
     let agent = download_agent();
     let temporary = destination.with_extension(format!("part.{}", std::process::id()));
+    reclaim_stale_parts(destination, &temporary);
     let streams = download_streams();
     let result = (|| -> Result<()> {
         let ranged = if streams > 1 {
@@ -6572,6 +6615,45 @@ mod tests {
         let landed = fs::read(&path).expect("read back");
         let _ = fs::remove_file(&path);
         assert_eq!(landed, expected);
+    }
+
+    /// Reclaiming staging files must not touch a concurrent pull's file: the
+    /// pid in the name is the only thing separating dead debris from a live
+    /// writer, and deleting the latter truncates someone else's download.
+    #[test]
+    fn stale_part_reclaim_spares_live_writers() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-reclaim-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("model.mq4");
+        let mine = destination.with_extension(format!("part.{}", std::process::id()));
+        let dead = root.join("model.part.4294967294");
+        let unparsed = root.join("model.part.notapid");
+        let other = root.join("other.part.4294967294");
+        for path in [&mine, &dead, &unparsed, &other] {
+            fs::write(path, b"staging").unwrap();
+        }
+        assert!(
+            !crate::serve::process_is_alive(4294967294),
+            "fixture pid must be dead"
+        );
+
+        reclaim_stale_parts(&destination, &mine);
+
+        assert!(
+            !dead.exists(),
+            "debris from a dead writer must be reclaimed"
+        );
+        assert!(
+            mine.exists(),
+            "this process's own staging file must survive"
+        );
+        assert!(unparsed.exists(), "a non-pid suffix is not ours to delete");
+        assert!(other.exists(), "another model's staging file must survive");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     fn idle_test_meta() -> ServeMeta {
