@@ -119,11 +119,17 @@ difference live in [docs/windows-parity.md](docs/windows-parity.md).
   platform-accurate message instead of probing `.so` names and printing Linux
   install advice. PM4 construction and HSACO parsing stay portable and keep
   unit-testing everywhere.
-- **Cross-platform test suite.** Twelve tests only passed on Linux: they pinned
-  `libamdhip64` in host-shaped install guidance, compared paths without the
-  Windows `\\?\` canonicalization prefix, built a Debian multiarch layout
-  against a `cfg(not(windows))` scan, and wrote a `#!/bin/sh` fake `hipcc` that
-  `CreateProcess` cannot execute. All are now host-shaped.
+- **Cross-platform test suite.** Eighteen tests only passed on Linux. Twelve
+  pinned `libamdhip64` in host-shaped install guidance, compared paths without
+  the Windows `\\?\` canonicalization prefix, built a Debian multiarch layout
+  against a `cfg(not(windows))` scan, or wrote a `#!/bin/sh` fake `hipcc` that
+  `CreateProcess` cannot execute. Six more lived in the `hipfire-cli` binary
+  target, which the library-only run never reached: four asserted byte-exact
+  file contents after a git checkout or stash apply on a host that rewrites LF
+  to CRLF, one compared discovery output against a verbatim `fs::canonicalize`
+  path, and one searched a `Command` Debug string for a `/`-separated path.
+  All eighteen are now host-shaped, and both targets run clean: 2504 library
+  tests and 201 binary tests.
 
 ### Fixed
 

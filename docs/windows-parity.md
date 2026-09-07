@@ -21,6 +21,7 @@ Verified by running the thing, not by reading the code.
 |---|---|
 | `cargo build --release`, `cargo check --all-targets` | clean |
 | Workspace library tests | 2504 passed, 0 failed |
+| `hipfire-cli` binary tests | 201 passed, 0 failed |
 | Kernel JIT through `hipcc` | 1032-kernel tree compiles; cache at `%USERPROFILE%\.hipfire_kernels\<arch>` |
 | HIP runtime load from an absolute SDK path | `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` resolves sibling DLLs |
 | AMDGCN device bitcode discovery | explicit `--rocm-device-lib-path` for bundled-LLVM layouts |
