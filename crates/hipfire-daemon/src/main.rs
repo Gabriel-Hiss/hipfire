@@ -333,15 +333,85 @@ fn gpu_block_attractor_token(
     }
 }
 
+/// Report a lock the daemon could not take, then exit non-zero.
+///
+/// `file` is reopened rather than read through the contending handle: the
+/// holder's PID lives at offset 0, and reading it has to work while another
+/// process holds the lock. That is why the lock itself is taken on a sentinel
+/// byte far past the payload instead of over the whole file.
+fn exit_daemon_lock_failure(pid_path: &std::path::Path, command: fn(&str) -> String) -> ! {
+    let existing = std::fs::read_to_string(pid_path).unwrap_or_default();
+    let pid = existing.trim();
+    let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
+    let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
+    eprintln!(
+        "FATAL: hipfire daemon already running (PID {}). Run `{}` and retry.",
+        pid_display,
+        command(kill_arg)
+    );
+    std::process::exit(1);
+}
+
+/// Byte the advisory lock is taken on, far past the PID text at offset 0.
+///
+/// Windows byte-range locks deny reads inside the locked range, so locking the
+/// whole file would make the holder's PID unreadable and every contention
+/// message would say `<unknown>`. One sentinel byte gives mutual exclusion and
+/// leaves the payload readable. `flock` is whole-file and ignores the range;
+/// the constant simply goes unused there.
+#[cfg(windows)]
+const DAEMON_LOCK_SENTINEL_OFFSET: u32 = 0xFFFF_FF00;
+
+/// How long to keep retrying a contended lock before declaring failure.
+///
+/// `hipfire restart` stops the old serve and starts a new one immediately, so
+/// the incoming daemon routinely races the outgoing daemon's teardown. Failing
+/// on the first attempt turns that ordinary sequence into
+/// `FATAL: daemon already running`. A daemon that is genuinely up still fails,
+/// just a few seconds later.
+const DAEMON_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const DAEMON_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Try once to take the daemon's advisory lock on `f`.
+fn try_lock_daemon_pidfile(f: &std::fs::File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // Safety: `f` owns a valid file descriptor for the duration of this call.
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let mut overlapped = OVERLAPPED::default();
+        // The offset a byte-range lock applies to comes from the OVERLAPPED
+        // structure, not from the file cursor.
+        overlapped.Anonymous.Anonymous.Offset = DAEMON_LOCK_SENTINEL_OFFSET;
+        // Safety: `f` owns a valid synchronous file handle and `overlapped`
+        // stays valid for this non-blocking call.
+        unsafe {
+            LockFileEx(
+                f.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            ) != 0
+        }
+    }
+}
+
 fn acquire_daemon_lock() -> std::fs::File {
     use std::io::{Seek, Write};
 
-    #[cfg(unix)]
-    let home = std::env::var("HOME").expect("HOME environment variable not set");
-    #[cfg(windows)]
-    let home = std::env::var("USERPROFILE").expect("USERPROFILE environment variable not set");
-
-    let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
+    let home = hipfire_config::home_dir().expect("no home directory (HOME / USERPROFILE unset)");
+    let hipfire_dir = home.join(".hipfire");
     std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
     let pid_path = hipfire_dir.join("daemon.pid");
 
@@ -353,32 +423,28 @@ fn acquire_daemon_lock() -> std::fs::File {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
+        // Windows OpenOptionsExt cannot set an ACL; this file inherits the
+        // user profile directory ACL, which restricts it to the owning user.
         opts.open(&pid_path)
             .expect("failed to open ~/.hipfire/daemon.pid")
     };
 
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let mut existing = String::new();
-            let _ = f.read_to_string(&mut existing);
-            let pid = existing.trim();
-            let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
-            let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
-            eprintln!(
-                "FATAL: hipfire daemon already running (PID {}). Run `kill {}` and retry.",
-                pid_display, kill_arg
-            );
-            std::process::exit(1);
+    let deadline = std::time::Instant::now() + DAEMON_LOCK_WAIT;
+    while !try_lock_daemon_pidfile(&f) {
+        if std::time::Instant::now() >= deadline {
+            #[cfg(unix)]
+            exit_daemon_lock_failure(&pid_path, |pid| format!("kill {pid}"));
+            #[cfg(windows)]
+            exit_daemon_lock_failure(&pid_path, |pid| format!("taskkill /PID {pid} /F"));
         }
+        std::thread::sleep(DAEMON_LOCK_POLL);
     }
 
-    // Got the lock (Unix) / opened the PID file (Windows). Truncate any stale
-    // content and write our PID so tooling and the Unix-side error above can
-    // both show a useful number.
+    // The lock is released when `f` closes, so the returned handle is what holds
+    // it for the process lifetime. An explicit unlock in a `Drop` would be wrong.
+    //
+    // Truncate any stale content and write our PID so tooling and the
+    // contention message above can both show a useful number.
     f.set_len(0).ok();
     f.seek(std::io::SeekFrom::Start(0)).ok();
     writeln!(f, "{}", std::process::id()).ok();
