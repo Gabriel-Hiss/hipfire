@@ -4722,21 +4722,35 @@ impl Gpu {
     ) {
         self.bind_thread_or_warn();
         let vram = self.hip.get_vram_info().map(|(_, t)| t as u64).unwrap_or(0);
-        let cu_hint = self
-            .hip
-            .get_device_attribute(
-                crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                0,
-            )
-            .ok()
-            .filter(|&v| v > 0)
-            .map(|v| crate::profiler::hip_mp_count_to_cu_count(&self.arch, v as u32))
+        // Positive-only: a driver that does not implement an attribute answers
+        // 0, and a 0 MHz memory clock would zero the roofline's peak bandwidth.
+        let attribute = |id: i32| {
+            self.hip
+                .get_device_attribute(id, self.device_id as i32)
+                .ok()
+                .filter(|&v| v > 0)
+                .map(|v| v as u32)
+        };
+        let cu_hint = attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .map(|v| crate::profiler::hip_mp_count_to_cu_count(&self.arch, v))
             .filter(|&v| (4..=256).contains(&v));
-        crate::profiler::profile_kernels_with_hint(
+        // HIP reports both clocks in kilohertz; the profiler works in megahertz.
+        let khz_to_mhz = |khz: u32| khz / 1000;
+        let hints = crate::profiler::HipDeviceHints {
+            cu_count: cu_hint,
+            boost_clock_mhz: attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_CLOCK_RATE)
+                .map(khz_to_mhz)
+                .filter(|&v| v > 0),
+            mem_clock_mhz: attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)
+                .map(khz_to_mhz)
+                .filter(|&v| v > 0),
+            mem_bus_width_bits: attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MEMORY_BUS_WIDTH),
+        };
+        crate::profiler::profile_kernels_with_hints(
             &self.arch,
             vram,
             self.compiler.compiled_kernels(),
-            cu_hint,
+            hints,
         )
     }
 

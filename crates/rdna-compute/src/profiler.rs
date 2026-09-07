@@ -99,6 +99,53 @@ fn arch_spec(arch: &str) -> ArchSpec {
 /// Use [`hip_mp_count_to_cu_count`] to convert per arch.
 pub const HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 63;
 
+/// HIP `hipDeviceAttribute_t` value for `hipDeviceAttributeClockRate` — peak
+/// core clock in **kilohertz**. Position 5 in the CUDA-compatible block, counted
+/// the same way as [`HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`] from
+/// `hipDeviceAttributeEccEnabled = hipDeviceAttributeCudaCompatibleBegin = 0`.
+/// The same walk lands MultiprocessorCount on 63, which is how this counting is
+/// checked against the value already pinned above.
+pub const HIP_DEVICE_ATTRIBUTE_CLOCK_RATE: i32 = 5;
+
+/// HIP `hipDeviceAttribute_t` value for `hipDeviceAttributeMemoryBusWidth` —
+/// global memory bus width in bits. Position 59, same counting.
+pub const HIP_DEVICE_ATTRIBUTE_MEMORY_BUS_WIDTH: i32 = 59;
+
+/// HIP `hipDeviceAttribute_t` value for `hipDeviceAttributeMemoryClockRate` —
+/// peak memory clock in **kilohertz**. Position 60, same counting.
+pub const HIP_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: i32 = 60;
+
+/// Hardware facts a caller holding a HIP runtime handle can supply, for the
+/// values this module otherwise reads from Linux sysfs.
+///
+/// Every field is optional and every one is a *fallback*: sysfs stays primary
+/// on Linux because KFD reports the exact per-SKU figure regardless of CU/WGP
+/// mode and `pp_dpm_*` reports the real DPM ladder. These hints are what make
+/// the roofline resolve on a host with no sysfs at all — Windows, and
+/// containers without `/sys` mounted — where all three readers return `None`
+/// and the arch-keyed constants would otherwise stand in for measured hardware.
+///
+/// `cu_count` is already converted to physical CUs by
+/// [`hip_mp_count_to_cu_count`]; the clock fields are already megahertz, so the
+/// caller owns the kilohertz conversion at the HIP boundary.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HipDeviceHints {
+    pub cu_count: Option<u32>,
+    pub boost_clock_mhz: Option<u32>,
+    pub mem_clock_mhz: Option<u32>,
+    pub mem_bus_width_bits: Option<u32>,
+}
+
+impl HipDeviceHints {
+    /// Only a CU count is known — the shape every pre-existing caller passes.
+    pub fn from_cu_count(cu_count: Option<u32>) -> Self {
+        Self {
+            cu_count,
+            ..Self::default()
+        }
+    }
+}
+
 /// Convert `hipDeviceAttributeMultiprocessorCount` value to physical CU count.
 /// On RDNA wave32 (gfx10xx / gfx11xx / gfx12xx) HIP reports WGP count; one WGP holds two CUs.
 /// On wave64 archs (GCN5 gfx906 / CDNA) WGPs don't exist; HIP reports CU count directly.
@@ -114,14 +161,26 @@ impl GpuCapability {
     /// `hipDeviceGetAttribute(hipDeviceAttributeMultiprocessorCount)` for callers
     /// that hold a HIP runtime handle.
     pub fn detect(arch: &str, vram_bytes: u64) -> Self {
-        Self::detect_with_hint(arch, vram_bytes, None)
+        Self::detect_with_hints(arch, vram_bytes, HipDeviceHints::default())
     }
 
     /// Build from arch string + runtime queries, with an optional CU count hint.
-    /// CU resolution order: KFD sysfs (`simd_count / 2`, exact per SKU regardless of
-    /// CU/WGP mode) → caller-supplied hint (typically HIP runtime) → arch-keyed const.
     pub fn detect_with_hint(arch: &str, vram_bytes: u64, cu_count_hint: Option<u32>) -> Self {
+        Self::detect_with_hints(
+            arch,
+            vram_bytes,
+            HipDeviceHints::from_cu_count(cu_count_hint),
+        )
+    }
+
+    /// Build from arch string + runtime queries, with HIP-supplied hardware hints.
+    ///
+    /// Resolution order for every hinted value: KFD/DRM sysfs → HIP hint →
+    /// arch-keyed const. Sysfs stays first so Linux results are unchanged; the
+    /// hints are what keep the roofline real where sysfs does not exist.
+    pub fn detect_with_hints(arch: &str, vram_bytes: u64, hints: HipDeviceHints) -> Self {
         let spec = arch_spec(arch);
+        let cu_count_hint = hints.cu_count;
 
         // KFD primary; HIP-runtime hint secondary; arch const last resort. The arch const
         // is conservative (smallest in family) so we never overestimate occupancy when both
@@ -142,11 +201,25 @@ impl GpuCapability {
                 }
             });
 
-        // Clock speeds from sysfs
-        let (boost_mhz, mem_mhz) = read_sysfs_clocks().unwrap_or((1800, 875));
+        // Clocks: sysfs DPM ladder, then the HIP peak-clock attributes, then the
+        // conservative pair. A zero-valued hint is treated as absent — a driver
+        // that does not implement an attribute answers 0, and a 0 MHz memory
+        // clock would make `peak_bw` zero and the ridge point infinite.
+        let (sysfs_boost, sysfs_mem) = match read_sysfs_clocks() {
+            Some((boost, mem)) => (Some(boost), Some(mem)),
+            None => (None, None),
+        };
+        let boost_mhz = sysfs_boost
+            .or(hints.boost_clock_mhz.filter(|&v| v > 0))
+            .unwrap_or(1800);
+        let mem_mhz = sysfs_mem
+            .or(hints.mem_clock_mhz.filter(|&v| v > 0))
+            .unwrap_or(875);
 
-        // Detect bus width from VRAM size heuristic when sysfs unavailable
-        let bus_width = read_sysfs_bus_width().unwrap_or(spec.default_bus_width);
+        // Bus width: KFD topology, then the HIP attribute, then the arch default.
+        let bus_width = read_sysfs_bus_width()
+            .or(hints.mem_bus_width_bits.filter(|&v| v > 0))
+            .unwrap_or(spec.default_bus_width);
 
         // GDDR6 effective rate: sysfs reports interface clock (e.g., 875 MHz).
         // GDDR6 data rate = clock * 2 (DDR) * 8 (prefetch) = 16x multiplier.
@@ -219,7 +292,12 @@ pub fn profile_kernels(
     vram_bytes: u64,
     compiled_kernels: &HashMap<String, std::path::PathBuf>,
 ) -> (GpuCapability, Vec<KernelProfile>) {
-    profile_kernels_with_hint(arch, vram_bytes, compiled_kernels, None)
+    profile_kernels_with_hints(
+        arch,
+        vram_bytes,
+        compiled_kernels,
+        HipDeviceHints::default(),
+    )
 }
 
 /// Profile with an optional runtime CU count hint (typically from
@@ -230,7 +308,22 @@ pub fn profile_kernels_with_hint(
     compiled_kernels: &HashMap<String, std::path::PathBuf>,
     cu_count_hint: Option<u32>,
 ) -> (GpuCapability, Vec<KernelProfile>) {
-    let cap = GpuCapability::detect_with_hint(arch, vram_bytes, cu_count_hint);
+    profile_kernels_with_hints(
+        arch,
+        vram_bytes,
+        compiled_kernels,
+        HipDeviceHints::from_cu_count(cu_count_hint),
+    )
+}
+
+/// Profile with the full set of HIP-supplied hardware hints.
+pub fn profile_kernels_with_hints(
+    arch: &str,
+    vram_bytes: u64,
+    compiled_kernels: &HashMap<String, std::path::PathBuf>,
+    hints: HipDeviceHints,
+) -> (GpuCapability, Vec<KernelProfile>) {
+    let cap = GpuCapability::detect_with_hints(arch, vram_bytes, hints);
     let mut profiles = Vec::new();
 
     for (name, path) in compiled_kernels {
