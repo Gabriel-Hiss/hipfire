@@ -1308,6 +1308,7 @@ dependencies = [
  "bytes",
  "clap",
  "ctrlc",
+ "hip-bridge",
  "hipfire-client",
  "hipfire-config",
  "hipfire-registry",
@@ -1316,6 +1317,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "rdna-compute",
  "saddle-core",
  "serde",
  "serde_json",
@@ -1323,6 +1325,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1367,6 +1370,7 @@ dependencies = [
  "serde_json",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1583,6 +1587,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2714,6 +2719,7 @@ dependencies = [
  "rayon",
  "redline-dispatch",
  "redline-rocr",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

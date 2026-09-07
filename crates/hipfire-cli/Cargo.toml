@@ -23,6 +23,12 @@ hipfire-config = { path = "../hipfire-config" }
 hipfire-client = { path = "../hipfire-client" }
 hipfire-registry = { path = "../hipfire-registry" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false, features = ["deltanet"] }
+# Direct, not transitive: `diag` enumerates HIP devices for its GPU-target row
+# and the pre-load preflight reads the host's available memory. Rust cannot name
+# a transitive crate, and both of those probes are the shared host-generic
+# implementations rather than CLI-local copies.
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 
 serde = { version = "1", features = ["derive"] }
@@ -31,3 +37,6 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 ureq = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

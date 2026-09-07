@@ -49,3 +49,6 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

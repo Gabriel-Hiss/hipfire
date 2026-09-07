@@ -642,3 +642,6 @@ required-features = ["deltanet"]
 [[example]]
 name = "h2d_mmap_bench"
 required-features = ["deltanet"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
