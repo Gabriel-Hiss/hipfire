@@ -138,6 +138,19 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
                 }
             }
         }
+        // Windows has no execute bit; whether a file can be launched is decided
+        // by its extension against PATHEXT. Checking that still catches the
+        // real mistake this guard exists for — pointing `--hipcc` at a log, a
+        // README, or the SDK directory instead of the compiler.
+        #[cfg(windows)]
+        if !path_is_windows_executable(hipcc) {
+            bail!(
+                "--hipcc {} is not an executable file on this host; expected one of PATHEXT ({}). \
+                 The Windows HIP SDK installs bin\\hipcc.bat and bin\\hipcc.exe",
+                hipcc.display(),
+                windows_pathext().join(";")
+            );
+        }
     }
     // Export for child processes (single-threaded installer, safe).
     if let Some(hipcc) = hipcc_override {
@@ -262,6 +275,10 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     fs::create_dir_all(&paths.models)
         .with_context(|| format!("failed to create {}", paths.models.display()))?;
 
+    // Collect any backup or staging file a previous install could not delete
+    // before staging new ones, so `bin/` does not accumulate `.prev-*` copies.
+    sweep_stale_backups(&bin_dir);
+
     // Always consume `<source>/target` regardless of ambient Cargo config.
     let release = source.join("target").join("release");
     let mut replacements: Vec<BinaryReplacement> = Vec::new();
@@ -281,26 +298,30 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
             }
         };
 
-    install_one(
-        &release.join("daemon"),
-        &bin_dir.join("daemon"),
-        &mut replacements,
-    )?;
-    install_one(
-        &release.join("hipfire"),
-        &bin_dir.join("hipfire"),
-        &mut replacements,
-    )?;
-    if tui_built {
-        let src = release.join("hipfire-tui");
-        if src.is_file() {
-            install_one(&src, &bin_dir.join("hipfire-tui"), &mut replacements)?;
-        }
+    // Cargo emits `daemon.exe` on Windows and `daemon` elsewhere; both the
+    // artifact hunted for in `target/release` and the installed name have to
+    // carry the host's suffix, or setup reports "build artifact missing" for a
+    // binary that was built successfully and installs something the shell
+    // cannot launch.
+    for stem in ["daemon", "hipfire"] {
+        let name = exe_file_name(stem);
+        install_one(
+            &release.join(&name),
+            &bin_dir.join(&name),
+            &mut replacements,
+        )?;
     }
-    if quantize_built {
-        let src = release.join("hipfire-quantize");
+    for (built, stem) in [
+        (tui_built, "hipfire-tui"),
+        (quantize_built, "hipfire-quantize"),
+    ] {
+        if !built {
+            continue;
+        }
+        let name = exe_file_name(stem);
+        let src = release.join(&name);
         if src.is_file() {
-            install_one(&src, &bin_dir.join("hipfire-quantize"), &mut replacements)?;
+            install_one(&src, &bin_dir.join(&name), &mut replacements)?;
         }
     }
     ensure_not_interrupted().map_err(|err| {
@@ -321,7 +342,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         err
     })?;
 
-    let mut precompile = Command::new(bin_dir.join("daemon"));
+    let mut precompile = Command::new(bin_dir.join(exe_file_name("daemon")));
     precompile.arg("--precompile");
     apply_rocm_env(&mut precompile, &rocm_root);
     match run_capturing(precompile) {
@@ -406,7 +427,18 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
 
     println!("hipfire installed to {}", bin_dir.display());
     if !path_on_path(&bin_dir) {
-        println!("export PATH=\"{}:$PATH\"", bin_dir.display());
+        // Emit the command for the host's own shell. `setx` is deliberately not
+        // suggested: it truncates a user PATH longer than 1024 characters,
+        // which silently destroys entries.
+        if cfg!(windows) {
+            println!(
+                "Add it to your user PATH (PowerShell):\n  [Environment]::SetEnvironmentVariable('PATH', \
+                 [Environment]::GetEnvironmentVariable('PATH','User') + ';{}', 'User')",
+                bin_dir.display()
+            );
+        } else {
+            println!("export PATH=\"{}:$PATH\"", bin_dir.display());
+        }
     }
     Ok(())
 }
@@ -920,6 +952,41 @@ struct BinaryReplacement {
     backup: Option<PathBuf>,
 }
 
+/// `stem` with this host's executable suffix: `daemon.exe` on Windows,
+/// `daemon` elsewhere. `std::env::consts::EXE_SUFFIX` is the compile-time
+/// answer for the target hipfire itself was built for, which is the same target
+/// cargo just built the artifacts for.
+fn exe_file_name(stem: &str) -> String {
+    format!("{stem}{}", env::consts::EXE_SUFFIX)
+}
+
+/// Executable extensions this host will launch, upper-cased and dot-prefixed.
+///
+/// `PATHEXT` is the only definition of "executable" Windows has; when it is
+/// unset the shell's documented default applies.
+#[cfg(windows)]
+fn windows_pathext() -> Vec<String> {
+    let raw = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    raw.split(';')
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| ext.to_ascii_uppercase())
+        .collect()
+}
+
+/// True when `path` is a file this host would launch as a program.
+#[cfg(windows)]
+fn path_is_windows_executable(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = format!(".{}", ext.to_ascii_uppercase());
+    windows_pathext().iter().any(|known| *known == ext)
+}
+
 /// Unique same-directory backup path for an existing destination.
 fn backup_path_for(dest: &Path, nonce: u128) -> Result<PathBuf> {
     let parent = dest
@@ -981,35 +1048,91 @@ fn install_binary_with_backup(src: &Path, dest: &Path) -> Result<BinaryReplaceme
         }
     }
 
-    // 2) Preserve an existing destination by copying it to backup while it stays live.
-    let backup = if dest.is_file() {
-        let backup = backup_path_for(dest, install_nonce())?;
-        if let Err(err) = fs::copy(dest, &backup) {
+    // 2) and 3) differ by platform because the two kernels disagree about what
+    // may be done to a running executable.
+    //
+    // Unix keeps the live destination in place, copies it aside, and renames the
+    // staged temp over it. `rename(2)` replacing a busy binary is legal, so the
+    // destination is never absent for even an instant.
+    //
+    // Windows refuses to replace the image of a running process
+    // (ERROR_SHARING_VIOLATION), which is precisely why `Copy-Item -Force` and
+    // a replace-rename both fail when hipfire updates itself. It does permit
+    // *renaming* a running image away, so the order inverts: move the live
+    // destination to the backup name first, then rename the temp into the now
+    // vacant destination. The running process keeps executing from the renamed
+    // file; only the path changes.
+    #[cfg(not(windows))]
+    let backup = {
+        let backup = if dest.is_file() {
+            let backup = backup_path_for(dest, install_nonce())?;
+            if let Err(err) = fs::copy(dest, &backup) {
+                let _ = fs::remove_file(&tmp);
+                let _ = fs::remove_file(&backup);
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to backup existing {} -> {}",
+                        dest.display(),
+                        backup.display()
+                    )
+                });
+            }
+            Some(backup)
+        } else {
+            None
+        };
+
+        if let Err(err) = fs::rename(&tmp, dest) {
             let _ = fs::remove_file(&tmp);
-            let _ = fs::remove_file(&backup);
+            // Destination is still the prior live binary; drop the unused backup copy.
+            if let Some(backup) = &backup {
+                let _ = fs::remove_file(backup);
+            }
             return Err(err).with_context(|| {
-                format!(
-                    "failed to backup existing {} -> {}",
-                    dest.display(),
-                    backup.display()
-                )
+                format!("failed to install {} -> {}", src.display(), dest.display())
             });
         }
-        Some(backup)
-    } else {
-        None
+        backup
     };
 
-    // 3) Atomic same-directory rename over the live destination.
-    if let Err(err) = fs::rename(&tmp, dest) {
-        let _ = fs::remove_file(&tmp);
-        // Destination is still the prior live binary; drop the unused backup copy.
-        if let Some(backup) = &backup {
-            let _ = fs::remove_file(backup);
+    #[cfg(windows)]
+    let backup = {
+        let backup = if dest.is_file() {
+            let backup = backup_path_for(dest, install_nonce())?;
+            if let Err(err) = fs::rename(dest, &backup) {
+                let _ = fs::remove_file(&tmp);
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to move the existing {} aside to {}",
+                        dest.display(),
+                        backup.display()
+                    )
+                });
+            }
+            Some(backup)
+        } else {
+            None
+        };
+
+        if let Err(err) = fs::rename(&tmp, dest) {
+            let _ = fs::remove_file(&tmp);
+            // The destination is currently vacant — put the prior binary back
+            // before returning, or the install leaves no working executable.
+            if let Some(backup) = &backup {
+                if let Err(restore) = fs::rename(backup, dest) {
+                    eprintln!(
+                        "WARNING: failed to restore {} from {}: {restore}",
+                        dest.display(),
+                        backup.display()
+                    );
+                }
+            }
+            return Err(err).with_context(|| {
+                format!("failed to install {} -> {}", src.display(), dest.display())
+            });
         }
-        return Err(err)
-            .with_context(|| format!("failed to install {} -> {}", src.display(), dest.display()));
-    }
+        backup
+    };
 
     Ok(BinaryReplacement {
         dest: dest.to_path_buf(),
@@ -1090,15 +1213,47 @@ fn rollback_replacements(replacements: &[BinaryReplacement]) {
 }
 
 /// Drop successful-install backups; cleanup failure is warning-only.
+///
+/// On Windows a backup can be the image of the process doing the install — that
+/// is the whole point of the rename-aside in [`install_binary_with_backup`] — so
+/// deletion legitimately fails with a sharing violation until that process
+/// exits. That is expected, not a problem worth a warning, and
+/// [`sweep_stale_backups`] collects it on the next install.
 fn cleanup_backups(replacements: &[BinaryReplacement]) {
     for rep in replacements {
         if let Some(backup) = &rep.backup {
             if let Err(err) = fs::remove_file(backup) {
+                if cfg!(windows) && err.kind() == io::ErrorKind::PermissionDenied {
+                    continue;
+                }
                 eprintln!(
                     "WARNING: failed to remove install backup {}: {err}",
                     backup.display()
                 );
             }
+        }
+    }
+}
+
+/// Remove `.<name>.prev-*` and `.<name>.install-*` leftovers in `bin_dir`.
+///
+/// Run before installing, never after: a backup that could not be deleted at
+/// the end of the previous install was locked because it was that install's own
+/// running binary, and by the time a later install starts, that process is
+/// gone. Failure is ignored — a leftover byte-for-byte copy of an old binary is
+/// clutter, not a fault, and must not fail an otherwise good install.
+fn sweep_stale_backups(bin_dir: &Path) {
+    let Ok(entries) = fs::read_dir(bin_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with('.') {
+            continue;
+        }
+        if name.contains(".prev-") || name.contains(".install-") {
+            let _ = fs::remove_file(entry.path());
         }
     }
 }

@@ -3435,6 +3435,7 @@ struct ProcessRecord {
     command: String,
 }
 
+#[cfg(not(windows))]
 fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
     let mut quantize = Vec::new();
     let mut uploads = Vec::new();
@@ -3491,6 +3492,14 @@ fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
     (quantize, uploads)
 }
 
+#[cfg(windows)]
+fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
+    // Windows process enumeration belongs to the serve lifecycle layer; an
+    // empty auxiliary list preserves the previous best-effort fallback without
+    // probing the nonexistent procfs.
+    (Vec::new(), Vec::new())
+}
+
 fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
@@ -3500,7 +3509,7 @@ fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
         .ok()
         .and_then(|raw| parse_pid_record(&raw));
     let pid = pid_record.as_ref().map(|record| record.pid);
-    let alive = pid.is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists());
+    let alive = pid.is_some_and(crate::serve::process_is_alive);
     let health = http_get_json(&host, port, "/health");
     let stats = http_get_json(&host, port, "/stats");
     let (quantize, uploads) = scan_auxiliary_processes();
@@ -3886,16 +3895,9 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
         return Ok(());
     };
     let need = meta.len();
-    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+    let Some(avail) = rdna_compute::kv_slots::mem_available_bytes() else {
         return Ok(());
     };
-    let avail_kb = meminfo
-        .lines()
-        .find_map(|l| l.strip_prefix("MemAvailable:"))
-        .and_then(|v| v.split_whitespace().next())
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    let avail = avail_kb * 1024;
     // 20% headroom over the raw weight bytes for KV arenas and scratch.
     let want = need + need / 5;
     if avail < want {
@@ -4524,11 +4526,10 @@ fn ensure_update_not_interrupted() -> Result<()> {
 }
 
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
-    if !cfg!(target_os = "linux") {
-        bail!(
-            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
-        );
-    }
+    #[cfg(all(not(target_os = "linux"), not(windows)))]
+    bail!(
+        "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
+    );
     // Install before any fetch/mutation so SIGINT cannot race past the guard.
     install_update_interrupt_handler();
     UPDATE_INTERRUPT.store(false, Ordering::SeqCst);
@@ -4705,39 +4706,154 @@ impl Drop for UpdateRollbackGuard {
 }
 
 fn run_update_installer(repo: &Path, paths: &Paths, resolved: &ResolvedRevision) -> Result<()> {
+    #[cfg(windows)]
+    let installer = repo.join("scripts/install.ps1");
+    #[cfg(not(windows))]
     let installer = repo.join("scripts/install.sh");
     if !installer.is_file() {
         bail!("updated checkout has no {}", installer.display());
     }
-    let recorded = recorded_install_metadata(&paths.root);
-    let mut installer_cmd = Command::new("bash");
-    installer_cmd
-        .arg(&installer)
-        .current_dir(repo)
-        .env("HIPFIRE_FORCE_REBUILD", "1");
-    #[cfg(unix)]
+
+    #[cfg(windows)]
     {
-        // Own process group so SIGTERM/KILL can reach the whole installer tree.
-        installer_cmd.process_group(0);
+        let recorded = recorded_install_metadata(&paths.root);
+        let mut installer_cmd = Command::new("powershell");
+        installer_cmd
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&installer)
+            .current_dir(repo)
+            .env("HIPFIRE_FORCE_REBUILD", "1");
+        for arg in powershell_installer_handoff_args(
+            &resolved.selector,
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
+        ) {
+            installer_cmd.arg(arg);
+        }
+        run_update_installer_child(installer_cmd)
     }
-    for arg in installer_handoff_args(
-        &resolved.selector,
-        recorded.rocm_root.as_deref(),
-        recorded.gpu_arch.as_deref(),
-        recorded.hipcc.as_deref(),
-        recorded.strict_rocm,
-    ) {
-        installer_cmd.arg(arg);
+
+    #[cfg(not(windows))]
+    {
+        let recorded = recorded_install_metadata(&paths.root);
+        let mut installer_cmd = Command::new("bash");
+        installer_cmd
+            .arg(&installer)
+            .current_dir(repo)
+            .env("HIPFIRE_FORCE_REBUILD", "1");
+        #[cfg(unix)]
+        {
+            // Own process group so SIGTERM/KILL can reach the whole installer tree.
+            installer_cmd.process_group(0);
+        }
+        for arg in installer_handoff_args(
+            &resolved.selector,
+            recorded.rocm_root.as_deref(),
+            recorded.gpu_arch.as_deref(),
+            recorded.hipcc.as_deref(),
+            recorded.strict_rocm,
+        ) {
+            installer_cmd.arg(arg);
+        }
+        run_update_installer_child(installer_cmd)
     }
-    run_update_installer_child(installer_cmd)
 }
 
-/// Spawn the installer, poll-wait, and on interrupt TERM then KILL the group.
-fn run_update_installer_child(mut installer_cmd: Command) -> Result<()> {
-    let mut child = installer_cmd
-        .spawn()
-        .context("failed to start native installer")?;
-    let status = wait_update_installer_child(&mut child)?;
+#[cfg(windows)]
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl JobHandle {
+    fn new() -> std::io::Result<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        // Safety: both optional pointers are null, requesting an unnamed job
+        // with the caller's default security descriptor.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let job = Self(handle);
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // Safety: `job.0` is a live job handle and `limits` points to a
+        // correctly sized structure for JobObjectExtendedLimitInformation.
+        if unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    fn assign(&self, child: &Child) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let process = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        // Safety: both handles are live for this call; `process` is owned by
+        // `child` and the job handle remains owned by `self`.
+        if unsafe { AssignProcessToJobObject(self.0, process) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        // Safety: this wrapper uniquely owns the non-null handle returned by
+        // CreateJobObjectW and closes it exactly once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+struct UpdateInstallerChild {
+    child: Child,
+    #[cfg(windows)]
+    job: JobHandle,
+}
+
+impl UpdateInstallerChild {
+    fn spawn(mut command: Command) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        let job = JobHandle::new()?;
+        let mut child = command.spawn()?;
+        #[cfg(windows)]
+        if let Err(err) = job.assign(&child) {
+            // The process was not admitted to the kill-on-close job, so reap
+            // the direct child before returning rather than leaking it.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            job,
+        })
+    }
+}
+
+/// Spawn the installer, poll-wait, and terminate its process tree on interrupt.
+fn run_update_installer_child(installer_cmd: Command) -> Result<()> {
+    let mut installer =
+        UpdateInstallerChild::spawn(installer_cmd).context("failed to start native installer")?;
+    let status = wait_update_installer_child(&mut installer)?;
     if update_interrupted() {
         bail!("update interrupted");
     }
@@ -4748,14 +4864,17 @@ fn run_update_installer_child(mut installer_cmd: Command) -> Result<()> {
     }
 }
 
-fn wait_update_installer_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+fn wait_update_installer_child(
+    installer: &mut UpdateInstallerChild,
+) -> Result<std::process::ExitStatus> {
     loop {
-        match child.try_wait() {
+        match installer.child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {
                 if update_interrupted() {
-                    terminate_update_installer_group(child);
-                    return child
+                    terminate_update_installer_group(installer);
+                    return installer
+                        .child
                         .wait()
                         .context("failed to reap interrupted native installer");
                 }
@@ -4768,13 +4887,16 @@ fn wait_update_installer_child(child: &mut Child) -> Result<std::process::ExitSt
     }
 }
 
-/// TERM the installer process group, then bounded KILL fallback; always wait/reap.
-fn terminate_update_installer_group(child: &mut Child) {
+/// TERM the Unix process group or terminate the Windows Job Object; always reap.
+fn terminate_update_installer_group(installer: &mut UpdateInstallerChild) {
     #[cfg(unix)]
     {
+        let child = &mut installer.child;
         let pid = child.id() as i32;
         if pid > 0 {
             // Negative pid targets the process group created via process_group(0).
+            // Safety: `pid` came from the live child and negating it addresses
+            // only the process group created for this installer.
             unsafe {
                 libc::kill(-pid, libc::SIGTERM);
             }
@@ -4786,14 +4908,24 @@ fn terminate_update_installer_group(child: &mut Child) {
                     Err(_) => break,
                 }
             }
+            // Safety: the same live child process-group id remains valid until
+            // the caller reaps it immediately after this function returns.
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = child.kill();
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        // Safety: `installer.job` is the live job containing the child and all
+        // descendants; exit code 1 is an application-defined failure status.
+        if unsafe { TerminateJobObject(installer.job.0, 1) } == 0 {
+            // A failed Job Object termination must not leave the direct child
+            // blocking the reap path indefinitely.
+            let _ = installer.child.kill();
+        }
     }
 }
 
@@ -4842,6 +4974,53 @@ fn installer_handoff_args(
     }
     if strict_rocm {
         args.push("--strict-rocm".to_owned());
+    }
+    args
+}
+
+/// Args forwarded to scripts/install.ps1 during noninteractive update handoff.
+///
+/// Same option set as [`installer_handoff_args`], spelled as PowerShell
+/// parameters. `install.ps1` forwards them to `hipfire setup`, so an update
+/// that resolved a ROCm root or a GPU arch from `install.json` keeps that
+/// selection instead of re-detecting it.
+#[cfg(windows)]
+fn powershell_installer_handoff_args(
+    selector: &RevisionSelector,
+    rocm_root: Option<&Path>,
+    gpu_arch: Option<&str>,
+    hipcc: Option<&Path>,
+    strict_rocm: bool,
+) -> Vec<String> {
+    let parameter = match selector.kind {
+        RevisionKind::Auto => "-Ref",
+        RevisionKind::Branch => "-Branch",
+        RevisionKind::Tag => "-Tag",
+        RevisionKind::Commit => "-Commit",
+    };
+    let mut args = vec![
+        "-Yes".to_owned(),
+        parameter.to_owned(),
+        selector.value.clone(),
+    ];
+    if let Some(root) = rocm_root {
+        args.push("-RocmRoot".to_owned());
+        args.push(root.to_string_lossy().into_owned());
+    }
+    if let Some(arch) = gpu_arch.map(str::trim).filter(|arch| !arch.is_empty()) {
+        args.push("-GpuArch".to_owned());
+        args.push(arch.to_owned());
+    }
+    if let Some(hipcc) = hipcc
+        .map(|p| p.to_string_lossy().into_owned())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
+        args.push("-Hipcc".to_owned());
+        args.push(hipcc);
+    }
+    if strict_rocm {
+        args.push("-StrictRocm".to_owned());
     }
     args
 }
@@ -5479,8 +5658,13 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let models = list_local_models(paths, &loaded_registry.registry)?;
     let loaded_config = load_global(&paths.config)?;
     let platform = format!("{}-{}", env::consts::OS, env::consts::ARCH);
-    let kfd = Path::new("/dev/kfd").exists();
-    let amdgpu_loaded = Path::new("/sys/module/amdgpu").exists();
+    #[cfg(windows)]
+    let (kfd, amdgpu_loaded) = (false, false);
+    #[cfg(not(windows))]
+    let (kfd, amdgpu_loaded) = (
+        Path::new("/dev/kfd").exists(),
+        Path::new("/sys/module/amdgpu").exists(),
+    );
     let gpu_arches = detect_gpu_arches();
     let gpus = detect_amd_drm_cards();
     let hipcc = command_version("hipcc", "--version");
@@ -5519,9 +5703,13 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let gpu = gpu_arches
         .first()
         .map(|arch| serde_json::json!({ "arch": arch }))
-        .unwrap_or_else(
-            || serde_json::json!({ "error": "no gfx target detected in KFD topology" }),
-        );
+        .unwrap_or_else(|| {
+            #[cfg(windows)]
+            let error = "no gfx target detected from HIP";
+            #[cfg(not(windows))]
+            let error = "no gfx target detected in KFD topology";
+            serde_json::json!({ "error": error })
+        });
     let config_overrides = loaded_config
         .layer
         .values
@@ -5555,15 +5743,25 @@ fn diag_command(paths: &Paths, output: OutputArgs) -> Result<()> {
             report["registry"].as_str().unwrap_or("unknown")
         );
         println!("platform:      {platform}");
-        println!(
-            "amdgpu:       {}",
-            if amdgpu_loaded {
-                "loaded"
-            } else {
-                "not loaded"
-            }
-        );
-        println!("/dev/kfd:      {}", if kfd { "present" } else { "missing" });
+        #[cfg(windows)]
+        println!("driver model:  WDDM");
+        #[cfg(windows)]
+        {
+            println!("amdgpu:       n/a (WDDM)");
+            println!("/dev/kfd:      n/a (WDDM)");
+        }
+        #[cfg(not(windows))]
+        {
+            println!(
+                "amdgpu:       {}",
+                if amdgpu_loaded {
+                    "loaded"
+                } else {
+                    "not loaded"
+                }
+            );
+            println!("/dev/kfd:      {}", if kfd { "present" } else { "missing" });
+        }
         println!(
             "GPU targets:   {}",
             if gpu_arches.is_empty() {
@@ -5652,28 +5850,44 @@ fn parse_major_minor(value: &str) -> Option<(u64, u64)> {
 }
 
 fn detect_gpu_arches() -> Vec<String> {
-    let root = Path::new("/sys/class/kfd/kfd/topology/nodes");
     let mut arches = Vec::new();
-    let Ok(nodes) = fs::read_dir(root) else {
-        return arches;
-    };
-    for node in nodes.flatten() {
-        let Ok(properties) = fs::read_to_string(node.path().join("properties")) else {
-            continue;
-        };
-        let Some(version) = properties.lines().find_map(|line| {
-            line.split_whitespace()
-                .collect::<Vec<_>>()
-                .as_slice()
-                .strip_prefix(&["gfx_target_version"])
-                .and_then(|rest| rest.first())
-                .and_then(|value| value.parse::<u32>().ok())
-        }) else {
-            continue;
-        };
-        if let Some(arch) = gfx_version_to_arch(version) {
-            if !arches.iter().any(|candidate| candidate == arch) {
-                arches.push(arch.to_owned());
+    #[cfg(not(windows))]
+    {
+        let root = Path::new("/sys/class/kfd/kfd/topology/nodes");
+        if let Ok(nodes) = fs::read_dir(root) {
+            for node in nodes.flatten() {
+                let Ok(properties) = fs::read_to_string(node.path().join("properties")) else {
+                    continue;
+                };
+                let Some(version) = properties.lines().find_map(|line| {
+                    line.split_whitespace()
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                        .strip_prefix(&["gfx_target_version"])
+                        .and_then(|rest| rest.first())
+                        .and_then(|value| value.parse::<u32>().ok())
+                }) else {
+                    continue;
+                };
+                if let Some(arch) = gfx_version_to_arch(version) {
+                    if !arches.iter().any(|candidate| candidate == arch) {
+                        arches.push(arch.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    if arches.is_empty() {
+        if let Ok(hip) = hip_bridge::HipRuntime::load() {
+            if let Ok(device_count) = hip.device_count() {
+                for device_id in 0..device_count {
+                    let Ok(arch) = hip.get_arch(device_id) else {
+                        continue;
+                    };
+                    if arch != "unknown" && !arches.iter().any(|candidate| candidate == &arch) {
+                        arches.push(arch);
+                    }
+                }
             }
         }
     }
@@ -5698,34 +5912,48 @@ fn gfx_version_to_arch(version: u32) -> Option<&'static str> {
 }
 
 fn detect_amd_drm_cards() -> Vec<String> {
-    let mut cards = Vec::new();
-    let Ok(entries) = fs::read_dir("/sys/class/drm") else {
-        return cards;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with("card") || !name[4..].bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
-        let vendor = fs::read_to_string(entry.path().join("device/vendor")).unwrap_or_default();
-        if vendor.trim() == "0x1002" {
-            cards.push(name);
-        }
+    #[cfg(windows)]
+    {
+        Vec::new()
     }
-    cards.sort();
-    cards
+    #[cfg(not(windows))]
+    {
+        let mut cards = Vec::new();
+        let Ok(entries) = fs::read_dir("/sys/class/drm") else {
+            return cards;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("card") || !name[4..].bytes().all(|byte| byte.is_ascii_digit()) {
+                continue;
+            }
+            let vendor = fs::read_to_string(entry.path().join("device/vendor")).unwrap_or_default();
+            if vendor.trim() == "0x1002" {
+                cards.push(name);
+            }
+        }
+        cards.sort();
+        cards
+    }
 }
 
 fn list_dri_nodes() -> Vec<String> {
-    let Ok(entries) = fs::read_dir("/dev/dri") else {
-        return Vec::new();
-    };
-    let mut nodes = entries
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    nodes.sort();
-    nodes
+    #[cfg(windows)]
+    {
+        Vec::new()
+    }
+    #[cfg(not(windows))]
+    {
+        let Ok(entries) = fs::read_dir("/dev/dri") else {
+            return Vec::new();
+        };
+        let mut nodes = entries
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        nodes.sort();
+        nodes
+    }
 }
 
 fn command_version(command: &str, argument: &str) -> Option<String> {
@@ -7541,16 +7769,28 @@ mod tests {
         let mut guard = UpdateRollbackGuard::arm(installed.clone(), checkpoint);
         assert!(guard.is_armed());
 
-        let mut cmd = Command::new("bash");
-        cmd.arg("-c")
-            .arg("trap 'exit 0' TERM; while true; do sleep 0.05; done")
-            .current_dir(&installed);
         #[cfg(unix)]
-        {
+        let mut cmd = {
+            let mut cmd = Command::new("bash");
+            cmd.arg("-c")
+                .arg("trap 'exit 0' TERM; while true; do sleep 0.05; done")
+                .current_dir(&installed);
             cmd.process_group(0);
-        }
-        let mut child = cmd.spawn().unwrap();
-        let child_pid = child.id();
+            cmd
+        };
+        #[cfg(windows)]
+        let cmd = {
+            let mut cmd = Command::new("powershell");
+            cmd.args([
+                "-NoProfile",
+                "-Command",
+                "while ($true) { Start-Sleep -Milliseconds 50 }",
+            ])
+            .current_dir(&installed);
+            cmd
+        };
+        let mut child = UpdateInstallerChild::spawn(cmd).unwrap();
+        let child_pid = child.child.id();
 
         // Arm interrupt after spawn so the wait loop takes the TERM path.
         UPDATE_INTERRUPT.store(true, Ordering::SeqCst);
@@ -7561,7 +7801,7 @@ mod tests {
         );
 
         // Child must be reaped (no zombie); try_wait Ok(Some) or Err after wait.
-        match child.try_wait() {
+        match child.child.try_wait() {
             Ok(Some(_)) => {}
             Ok(None) => panic!("installer child {child_pid} was not reaped"),
             Err(_) => {}
