@@ -57,6 +57,7 @@ fn main() {
     // fresh so PTEs are absent too. `posix_fadvise(DONTNEED)` is only honored
     // while the file is NOT mmap'd, which is why the drop runs on the plain
     // handle before `Mmap::map`.
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
@@ -65,6 +66,12 @@ fn main() {
             eprintln!("warn: fadvise DONTNEED failed (rc={rc}); MMAP_COLD may be partially warm");
         }
     }
+    // No portable way to evict a file from the page cache: `posix_fadvise` is
+    // Linux-only and Windows exposes no equivalent to a process. MMAP_COLD
+    // still runs, it just measures a warm mapping — read it as a second
+    // MMAP_WARM_PTE row, not as a cold-start number.
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("warn: page-cache drop is Linux-only; MMAP_COLD is warm on this host");
     let mmap = unsafe { memmap2::Mmap::map(&file).expect("mmap") };
     let (reps, dt) = sweep_mmap(&gpu, &dst, &mmap, chunk);
     report("MMAP_COLD    ", reps * chunk, dt);
@@ -76,6 +83,7 @@ fn main() {
     // (d) POPULATE_READ then sweep: pre-faults everything up front, so the
     // sweep itself carries zero fault cost. Delta vs (c) shows how much of
     // even the "warm" pass was still fault handling.
+    #[cfg(target_os = "linux")]
     unsafe {
         libc::madvise(
             mmap.as_ptr() as *mut libc::c_void,
@@ -83,6 +91,8 @@ fn main() {
             libc::MADV_POPULATE_READ,
         );
     }
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("warn: MADV_POPULATE_READ is Linux-only; MMAP_POPULATE repeats the warm sweep");
     let (reps, dt) = sweep_mmap(&gpu, &dst, &mmap, chunk);
     report("MMAP_POPULATE", reps * chunk, dt);
 }

@@ -154,7 +154,7 @@ fn read_jobs_from_path(
             let path = path.clone();
             let next_job = &next_job;
             scope.spawn(move || {
-                let file = match File::open(&path) {
+                let file = match open_sequential(&path) {
                     Ok(file) => file,
                     Err(error) => {
                         loop {
@@ -246,18 +246,39 @@ fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result<()> 
     file.read_exact(buffer)
 }
 
+#[cfg(windows)]
+fn open_sequential(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_sequential(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
 #[cfg(unix)]
 fn advise_sequential(file: &File) {
     use std::os::fd::AsRawFd;
+    // Safety: `file` remains open for the advisory call.
     let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
 }
 
 #[cfg(not(unix))]
-fn advise_sequential(_file: &File) {}
+fn advise_sequential(_file: &File) {
+    // Windows applies FILE_FLAG_SEQUENTIAL_SCAN when `open_sequential` creates
+    // the handle, before the cache manager observes any reads.
+}
 
 #[cfg(unix)]
 fn advise_dontneed(file: &File, offset: usize, len: usize) {
     use std::os::fd::AsRawFd;
+    // Safety: `file` remains open for the advisory call.
     let _ = unsafe {
         libc::posix_fadvise(
             file.as_raw_fd(),
@@ -269,7 +290,10 @@ fn advise_dontneed(file: &File, offset: usize, len: usize) {
 }
 
 #[cfg(not(unix))]
-fn advise_dontneed(_file: &File, _offset: usize, _len: usize) {}
+fn advise_dontneed(_file: &File, _offset: usize, _len: usize) {
+    // Windows exposes no supported unprivileged per-range file-cache eviction,
+    // so a load retains more standby memory than the POSIX path after upload.
+}
 
 #[cfg(test)]
 mod tests {

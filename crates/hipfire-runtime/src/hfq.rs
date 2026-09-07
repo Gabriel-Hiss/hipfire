@@ -29,6 +29,8 @@ use std::path::Path;
 /// mappings (memmap2 default). posix_fadvise on the fd does.
 #[cfg(unix)]
 fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
+    // Safety: `fd` is borrowed from a live `File`; this advisory does not
+    // dereference caller-provided memory.
     unsafe {
         libc::posix_fadvise(
             fd,
@@ -40,7 +42,10 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 }
 
 #[cfg(not(unix))]
-fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
+fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {
+    // Windows exposes no supported unprivileged per-range file-cache eviction,
+    // so a load retains more standby memory than the POSIX path after upload.
+}
 
 impl HfqFile {
     /// Start a background parallel cache warmer: N worker threads pread the
@@ -104,6 +109,8 @@ impl HfqFile {
                         let len = CHUNK.min(end - off);
                         let mut got = 0usize;
                         while got < len {
+                            // Safety: `fd` remains open for the worker lifetime
+                            // and this writable slice has `len - got` bytes.
                             let n = unsafe {
                                 libc::pread(
                                     fd,
@@ -149,12 +156,15 @@ impl HfqFile {
         let Ok(file) = std::fs::File::open(&self.path) else {
             return false;
         };
+        // Safety: `file` remains open until the mapping has been created.
         let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
             return false;
         };
         let page = 4096usize;
         let n_pages = mmap.len().div_ceil(page);
         let mut vec = vec![0u8; n_pages];
+        // Safety: `mmap` is a live shared mapping and `vec` has one byte per
+        // page in that mapping, as required by `mincore`.
         let rc = unsafe {
             libc::mincore(
                 mmap.as_ptr() as *mut libc::c_void,
@@ -188,21 +198,133 @@ impl HfqFile {
         }
     }
 
-    /// Non-unix fallback: no mincore probe available; never pre-detected as
-    /// cached (callers fall back to the pread path).
-    #[cfg(not(unix))]
+    /// Fraction of mapping pages currently resident in this process's working
+    /// set. `QueryWorkingSetEx` observes the same 4 KiB page sample and 90%
+    /// threshold as the Unix `mincore` path without faulting pages in.
+    #[cfg(windows)]
+    pub fn mostly_page_cached(&self) -> bool {
+        use windows_sys::Win32::System::ProcessStatus::{
+            QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        let end = self
+            .tensors
+            .last()
+            .map(|t| t.data_offset + t.data_size)
+            .unwrap_or(0);
+        if end == 0 {
+            return false;
+        }
+        let Ok(file) = std::fs::File::open(&self.path) else {
+            return false;
+        };
+        // Safety: `file` remains open until the mapping has been created.
+        let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
+            return false;
+        };
+        let page = 4096usize;
+        let n_pages = mmap.len().div_ceil(page);
+        let byte_len = match n_pages
+            .checked_mul(std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>())
+            .and_then(|len| u32::try_from(len).ok())
+        {
+            Some(len) => len,
+            None => return false,
+        };
+        let mut pages = Vec::with_capacity(n_pages);
+        for page_index in 0..n_pages {
+            pages.push(PSAPI_WORKING_SET_EX_INFORMATION {
+                VirtualAddress: mmap
+                    .as_ptr()
+                    .wrapping_add(page_index * page)
+                    .cast_mut()
+                    .cast(),
+                VirtualAttributes: Default::default(),
+            });
+        }
+        // Safety: `pages` contains initialized query entries that remain live
+        // for the call, and each virtual address lies within `mmap`.
+        let queried =
+            unsafe { QueryWorkingSetEx(GetCurrentProcess(), pages.as_mut_ptr().cast(), byte_len) };
+        if queried == 0 {
+            return false;
+        }
+        let resident = pages
+            .iter()
+            .filter(|entry| {
+                // Safety: `QueryWorkingSetEx` filled this union; `Flags` is
+                // the documented raw representation containing Valid at bit 0.
+                unsafe { entry.VirtualAttributes.Flags & 1 != 0 }
+            })
+            .count();
+        resident * 100 >= n_pages * 90
+    }
+
+    /// [`Self::mostly_page_cached`] memoized per file instance. The probe
+    /// maps + queries every page in the whole multi-GB file, so callers inside
+    /// a layer sweep must not re-run it per layer.
+    #[cfg(windows)]
+    pub fn mostly_page_cached_memo(&self) -> bool {
+        match self.pages_resident_memo.get() {
+            1 => true,
+            2 => false,
+            _ => {
+                let resident = self.mostly_page_cached();
+                self.pages_resident_memo.set(if resident { 1 } else { 2 });
+                resident
+            }
+        }
+    }
+
+    /// Prefetch the mapped tensor region synchronously. Unlike the Unix
+    /// pread workers, the Windows memory manager owns this request directly,
+    /// so no worker handles need to outlive the call.
+    #[cfg(windows)]
+    pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
+        use windows_sys::Win32::System::Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        if self.evict_page_cache || self.mostly_page_cached() {
+            return CacheWarmerGuard::empty();
+        }
+        let end = self
+            .tensors
+            .last()
+            .map(|t| t.data_offset + t.data_size)
+            .unwrap_or(0);
+        let Some(mmap) = self.mmap.as_ref() else {
+            return CacheWarmerGuard::empty();
+        };
+        let len = end.min(mmap.len());
+        if len == 0 {
+            return CacheWarmerGuard::empty();
+        }
+        let range = WIN32_MEMORY_RANGE_ENTRY {
+            VirtualAddress: mmap.as_ptr().cast_mut().cast(),
+            NumberOfBytes: len,
+        };
+        // Safety: `range` describes a live portion of this process's `mmap`
+        // and remains valid for the synchronous prefetch request.
+        let _ = unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0) };
+        CacheWarmerGuard::empty()
+    }
+
+    /// Platforms without either `mincore` or `QueryWorkingSetEx` cannot
+    /// distinguish a warm mapping, so callers retain the conservative path.
+    #[cfg(not(any(unix, windows)))]
     pub fn mostly_page_cached_memo(&self) -> bool {
         false
     }
 
-    /// Non-unix fallback: never pre-detected as cached.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn mostly_page_cached(&self) -> bool {
         false
     }
 
-    /// Non-unix fallback: nothing to warm.
-    #[cfg(not(unix))]
+    /// Platforms without `PrefetchVirtualMemory` have no equivalent to the
+    /// Unix pread warmers at this lifecycle point.
+    #[cfg(not(any(unix, windows)))]
     pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
         CacheWarmerGuard::empty()
     }
@@ -213,6 +335,8 @@ pub struct CacheWarmerGuard {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(unix)]
     handles: Option<Vec<std::thread::JoinHandle<()>>>,
+    // `PrefetchVirtualMemory` completes synchronously, so Windows has no
+    // worker handles to retain after the prefetch call returns.
     #[cfg(not(unix))]
     handles: Option<()>,
 }
@@ -443,7 +567,19 @@ impl HfqFile {
     /// Callers passing `base_offset = 0` go through the canonical [`Self::open`]
     /// entry point.
     pub fn open_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
+
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+                .open(path)?
+        };
+        #[cfg(not(windows))]
         let file = File::open(path)?;
+        // Safety: `file` remains open until the mapping has been created.
         let mmap = unsafe { Mmap::map(&file)? };
         // Sequential access hint: helps the kernel readahead and drop pages sooner.
         #[cfg(unix)]
@@ -451,6 +587,7 @@ impl HfqFile {
             mmap.advise(memmap2::Advice::Sequential).ok();
             // Also advise the file descriptor for the data region.
             use std::os::unix::io::AsRawFd;
+            // Safety: `file` remains open for the advisory call.
             unsafe {
                 libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
             }
@@ -952,6 +1089,8 @@ impl HfqFile {
             buf.resize(info.data_size, 0);
             let mut total_read = 0usize;
             while total_read < info.data_size {
+                // Safety: `fd` remains open for the read and this writable
+                // slice covers exactly the requested remaining byte count.
                 let n = unsafe {
                     libc::pread(
                         fd,
@@ -975,7 +1114,8 @@ impl HfqFile {
         Some((info, self.pread_buf.borrow()))
     }
 
-    /// Non-unix fallback: just delegates to mmap-based tensor_data.
+    /// Windows delegates to the mmap slice: working-set residency now selects
+    /// the zero-copy path when the mapping is already warm.
     #[cfg(not(unix))]
     pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
         // Overlay-first resolution (SP3). `tensor_data` already consults the
@@ -1016,6 +1156,8 @@ impl HfqFile {
             let mut buf = vec![0u8; info.data_size];
             let mut total_read = 0usize;
             while total_read < info.data_size {
+                // Safety: `fd` remains open for the read and this writable
+                // slice covers exactly the requested remaining byte count.
                 let n = unsafe {
                     libc::pread(
                         fd,
@@ -1456,6 +1598,8 @@ pub(crate) fn load_weight_tensor(
                 .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
+            // Safety: `f32_data` remains live through `upload_raw`; the byte
+            // length exactly covers its contiguous `f32` allocation.
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
@@ -1518,6 +1662,8 @@ pub fn load_weight_tensor_pread(
                 .chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
+            // Safety: `f32_data` remains live through `upload_raw`; the byte
+            // length exactly covers its contiguous `f32` allocation.
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
@@ -1854,6 +2000,8 @@ fn load_fp16_weight_tensor_from_source(
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
     // Handles F16/BF16/F32 (raw HF checkpoints — incl. lm_head — are commonly BF16).
     let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, data);
+    // Safety: `f32_data` remains live through `upload_raw`; the byte length
+    // exactly covers its contiguous `f32` allocation.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
     let buf = gpu.upload_raw(bytes, &[m, k])?;
@@ -1963,6 +2111,8 @@ pub fn load_weights_paroquant_llama(
                 HipError::new(0, "PARO tensor not found: embed_tokens for lm_head")
             })?;
             let f32_data = crate::safetensors_source::source_bytes_to_f32_vec(&info.dtype, td);
+            // Safety: `f32_data` remains live through `upload_raw`; the byte
+            // length exactly covers its contiguous `f32` allocation.
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };

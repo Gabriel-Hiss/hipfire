@@ -199,14 +199,25 @@ pub struct PreadH2DTransport {
 impl PreadH2DTransport {
     /// Open the HFQ file at `path` for paged reads.
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_RANDOM_ACCESS;
+
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_RANDOM_ACCESS)
+                .open(path)?
+        };
+        #[cfg(not(windows))]
         let file = File::open(path)?;
-        // Hint sequential-ish access for the page-cache layer. Tensors don't
-        // overlap so reads are effectively sequential within a tensor and
-        // random across tensors; the kernel's readahead handles the within
-        // case correctly with this advice.
+        // Individual expert reads jump between offsets, so declare random
+        // access before opening the handle; Windows consumes this as an open
+        // flag while Unix retains the post-open fadvise below.
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
+            // Safety: `file` remains open for the advisory call.
             unsafe {
                 libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM);
             }
