@@ -51,17 +51,18 @@ fn unique_token() -> String {
 }
 
 /// Shared on-disk kernel cache root: `$HIPFIRE_KERNEL_CACHE` when set,
-/// otherwise `$HOME/.hipfire_kernels` so every worktree and daemon on the
+/// otherwise `<home>/.hipfire_kernels` so every worktree and daemon on the
 /// machine shares one content-keyed store instead of recompiling per CWD.
-/// Falls back to the legacy CWD-relative dir only when `HOME` is unset.
-/// Pre-existing CWD `.hipfire_kernels` dirs are left alone — they simply go
-/// unused, never deleted or migrated by this code.
+/// Home resolution is `hipfire_config::home_dir` (`HOME`, then `USERPROFILE`
+/// on Windows). Falls back to the legacy CWD-relative dir only when the host
+/// exposes no home at all. Pre-existing CWD `.hipfire_kernels` dirs are left
+/// alone — they simply go unused, never deleted or migrated by this code.
 fn default_cache_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("HIPFIRE_KERNEL_CACHE") {
         return PathBuf::from(dir);
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".hipfire_kernels");
+    if let Some(home) = hipfire_config::home_dir() {
+        return home.join(".hipfire_kernels");
     }
     PathBuf::from(".hipfire_kernels")
 }
@@ -367,13 +368,8 @@ impl KernelCompiler {
                 }
             })
             .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| {
-                        PathBuf::from(h)
-                            .join(".hipfire/bin/kernels/compiled")
-                            .join(arch)
-                    })
+                hipfire_config::home_dir()
+                    .map(|home| home.join(".hipfire/bin/kernels/compiled").join(arch))
                     .filter(|p| p.is_dir())
             });
 
@@ -972,24 +968,41 @@ impl KernelCompiler {
 
     /// Root-scoped flags passed through hipcc to the device compiler.
     ///
-    /// `hipcc.bat` re-tokenises its arguments on Windows, so both flags must
+    /// `hipcc.bat` re-tokenises its arguments on Windows, so every flag must
     /// use the same space-free path policy as the explicit include directory.
     /// Keep the resolver injectable so the Windows-shaped argv contract can be
     /// tested on hosts without a Windows SDK.
+    ///
+    /// `device_lib` names the AMDGCN bitcode directory when the install keeps
+    /// it somewhere clang would not look given `--rocm-path` alone. Passing
+    /// `--rocm-path` *replaces* clang's own ROCm detection, so on a
+    /// bundled-LLVM layout (TheRock, `rocm-sdk` wheels) where the bitcode sits
+    /// at `<root>/lib/llvm/amdgcn/bitcode`, omitting this flag fails every
+    /// compile with `cannot find ROCm device library`.
     fn rocm_root_flags_with(
         root: &Path,
-        resolve_for_hipcc: impl FnOnce(&str) -> String,
+        device_lib: Option<&Path>,
+        resolve_for_hipcc: impl Fn(&str) -> String,
     ) -> Vec<String> {
         let root = root.to_string_lossy();
         let resolved = resolve_for_hipcc(&root);
-        vec![
+        let mut flags = vec![
             format!("--rocm-path={resolved}"),
             format!("--hip-path={resolved}"),
-        ]
+        ];
+        if let Some(dir) = device_lib {
+            let dir = resolve_for_hipcc(&dir.to_string_lossy());
+            flags.push(format!("--rocm-device-lib-path={dir}"));
+        }
+        flags
     }
 
     fn rocm_root_flags(root: &Path) -> Vec<String> {
-        Self::rocm_root_flags_with(root, Self::win_short_path_if_needed)
+        Self::rocm_root_flags_with(
+            root,
+            hipfire_config::rocm::device_library_dir(root).as_deref(),
+            Self::win_short_path_if_needed,
+        )
     }
 
     /// Core hipcc argv: genco/arch/O3, then passthrough, then -o out src.
@@ -1927,11 +1940,11 @@ mod tests {
                     Some(".hipfire_kernels"),
                     "default must be a single shared .hipfire_kernels root, not the CWD"
                 );
-                if let Some(home) = std::env::var_os("HOME") {
+                if let Some(home) = hipfire_config::home_dir() {
                     assert_eq!(
                         root,
-                        PathBuf::from(home).join(".hipfire_kernels"),
-                        "default must live under HOME so all worktrees share it"
+                        home.join(".hipfire_kernels"),
+                        "default must live under the user's home so all worktrees share it"
                     );
                 }
             }
@@ -1969,9 +1982,9 @@ mod tests {
     #[test]
     fn windows_shaped_rocm_root_flags_share_the_short_path_policy() {
         let long = Path::new(r"C:\Program Files\AMD\ROCm\7.2");
-        let flags = KernelCompiler::rocm_root_flags_with(long, |path| {
-            assert_eq!(path, r"C:\Program Files\AMD\ROCm\7.2");
-            r"C:\PROGRA~1\AMD\ROCm\7.2".to_owned()
+        let device_lib = long.join(r"lib\llvm\amdgcn\bitcode");
+        let flags = KernelCompiler::rocm_root_flags_with(long, Some(&device_lib), |path| {
+            path.replace(r"C:\Program Files", r"C:\PROGRA~1")
         });
 
         assert_eq!(
@@ -1979,11 +1992,18 @@ mod tests {
             vec![
                 r"--rocm-path=C:\PROGRA~1\AMD\ROCm\7.2",
                 r"--hip-path=C:\PROGRA~1\AMD\ROCm\7.2",
+                r"--rocm-device-lib-path=C:\PROGRA~1\AMD\ROCm\7.2\lib\llvm\amdgcn\bitcode",
             ]
         );
         assert!(
             flags.iter().all(|arg| !arg.contains(' ')),
             "hipcc.bat must receive each root-scoped flag without spaces"
+        );
+
+        // An install whose bitcode is where clang already looks adds no flag.
+        assert_eq!(
+            KernelCompiler::rocm_root_flags_with(long, None, str::to_owned).len(),
+            2
         );
     }
 
@@ -2031,30 +2051,51 @@ mod tests {
         );
     }
 
-    /// Write an executable fake hipcc that copies a canned blob to `-o` path,
-    /// or exits nonzero when `fail` is true.
+    /// Write an executable fake hipcc that copies a canned blob to the `-o`
+    /// path, or exits nonzero when `fail` is true.
+    ///
+    /// The script is host-shaped: a `#!/bin/sh` file is not executable by
+    /// `CreateProcess`, so Windows gets a `.bat` (which `std::process::Command`
+    /// routes through `cmd.exe`) implementing the same argv contract.
     fn install_fake_hipcc(bin_dir: &Path, canned_blob: &[u8], fail: bool) -> PathBuf {
         std::fs::create_dir_all(bin_dir).unwrap();
         let blob_path = bin_dir.join("canned.hsaco");
         std::fs::write(&blob_path, canned_blob).unwrap();
-        let hipcc = bin_dir.join("fake_hipcc");
-        let script = if fail {
-            "#!/bin/sh\necho 'fake hipcc failure' >&2\nexit 1\n".to_string()
-        } else {
-            format!(
-                "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\ncp \"{}\" \"$out\"\n",
-                blob_path.display()
-            )
-        };
-        std::fs::write(&hipcc, script).unwrap();
-        #[cfg(unix)]
+
+        #[cfg(windows)]
         {
+            let hipcc = bin_dir.join("fake_hipcc.bat");
+            let script = if fail {
+                "@echo off\r\necho fake hipcc failure 1>&2\r\nexit /b 1\r\n".to_string()
+            } else {
+                // Walk argv for `-o`; the next argument is the output path.
+                format!(
+                    "@echo off\r\n:loop\r\nif \"%~1\"==\"\" goto missing\r\nif \"%~1\"==\"-o\" goto found\r\nshift\r\ngoto loop\r\n:found\r\ncopy /y \"{}\" \"%~2\" >nul\r\nexit /b 0\r\n:missing\r\nexit /b 1\r\n",
+                    blob_path.display()
+                )
+            };
+            std::fs::write(&hipcc, script).unwrap();
+            return hipcc;
+        }
+
+        #[cfg(not(windows))]
+        {
+            let hipcc = bin_dir.join("fake_hipcc");
+            let script = if fail {
+                "#!/bin/sh\necho 'fake hipcc failure' >&2\nexit 1\n".to_string()
+            } else {
+                format!(
+                    "#!/bin/sh\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\ncp \"{}\" \"$out\"\n",
+                    blob_path.display()
+                )
+            };
+            std::fs::write(&hipcc, script).unwrap();
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&hipcc).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&hipcc, perms).unwrap();
+            hipcc
         }
-        hipcc
     }
 
     fn leftover_temps(dir: &Path) -> Vec<String> {

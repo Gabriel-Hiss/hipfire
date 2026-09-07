@@ -267,16 +267,40 @@ pub const R9700_VRAM_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 /// Headroom left for the rest of the system. Chosen so the desktop survives.
 const HEADROOM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
-/// `MemAvailable` from /proc/meminfo, in bytes. `None` if unreadable.
+/// Host RAM an allocation may take without pushing the machine into reclaim,
+/// in bytes. `None` when the host exposes no usable figure.
+///
+/// Linux reads `MemAvailable` from `/proc/meminfo` — the kernel's own estimate,
+/// which already discounts reclaimable page cache. Windows uses
+/// `GlobalMemoryStatusEx`'s `ullAvailPhys`, the closest equivalent: physical
+/// memory available for allocation without paging. Both are estimates; the
+/// caller keeps a fixed headroom on top.
 pub fn mem_available_bytes() -> Option<u64> {
-    let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in txt.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-            return Some(kb * 1024);
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..unsafe { std::mem::zeroed() }
+        };
+        // Safety: `status` is a live, correctly sized `MEMORYSTATUSEX` whose
+        // `dwLength` is set, which is the whole contract of this call.
+        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+            return None;
         }
+        return Some(status.ullAvailPhys);
     }
-    None
+    #[cfg(not(windows))]
+    {
+        let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in txt.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
 }
 
 /// Refuse a planned allocation that would either exceed the deployment target's
@@ -327,7 +351,7 @@ pub fn preflight_alloc(planned_bytes: u64, budget_bytes: u64, what: &str) -> Res
         // safety, and the failure mode we are guarding against costs the user
         // their desktop session.
         None => Err(format!(
-            "{what}: cannot read MemAvailable from /proc/meminfo; refusing to \
+            "{what}: cannot read the host's available memory; refusing to \
              allocate {:.2} GiB blind.",
             gib(planned_bytes)
         )),
@@ -354,8 +378,8 @@ mod tests {
 
     #[test]
     fn mem_available_is_readable_and_sane() {
-        let a = mem_available_bytes().expect("MemAvailable must be readable on Linux");
-        assert!(a > 0, "MemAvailable should be positive");
+        let a = mem_available_bytes().expect("available host memory must be readable");
+        assert!(a > 0, "available host memory should be positive");
     }
 
     #[test]
