@@ -366,7 +366,7 @@ impl HipRuntime {
             let mut loaded = None;
             let mut last_err = None;
             for candidate in &candidates {
-                match Library::new(candidate) {
+                match crate::dlopen::open(candidate) {
                     Ok(l) => {
                         loaded = Some(l);
                         break;
@@ -392,7 +392,8 @@ impl HipRuntime {
                         &format!(
                             "failed to load {short_name}: {}.\n{}",
                             last_err
-                                .map(|e| e.to_string())
+                                .as_ref()
+                                .map(crate::dlopen::describe)
                                 .unwrap_or_else(|| "no candidates".into()),
                             hipfire_config::rocm::resolution_failure(runtime_label, &candidates)
                         ),

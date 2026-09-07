@@ -6,6 +6,7 @@
 //! hip-bridge: Safe Rust FFI to AMD HIP runtime via dlopen.
 //! Modeled after rustane's ane-bridge — no link-time dependency on libamdhip64.
 
+mod dlopen;
 mod error;
 mod ffi;
 mod kernarg;

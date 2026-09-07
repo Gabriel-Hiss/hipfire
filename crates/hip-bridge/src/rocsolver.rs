@@ -150,15 +150,11 @@ impl Rocsolver {
                 "rocBLAS handle is null".into(),
             ));
         }
-        let candidates = hipfire_config::rocm::library_candidates(&[
-            "librocsolver.so",
-            "librocsolver.so.1",
-            "librocsolver.so.0",
-            "librocsolver.so.0.6",
-        ]);
+        let candidates =
+            hipfire_config::rocm::library_candidates(hipfire_config::rocm::ROCSOLVER_LIBRARIES);
         let lib = candidates
             .iter()
-            .find_map(|name| unsafe { Library::new(name).ok() })
+            .find_map(|name| unsafe { crate::dlopen::open(name).ok() })
             .ok_or_else(|| RocsolverError::LibraryUnavailable {
                 context: format!(
                     "dlopen librocsolver.so failed. Tried: {}",

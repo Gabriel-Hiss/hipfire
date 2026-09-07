@@ -100,17 +100,23 @@ impl RcclComms {
     /// Then initializes `n_devices` communicators in one shot via
     /// `ncclCommInitAll`. Each comm[i] binds to `device_ids[i]`.
     pub fn init_all(device_ids: &[i32]) -> RcclResult<Self> {
+        let candidates =
+            hipfire_config::rocm::library_candidates(hipfire_config::rocm::RCCL_LIBRARIES);
+        if candidates.is_empty() {
+            return Err(RcclError {
+                status: 0,
+                context:
+                    "RCCL is unavailable on this platform; falling back to boundary_copy ring path"
+                        .into(),
+            });
+        }
+
         let lib = unsafe {
             // Resolved ROCm roots first, bare sonames last, so RCCL is found on
             // side-by-side and /opt/rocm/core-<ver> installs too.
-            let candidates = hipfire_config::rocm::library_candidates(&[
-                "librccl.so",
-                "librccl.so.1",
-                "librccl.so.1.0",
-            ]);
             let mut loaded = None;
             for name in &candidates {
-                if let Ok(l) = Library::new(name) {
+                if let Ok(l) = crate::dlopen::open(name) {
                     loaded = Some(l);
                     break;
                 }

@@ -174,15 +174,11 @@ impl Rocblas {
     pub fn load() -> RocblasResult<Self> {
         // Resolved ROCm roots first, bare sonames last. Replaces a hardcoded
         // /opt/rocm/lib list that missed side-by-side and core-<ver> layouts.
-        let candidates = hipfire_config::rocm::library_candidates(&[
-            "librocblas.so",
-            "librocblas.so.7",
-            "librocblas.so.6",
-            "librocblas.so.5",
-        ]);
+        let candidates =
+            hipfire_config::rocm::library_candidates(hipfire_config::rocm::ROCBLAS_LIBRARIES);
         let lib = candidates
             .iter()
-            .find_map(|name| unsafe { Library::new(name).ok() })
+            .find_map(|name| unsafe { crate::dlopen::open(name).ok() })
             .ok_or_else(|| RocblasError {
                 status: 0,
                 context: format!(
