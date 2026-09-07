@@ -15,15 +15,54 @@ captured HIP, and retained PM4 state without installing that route into serving.
 import argparse
 import json
 import os
+import queue
 import select
+import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
+
+
+def _process_group_popen_kwargs():
+    """Platform kwargs that make the child a process-group leader."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _readline_with_timeout(stream, timeout_s):
+    """Read one daemon response with a timeout on pipes on every platform."""
+    if os.name != "nt":
+        ready, _, _ = select.select([stream], [], [], timeout_s)
+        if not ready:
+            return None
+        return stream.readline()
+
+    # Windows select() accepts sockets only. A daemon reader thread preserves
+    # the request timeout without attempting to treat an anonymous pipe as one.
+    result = queue.Queue(maxsize=1)
+    reader = threading.Thread(target=lambda: result.put(stream.readline()), daemon=True)
+    reader.start()
+    try:
+        return result.get(timeout=timeout_s)
+    except queue.Empty:
+        return None
+
+
+def _windows_taskkill_tree(pid):
+    """Force-stop a Windows process tree; an already-gone tree is benign."""
+    subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
 
 class Daemon:
@@ -32,14 +71,18 @@ class Daemon:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         self.log = log_path.open("w")
         env = dict(os.environ)
+        replay_backend = "hip" if os.name == "nt" else "shadow"
         env.update(
-            HIPFIRE_REPLAY_BACKEND="shadow",
-            HIPFIRE_REPLAY_MANUAL_CAPTURE="1",
+            HIPFIRE_REPLAY_BACKEND=replay_backend,
             HIPFIRE_KV_MODE=kv_mode,
             HIPFIRE_CASK_OFF="1",
             HIPFIRE_AR_GRAPH="0",
             HIPFIRE_GRAPH="0",
         )
+        if os.name != "nt":
+            env["HIPFIRE_REPLAY_MANUAL_CAPTURE"] = "1"
+        else:
+            env.pop("HIPFIRE_REPLAY_MANUAL_CAPTURE", None)
         self.proc = subprocess.Popen(
             [str(binary)],
             cwd=REPO,
@@ -49,7 +92,7 @@ class Daemon:
             stderr=self.log,
             text=True,
             bufsize=1,
-            start_new_session=True,
+            **_process_group_popen_kwargs(),
         )
 
     def request(self, message):
@@ -59,10 +102,9 @@ class Daemon:
         assert self.proc.stdout is not None
         self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         self.proc.stdin.flush()
-        ready, _, _ = select.select([self.proc.stdout], [], [], self.timeout_s)
-        if not ready:
+        line = _readline_with_timeout(self.proc.stdout, self.timeout_s)
+        if line is None:
             raise TimeoutError(f"daemon response timed out after {self.timeout_s}s: {message['type']}")
-        line = self.proc.stdout.readline()
         if not line:
             raise RuntimeError(f"daemon closed while handling {message['type']}")
         response = json.loads(line)
@@ -76,12 +118,24 @@ class Daemon:
                 self.request({"type": "unload"})
             except Exception:
                 pass
-            try:
-                self.proc.terminate()
-                self.proc.wait(timeout=5)
-            except Exception:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
+            if os.name == "nt":
+                try:
+                    os.kill(self.proc.pid, signal.CTRL_BREAK_EVENT)
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    pass
+                _windows_taskkill_tree(self.proc.pid)
+                try:
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.proc.terminate()
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    self.proc.kill()
+                    self.proc.wait(timeout=5)
         self.log.close()
 
 
@@ -91,6 +145,91 @@ def summarize(values):
         "median": statistics.median(values),
         "max": max(values),
     }
+
+
+def run_windows_hip_fallback(args, daemon, report):
+    """Exercise ordinary HIP while reporting that retained replay is unavailable."""
+    reason = (
+        "retained AQL/PM4 replay is Linux-only because Windows exposes "
+        "neither ROCr nor the KFD device; this run uses ordinary HIP"
+    )
+    report["retained_replay"] = {
+        "available": False,
+        "validated": False,
+        "fallback": "hip",
+        "reason": reason,
+        "requested_mode": (
+            "dflash_verify_shadow"
+            if args.dflash_verify_shadow
+            else "dspark_verify_shadow"
+            if args.dspark_verify_shadow
+            else "pm4"
+            if args.pm4
+            else "aql"
+        ),
+    }
+    print(f"redline: {reason}", flush=True)
+    try:
+        for tokens in ([] if args.skip_prefill else args.prefill):
+            measures = [
+                daemon.request({"type": "bench_prefill", "tokens": tokens})
+                for _ in range(args.measure_repeats)
+            ]
+            report["prefill"][str(tokens)] = {
+                "captures": [],
+                "sequence_stable": None,
+                "retained_replay_unavailable": True,
+                "measurement": {
+                    "tok_s": summarize([row["tok_s"] for row in measures]),
+                    "ms": summarize([row["ms"] for row in measures]),
+                    "runs": measures,
+                },
+            }
+            print(
+                f"prefill{tokens}: backend=hip "
+                f"median={report['prefill'][str(tokens)]['measurement']['tok_s']['median']:.1f} tok/s",
+                flush=True,
+            )
+        measures = [
+            daemon.request(
+                {
+                    "type": "bench_decode",
+                    "context_tokens": args.decode_context,
+                    "iterations": args.decode_iterations,
+                }
+            )
+            for _ in range(args.measure_repeats)
+        ]
+        report["decode"] = {
+            "context_tokens": args.decode_context,
+            "measurement_iterations": args.decode_iterations,
+            "retained_replay_unavailable": True,
+            "measurement": {
+                "tok_s": summarize([row["tok_s"] for row in measures]),
+                "us_per_token": summarize([row["us_per_token"] for row in measures]),
+                "runs": measures,
+            },
+        }
+        print(
+            f"decode: backend=hip "
+            f"median={report['decode']['measurement']['tok_s']['median']:.1f} tok/s",
+            flush=True,
+        )
+        report["pass"] = True
+    except Exception as error:
+        report["pass"] = False
+        report["hip_fallback_error"] = str(error)
+
+    output = Path(args.out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2) + "\n")
+    print(
+        f"report={output} pass={report['pass']} "
+        "retained_replay_validated=False fallback=hip",
+        flush=True,
+    )
+    if not report["pass"]:
+        raise SystemExit(f"Windows HIP fallback failed; see {output}")
 
 
 def capture_key(row):
@@ -194,7 +333,9 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--daemon",
-        default=str(REPO / "target/release/daemon"),
+        default=str(
+            REPO / "target" / "release" / f"daemon{'.exe' if os.name == 'nt' else ''}"
+        ),
     )
     parser.add_argument("--out", default=str(REPO / ".redline-work/redline-daemon-phases.json"))
     parser.add_argument("--log", default=str(REPO / ".redline-work/redline-daemon-phases.log"))
@@ -318,13 +459,13 @@ def main():
     if not daemon_path.is_file():
         sys.exit(f"daemon not found: {daemon_path}")
     draft = Path(args.draft).expanduser().resolve() if args.draft else None
-    if args.dspark_verify_shadow and (draft is None or not draft.is_file()):
+    if os.name != "nt" and args.dspark_verify_shadow and (draft is None or not draft.is_file()):
         sys.exit("--dspark-verify-shadow requires an existing --draft sidecar")
-    if args.dflash_verify_shadow and (draft is None or not draft.is_file()):
+    if os.name != "nt" and args.dflash_verify_shadow and (draft is None or not draft.is_file()):
         sys.exit("--dflash-verify-shadow requires an existing --draft sidecar")
     if args.dspark_verify_shadow and args.dflash_verify_shadow:
         sys.exit("choose one of --dspark-verify-shadow or --dflash-verify-shadow")
-    if args.dspark_verify_shadow:
+    if os.name != "nt" and args.dspark_verify_shadow:
         discovered_draft = model.with_name(f"{model.stem}-dspark{model.suffix}").resolve()
         if draft != discovered_draft:
             sys.exit(
@@ -348,8 +489,8 @@ def main():
         load_params = {
             "max_seq": args.max_seq,
             "kv_mode": args.kv_mode,
-            "dflash_mode": "on" if args.dflash_verify_shadow else "off",
-            "dspark_mode": "on" if args.dspark_verify_shadow else "off",
+            "dflash_mode": "on" if os.name != "nt" and args.dflash_verify_shadow else "off",
+            "dspark_mode": "on" if os.name != "nt" and args.dspark_verify_shadow else "off",
             "mtp_mode": "off",
             "ngram_draft": False,
         }
@@ -360,7 +501,7 @@ def main():
         load_body = {
             **load_params,
             **({"state_quant": args.state_quant} if args.state_quant else {}),
-            **({"draft": str(draft)} if args.dflash_verify_shadow else {}),
+            **({"draft": str(draft)} if os.name != "nt" and args.dflash_verify_shadow else {}),
         }
         loaded = daemon.request(
             {
@@ -378,6 +519,9 @@ def main():
             flush=True,
         )
 
+        if os.name == "nt":
+            run_windows_hip_fallback(args, daemon, report)
+            return
         if args.dflash_verify_shadow:
             shadow = daemon.request(
                 {

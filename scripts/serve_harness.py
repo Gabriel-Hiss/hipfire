@@ -59,6 +59,20 @@ GENRE_BATTERY = [
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
+DEFAULT_HARNESS_HOME = os.path.expanduser("~/.cache/serve_harness_home")
+
+
+def _process_group_popen_kwargs():
+    """Platform kwargs that make the child a process-group leader."""
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def _default_serve_log(home=None):
+    """Keep the serve log with the harness's persistent home artifacts."""
+    return os.path.join(home or DEFAULT_HARNESS_HOME, "serve.log")
+
 
 def _registry_entry(tag, registry_path):
     """Return (canonical_tag, entry_dict) for *tag*, following aliases."""
@@ -538,11 +552,11 @@ def show_config(cfg):
 
 
 # ---------- serve spawn (robust, self-contained) ----------
-# Popen(start_new_session=True) makes the CLI leader PID also the session PGID.
-# Retain that known PGID so cleanup can killpg even after the leader exits
-# (os.getpgid(leader) then returns ESRCH while descendants may still live).
+# The retained PID identifies the process-group leader on both platforms.
+# POSIX makes it a session PGID; Windows makes it a CREATE_NEW_PROCESS_GROUP
+# leader that can receive CTRL_BREAK_EVENT and anchor taskkill /T.
 _serve_proc = None
-_serve_pgid = None
+_serve_group_leader_pid = None
 
 
 def _pid_file_path():
@@ -585,25 +599,50 @@ def _write_pid_file(pid):
         raise
 
 
-def _kill_serve():
-    """Kill ONLY this harness's own native serve tree (the Rust CLI + its child daemon),
-    scoped by process group — NOT a broad `pkill -x daemon`, which would execute
-    the parallel autoresearch daemons pinned to OTHER GPUs. spawn_serve starts the
-    serve in its own session (start_new_session) so this group kill is exact.
+def _windows_taskkill_tree(pid):
+    """Force-stop a Windows process tree; an already-gone tree is benign."""
+    subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(pid)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
-    Always killpg the retained session PGID (equal to the CLI Popen PID). Do not
-    gate on os.getpgid(leader): after the leader exits getpgid returns ESRCH even
-    when the process group still has descendants. ESRCH from killpg is benign."""
-    global _serve_proc, _serve_pgid
-    pgid = _serve_pgid
-    if pgid is None and _serve_proc is not None:
-        pgid = _serve_proc.pid
-    if pgid is not None and hasattr(os, "killpg"):
+
+def _kill_serve():
+    """Kill only this harness's native serve tree (the CLI and child daemon).
+
+    POSIX retains the historical session-scoped killpg behavior. Windows uses
+    the CREATE_NEW_PROCESS_GROUP leader for CTRL_BREAK_EVENT and taskkill /T,
+    which prevents daemon.exe from surviving with the port and VRAM.
+    """
+    global _serve_proc, _serve_group_leader_pid
+    leader_pid = _serve_group_leader_pid
+    if leader_pid is None and _serve_proc is not None:
+        leader_pid = _serve_proc.pid
+    graceful = os.environ.get("HIPFIRE_SERVE_HARNESS_GRACEFUL_CLEANUP") == "1"
+    if leader_pid is not None and os.name == "nt":
+        if graceful:
+            try:
+                os.kill(leader_pid, signal.CTRL_BREAK_EVENT)
+            except (ProcessLookupError, OSError):
+                pass
+            deadline = time.monotonic() + 30.0
+            while (
+                _serve_proc is not None
+                and _serve_proc.poll() is None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.1)
+        # Always ask taskkill for the full tree. Its non-zero "already gone"
+        # result is quiet, while a live daemon descendant cannot be orphaned.
+        _windows_taskkill_tree(leader_pid)
+    elif leader_pid is not None:
         # rocprof must observe a normal target shutdown to flush its CSV trace.
         # The default remains the historical exact/fast SIGKILL cleanup; this
         # opt-in is developer tooling for HIPFIRE_DAEMON_BIN wrappers such as
         # scripts/rocprof-daemon-wrap.sh and never changes product serving.
-        graceful = os.environ.get("HIPFIRE_SERVE_HARNESS_GRACEFUL_CLEANUP") == "1"
+        pgid = leader_pid
         if graceful:
             try:
                 os.killpg(pgid, signal.SIGINT)
@@ -638,15 +677,8 @@ def _kill_serve():
                         _serve_proc.kill()
                     except Exception:
                         pass
-    elif _serve_proc is not None:
-        # Windows: process groups are POSIX-only (os.killpg does not exist);
-        # kill the direct child and let its daemon child exit with it.
-        try:
-            _serve_proc.kill()
-        except Exception:
-            pass
     _serve_proc = None
-    _serve_pgid = None
+    _serve_group_leader_pid = None
     _clear_pid_file()
 
 
@@ -1937,7 +1969,7 @@ def spawn_serve(cfg, home, log):
 
     The per-request sampling is sent by the driver, so one serve handles all recipes/modes.
     Proofs must inspect only ``_serve_log_text(log, offset)`` for that attempt."""
-    global _serve_proc, _serve_pgid
+    global _serve_proc, _serve_group_leader_pid
     os.makedirs(os.path.join(home, ".hipfire"), exist_ok=True)
     models = os.path.expanduser(os.environ.get("HIPFIRE_MODELS_DIR", "~/.hipfire/models"))
     for ln in ("models", "templates"):
@@ -1996,13 +2028,13 @@ def spawn_serve(cfg, home, log):
         _clear_pid_file()
         # Capture offset immediately before launch — only this attempt's suffix is proof.
         log_offset = _serve_log_offset(log)
-        _serve_proc = subprocess.Popen(
-            serve_cmd,
-            cwd=REPO, env=env, stdout=open(log, "a"), stderr=subprocess.STDOUT,
-            start_new_session=True)   # own process group so _kill_serve's group-kill is exact + scoped
-        # Leader PID == PGID under start_new_session; retain it for dead-leader cleanup.
-        _serve_pgid = _serve_proc.pid
-        _write_pid_file(_serve_pgid)
+        with open(log, "a") as log_handle:
+            _serve_proc = subprocess.Popen(
+                serve_cmd,
+                cwd=REPO, env=env, stdout=log_handle, stderr=subprocess.STDOUT,
+                **_process_group_popen_kwargs())
+        _serve_group_leader_pid = _serve_proc.pid
+        _write_pid_file(_serve_group_leader_pid)
         warm_timeout_secs = max(1, int(cfg.get("serve_warm_timeout_secs", 180)))
         for _ in range((warm_timeout_secs + 1) // 2):
             txt = _serve_log_text(log, log_offset)
@@ -2730,7 +2762,9 @@ def run(cfg, args):
     do_trace = getattr(args, "assert_glimmer_cache_trace", False) or os.environ.get("HIPFIRE_GLIMMER_CACHE_TRACE") == "1"
     if do_trace:
         trace_text = ""
-        log_path = getattr(args, "serve_log", None) or "/tmp/serve_harness.serve.log"
+        log_path = getattr(args, "serve_log", None) or _default_serve_log(
+            getattr(args, "home", None)
+        )
         log_offset = cfg.get("_serve_log_offset", 0)
         try:
             if os.path.exists(log_path):
@@ -2874,8 +2908,8 @@ def main():
         help="Multi-turn session fixture (default: the committed 8-turn coding chain).",
     )
     ap.add_argument("--port", type=int, default=11520)
-    ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
-    ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
+    ap.add_argument("--home", default=DEFAULT_HARNESS_HOME)
+    ap.add_argument("--serve-log", default=None)
     ap.add_argument(
         "--serve-warm-timeout-secs",
         type=int,
@@ -2936,6 +2970,8 @@ def main():
         help="Run deterministic serve path-proof self-tests (no GPU / no serve) and exit.",
     )
     args = ap.parse_args()
+    if args.serve_log is None:
+        args.serve_log = _default_serve_log(args.home)
     if args.self_test or os.environ.get("HIPFIRE_SERVE_HARNESS_SELFTEST") == "1":
         _self_test_serve_path_proofs()
         _self_test_prompt_sources()
@@ -2973,8 +3009,11 @@ def main():
         log_offset = spawn_serve(cfg, args.home, args.serve_log)
         if log_offset is None:
             sys.exit("serve_harness: serve failed to warm after retries")
-        head = subprocess.run(f"grep -c 'MTP head loaded' {args.serve_log}", shell=True,
-                              capture_output=True, text=True).stdout.strip()
+        try:
+            with open(args.serve_log, encoding="utf-8", errors="replace") as handle:
+                head = sum("MTP head loaded" in line for line in handle)
+        except FileNotFoundError:
+            head = 0
         print(f"  [serve warm; MTP head loaded lines={head}]", flush=True)
         _assert_serve_path_proofs(cfg, args.serve_log, offset=log_offset)
     cfg["_serve_log_offset"] = log_offset
