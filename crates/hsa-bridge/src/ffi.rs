@@ -252,10 +252,15 @@ impl HsaLib {
     /// is never delegated to a bare loader soname. This previously hardcoded
     /// `/opt/rocm/lib`, which fails on every non-default install.
     pub fn load() -> crate::error::HsaResult<Self> {
-        let candidates = hipfire_config::rocm::library_candidates(&[
-            "libhsa-runtime64.so.1",
-            "libhsa-runtime64.so",
-        ]);
+        if !hipfire_config::rocm::hsa_runtime_supported() {
+            return Err(crate::error::HsaError::new(
+                0,
+                "ROCr is not available on Windows; Redline retained AQL/PM4 replay and the AQL launch-overhead bypass are unavailable, so the caller falls back to ordinary HIP dispatch.",
+            ));
+        }
+
+        let candidates =
+            hipfire_config::rocm::library_candidates(hipfire_config::rocm::HSA_RUNTIME_LIBRARIES);
         let lib = unsafe {
             let mut loaded = None;
             let mut last_err = None;

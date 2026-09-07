@@ -996,6 +996,80 @@ pub const HIP_RUNTIME_DIRS: &[&str] = &["bin"];
 #[cfg(not(windows))]
 pub const HIP_RUNTIME_DIRS: &[&str] = &["lib", "lib64"];
 
+/// rocBLAS library filenames, most preferred first. Windows ships `rocblas.dll`;
+/// ELF platforms ship the library with SONAME variants.
+#[cfg(windows)]
+pub const ROCBLAS_LIBRARIES: &[&str] = &["rocblas.dll"];
+#[cfg(not(windows))]
+pub const ROCBLAS_LIBRARIES: &[&str] = &[
+    "librocblas.so",
+    "librocblas.so.7",
+    "librocblas.so.6",
+    "librocblas.so.5",
+];
+
+/// rocSOLVER library filenames, most preferred first. Windows ships
+/// `rocsolver.dll`; ELF platforms ship the library with SONAME variants.
+#[cfg(windows)]
+pub const ROCSOLVER_LIBRARIES: &[&str] = &["rocsolver.dll"];
+#[cfg(not(windows))]
+pub const ROCSOLVER_LIBRARIES: &[&str] = &[
+    "librocsolver.so",
+    "librocsolver.so.1",
+    "librocsolver.so.0",
+    "librocsolver.so.0.6",
+];
+
+/// RCCL library filenames, most preferred first. AMD ships no RCCL for Windows,
+/// where collective multi-GPU has no implementation.
+#[cfg(windows)]
+pub const RCCL_LIBRARIES: &[&str] = &[];
+#[cfg(not(windows))]
+pub const RCCL_LIBRARIES: &[&str] = &["librccl.so", "librccl.so.1", "librccl.so.1.0"];
+
+/// ROCr runtime library filenames, most preferred first. Windows ships no ROCr
+/// user-mode runtime.
+#[cfg(windows)]
+pub const HSA_RUNTIME_LIBRARIES: &[&str] = &[];
+#[cfg(not(windows))]
+pub const HSA_RUNTIME_LIBRARIES: &[&str] = &["libhsa-runtime64.so.1", "libhsa-runtime64.so"];
+
+/// Whether ROCr-dependent paths are supported on this host.
+///
+/// ROCr is a Linux-only component of AMD's stack: Windows uses WDDM/PAL and
+/// exposes no public user-mode queue interface, so every ROCr-dependent route
+/// must fail closed rather than probe for a runtime that cannot exist.
+pub fn hsa_runtime_supported() -> bool {
+    cfg!(not(windows))
+}
+
+/// Directories within a root that can hold the AMDGCN device bitcode
+/// (`ocml.bc`, `oclc_*.bc`), relative to the root, most standard first.
+///
+/// `amdgcn/bitcode` is the classic ROCm layout that clang finds on its own from
+/// `--rocm-path`. `lib/llvm/amdgcn/bitcode` is the bundled-LLVM layout used by
+/// TheRock (including the `rocm-sdk` Python wheels), where the device libs sit
+/// next to the compiler rather than at the root.
+const DEVICE_LIBRARY_DIRS: &[&str] = &[
+    "amdgcn/bitcode",
+    "lib/llvm/amdgcn/bitcode",
+    "lib/amdgcn/bitcode",
+];
+
+/// The AMDGCN device-bitcode directory under `root`, if this install ships one.
+///
+/// Needed because `--rocm-path=<root>` *replaces* clang's own ROCm detection.
+/// On a layout whose device libs are not at `<root>/amdgcn/bitcode`, passing
+/// only `--rocm-path` turns a working compiler into
+/// `cannot find ROCm device library`; the caller pairs this with an explicit
+/// `--rocm-device-lib-path`.
+pub fn device_library_dir(root: &Path) -> Option<PathBuf> {
+    DEVICE_LIBRARY_DIRS
+        .iter()
+        .map(|rel| root.join(rel))
+        .find(|dir| dir.join("ocml.bc").is_file())
+}
+
 /// The HIP runtime library under `root`, if this install ships one.
 ///
 /// Deliberately root-scoped. Answering "does THIS root carry the runtime" needs
@@ -1011,11 +1085,6 @@ pub fn runtime_library(root: &Path) -> Option<PathBuf> {
     }
     None
 }
-
-/// HSA runtime sonames, most specific first. Required on non-Windows coherent
-/// SDKs; Windows HIP SDK does not ship libhsa.
-#[cfg(not(windows))]
-const HSA_RUNTIME_LIBRARIES: &[&str] = &["libhsa-runtime64.so.1", "libhsa-runtime64.so"];
 
 /// The HSA runtime library under `root`, if present.
 #[cfg(not(windows))]
@@ -1431,6 +1500,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn satellite_library_names_match_host_support() {
+        let libraries = [
+            ROCBLAS_LIBRARIES,
+            ROCSOLVER_LIBRARIES,
+            RCCL_LIBRARIES,
+            HSA_RUNTIME_LIBRARIES,
+        ];
+
+        if cfg!(windows) {
+            assert!(
+                libraries
+                    .iter()
+                    .all(|names| names.is_empty() || names.iter().all(|name| name.ends_with(".dll")))
+            );
+        } else {
+            assert!(libraries.iter().all(|names| !names.is_empty()));
+        }
+
+        assert_eq!(RCCL_LIBRARIES.is_empty(), cfg!(windows));
+        assert_eq!(HSA_RUNTIME_LIBRARIES.is_empty(), cfg!(windows));
+        assert_eq!(hsa_runtime_supported(), !cfg!(windows));
+    }
+
+    #[test]
     fn version_key_orders_core_dirs_newest_first() {
         assert_eq!(version_key("core-7.14"), vec![7, 14]);
         assert_eq!(version_key("core-7"), vec![7]);
@@ -1507,7 +1600,15 @@ mod tests {
             joined.contains("rocm.docs.amd.com"),
             "the docs link is the distro-independent answer: {lines:?}"
         );
-        for needle in ["libamdhip64", "libhsa-runtime64", "hip_runtime.h", "hipcc"] {
+        // `install_guidance` names the artifacts this host actually probes, so
+        // the expected set is host-shaped too — Windows has no
+        // `libhsa-runtime64`.
+        let needles: &[&str] = if cfg!(windows) {
+            &["amdhip64.dll", "hip_runtime.h", "hipcc"]
+        } else {
+            &["libamdhip64", "libhsa-runtime64", "hip_runtime.h", "hipcc"]
+        };
+        for needle in needles {
             assert!(
                 joined.contains(needle),
                 "guidance must name required artifact {needle}: {lines:?}"
@@ -2352,7 +2453,11 @@ mod tests {
         assert_eq!(result.compiler_source, Some(CompilerSource::SelectedRoot));
 
         // Debian multiarch: runtime under lib/x86_64-linux-gnu is discovered via
-        // root_library_dirs one-level child scan — do not “fix” that.
+        // root_library_dirs one-level child scan — do not “fix” that. The scan
+        // itself is `cfg(not(windows))` (Windows keeps DLLs directly in `bin`
+        // and has no multiarch tuple), so this arm is Linux-shaped by nature.
+        #[cfg(not(windows))]
+        {
         let debian = base.join("debian");
         std::fs::create_dir_all(debian.join("include").join("hip")).unwrap();
         std::fs::create_dir_all(debian.join("lib").join("x86_64-linux-gnu")).unwrap();
@@ -2371,6 +2476,7 @@ mod tests {
         assert!(is_coherent_sdk_root(&debian));
         let result2 = resolve_toolchain_pure(Some(&debian), None, false, None, None).unwrap();
         assert_eq!(result2.compiler_source, Some(CompilerSource::SelectedRoot));
+        }
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -2404,15 +2510,24 @@ mod tests {
             p.set_mode(0o755);
             std::fs::set_permissions(&comp, p).unwrap();
         }
+        // The resolver canonicalizes, and Windows canonicalization prepends the
+        // `\\?\` verbatim prefix, so compare canonical forms rather than the
+        // literal join.
+        let expected_root = std::fs::canonicalize(&comp_root).unwrap();
+        let canon = |p: Option<PathBuf>| p.map(|p| std::fs::canonicalize(p).unwrap());
         let toolchain = resolve_toolchain_pure(Some(&libs), None, false, Some(comp.clone()), None).unwrap();
-        assert_eq!(toolchain.compiler_root, Some(comp_root.clone()));
+        assert_eq!(canon(toolchain.compiler_root), Some(expected_root.clone()));
         // compiler_env_root must return the compiler's own root, not the libs root.
-        let env_root = compiler_env_root_from(&comp, None);
-        assert_eq!(env_root, Some(comp_root.clone()));
+        assert_eq!(
+            canon(compiler_env_root_from(&comp, None)),
+            Some(expected_root.clone())
+        );
         // When the compiler is cross-root, the value returned is the compiler's
         // root, not the libs root — even if ROCM_PATH is set to the libs root.
-        let env_root2 = compiler_env_root_from(&comp, Some(&libs));
-        assert_eq!(env_root2, Some(comp_root));
+        assert_eq!(
+            canon(compiler_env_root_from(&comp, Some(&libs))),
+            Some(expected_root)
+        );
         std::fs::remove_dir_all(&base).unwrap();
     }
 

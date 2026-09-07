@@ -51,8 +51,15 @@ pub use runtime::{
 
 /// Load the installed public ROCr runtime without a link-time ROCm dependency.
 pub fn load_symbols() -> Result<Arc<Symbols>, LoadError> {
+    if !hipfire_config::rocm::hsa_runtime_supported() {
+        return Err(LoadError::Library {
+            candidates: "not applicable".into(),
+            detail: "ROCr is not available on Windows; Redline retained AQL/PM4 replay and the AQL launch-overhead bypass are unavailable, so the caller falls back to ordinary HIP dispatch.".into(),
+        });
+    }
+
     let candidates =
-        hipfire_config::rocm::library_candidates(&["libhsa-runtime64.so", "libhsa-runtime64.so.1"]);
+        hipfire_config::rocm::library_candidates(hipfire_config::rocm::HSA_RUNTIME_LIBRARIES);
     let mut failures = Vec::new();
     let library = candidates
         .iter()
