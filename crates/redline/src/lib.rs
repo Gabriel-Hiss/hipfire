@@ -38,11 +38,23 @@
 //! | hipMemGetInfo             | Device::vram_info()           | DRM_AMDGPU_INFO       |
 
 pub mod drm;
-pub mod device;
-pub mod dispatch;
 pub mod hsaco;
-pub mod kfd;
 pub mod pm4;
+
+// Direct-KMD modules. `/dev/dri/renderD128`, `/dev/kfd`, and the `ioctl` /
+// `mmap` calls they are built from exist only on Linux with the amdgpu kernel
+// driver; there is no Windows equivalent to port them to, because on Windows
+// the graphics stack is WDDM and the command submission path is closed. Gating
+// them keeps `cargo build` green on every host while the portable halves
+// (PM4 packet construction, HSACO/ELF parsing) still compile and unit-test
+// everywhere.
+#[cfg(target_os = "linux")]
+pub mod device;
+#[cfg(target_os = "linux")]
+pub mod dispatch;
+#[cfg(target_os = "linux")]
+pub mod kfd;
+#[cfg(target_os = "linux")]
 pub mod queue;
 
 /// Redline error type.
