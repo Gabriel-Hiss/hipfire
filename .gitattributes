@@ -1,0 +1,12 @@
+
+# Benchmark prompt fixtures are compared by md5, and a comparison across hosts
+# is only valid when the bytes are identical. A Windows checkout with
+# core.autocrlf=true rewrites LF to CRLF, which changes the digest: the
+# fixtures pinned in AGENTS.md hash to 253c7ac5... and 37c5aad9... on Linux but
+# to 46c8d967... and 06eb2ebe... after a CRLF checkout. Pin them to LF so every
+# host reproduces the pinned md5.
+#
+# The two fixtures measured no throughput difference between CRLF and LF on
+# gfx1100 (29.1 vs 29.0 and 27.2 vs 27.2 tok/s), so this is about reproducible
+# fixture identity, not about a token-shape effect.
+benchmarks/prompts/** text eol=lf
