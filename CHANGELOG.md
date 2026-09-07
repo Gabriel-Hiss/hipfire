@@ -1,5 +1,141 @@
 # Changelog
 
+## Unreleased
+
+### Windows host support
+
+hipfire builds, serves, and generates on `x86_64-pc-windows-msvc` at parity with
+Linux except for subsystems that have no Windows counterpart.
+`cargo build --release` and `cargo check --all-targets` are clean, the 2504
+workspace library tests pass, and the CLI, daemon, `serve` HTTP surface, kernel
+JIT, `setup`/`update`, both validation harnesses, and n-gram speculative decode
+all run. Verified on an RX 7900 GRE (gfx1100) against `lfm2.5:1.2b`. The surface
+by surface matrix, the structural gaps, and the one remaining behavioral
+difference live in [docs/windows-parity.md](docs/windows-parity.md).
+
+- **HIP runtime load.** `libloading::Library::new` calls
+  `LoadLibraryExW(path, NULL, 0)`, and flags of zero exclude the loaded DLL's
+  own directory from the dependency search. An absolute
+  `<root>\bin\amdhip64_7.dll` inside a self-contained SDK tree therefore failed
+  on its own siblings. Absolute candidates now load with
+  `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`; bare
+  sonames keep the default search. The failure text also carries the OS error
+  instead of a bare `LoadLibraryExW failed`.
+- **Home directory.** `hipfire_config::home_dir()` is now the single resolver
+  (`HOME`, then `USERPROFILE`, then `HOMEDRIVE` + `HOMEPATH`) and backs config
+  paths, the registry cache, `~/` expansion, the kernel cache, per-model chat
+  templates, the daemon pidfile, and the TUI. Previously every one of these fell
+  through to a CWD-relative `.hipfire`, so `hipfire pull` wrote models into
+  whatever directory the shell happened to be in and the daemon looked
+  elsewhere.
+- **Device bitcode.** `--rocm-path=<root>` replaces clang's own ROCm detection,
+  so a layout that keeps AMDGCN bitcode at `lib/llvm/amdgcn/bitcode` (TheRock
+  and the `rocm-sdk` wheels) turned every kernel compile into
+  `cannot find ROCm device library`. `hipfire_config::rocm::device_library_dir`
+  probes the known layouts and the compiler passes an explicit
+  `--rocm-device-lib-path` when one is found.
+- **ROCm satellite libraries.** `rocblas`, `rocsolver`, `rccl`, and the HSA
+  runtime were dlopen'd by hardcoded ELF soname, so none could load on Windows
+  even when the DLL was installed. The four candidate lists now live in
+  `hipfire_config::rocm` with `cfg(windows)` arms, and `rocblas.dll` /
+  `rocsolver.dll` resolve under the selected root.
+- **Serve lifecycle.** `proc_start_time`, process liveness, command-line
+  identity, TCP listener ownership, graceful stop, and orphan reaping all had
+  `/proc`, `kill`, `pkill`, and `fuser` implementations only, so
+  `hipfire ps`/`stop`/`restart` refused to act on a healthy daemon. They now
+  have Windows arms built on `OpenProcess`, `GetProcessTimes`,
+  `GetExitCodeProcess`, ToolHelp snapshots, `GetExtendedTcpTable`, and
+  `TerminateProcess`, with the decision ladder and error strings unchanged.
+- **Detached serve.** `serve --detach` inherited the caller's console, so a
+  console control event in the tree terminated the process that launched it.
+  The child is now created with `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`.
+  It also inherited the caller's stdio handles, because Rust's `Command` always
+  calls `CreateProcess` with `bInheritHandles = TRUE`; a caller piping the
+  command's output therefore never saw EOF and blocked until the service
+  exited. `HANDLE_FLAG_INHERIT` is now cleared on the three standard handles
+  before the spawn.
+- **Daemon single-instance lock.** The `flock` guard was `cfg(unix)`, so two
+  daemons could bind the same model on Windows. It now takes `LockFileEx` on a
+  sentinel byte past the payload, which keeps the holder's PID readable, and
+  both platforms retry a contended lock for five seconds so `hipfire restart`
+  does not race the outgoing daemon's teardown.
+- **Binary install and `hipfire update`.** `install_binary_with_backup` renamed
+  a staged temp over the live destination, which Windows refuses for a running
+  image. On Windows the order inverts: the live binary is renamed aside first,
+  then the temp takes its place, which is legal and is what lets the CLI replace
+  itself. Artifact and installed names now carry `EXE_SUFFIX`, leftover backups
+  are swept at the start of the next install, and `hipfire update` drives
+  `scripts/install.ps1` under a kill-on-close Job Object instead of refusing.
+- **Installers.** `scripts/install.ps1` accepts the same option set as
+  `scripts/install.sh`, forwards the setup-owned options to `hipfire setup`
+  instead of reimplementing them in PowerShell, and installs through a
+  rename-then-write helper. `scripts/uninstall.ps1` is new and mirrors
+  `scripts/uninstall.sh`, including `-DryRun` and an exact user-PATH removal.
+- **Diagnostics.** `hipfire diag` reported `amdgpu: not loaded`,
+  `/dev/kfd: missing`, and `GPU targets: none` on a fully working GPU. It now
+  prints `driver model: WDDM`, marks the two Linux kernel objects `n/a (WDDM)`,
+  and sources GPU targets from HIP device enumeration when the sysfs walk yields
+  nothing. The `--json` field names and types are unchanged; the TUI doctor
+  branches on `platform` and renders those rows as not applicable rather than
+  as failures.
+- **Roofline hardware facts.** The profiler read CU count, clocks, and memory
+  bus width from `/sys` only, so on Windows it fell back to arch constants. It
+  now takes them from `hipDeviceGetAttribute` when sysfs is absent, which on the
+  test host yields the SKU's real 80 CU, 1927 MHz, and 576 GB/s.
+- **Host memory probe.** `preflight_alloc` refused to allocate at all without
+  `/proc/meminfo`, which blocked the multi-slot KV path on Windows.
+  `mem_available_bytes` now uses `GlobalMemoryStatusEx` there.
+- **Weight loading.** The page-cache-aware fast path was Linux-only:
+  `QueryWorkingSetEx` replaces `mincore` for residency with the same sampling
+  policy, `PrefetchVirtualMemory` replaces the threaded `pread` warmup, and
+  access intent is expressed with `FILE_FLAG_SEQUENTIAL_SCAN` /
+  `FILE_FLAG_RANDOM_ACCESS` at open. Per-range page-cache eviction has no
+  unprivileged Windows API and stays a documented no-op.
+- **Toolchain probes.** Radiowave's `configured_tool`, `sibling_of`,
+  `llc_present`, and offload-arch probes tested `is_file` on unsuffixed names,
+  so `llvm-objdump.exe` never resolved and every fresh kernel compile printed
+  `program not found`. They now consider host executable suffixes.
+- **Quantizer cache lookup.** The Hugging Face snapshot path was built from
+  `HOME` alone, resolving to `/.cache/huggingface` on Windows. One resolver now
+  honors `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`,
+  and then the user home, and joins paths natively.
+- **Kernel Atlas.** Task bundles are POSIX shell scripts and were run through
+  `sh -lc`, absent on Windows. Resolution is now `HIPFIRE_ATLAS_SHELL`, then
+  `sh` off Windows, then Git for Windows `bash.exe`; it never falls back to
+  `cmd.exe`, because running a POSIX script under `cmd` would feed wrong exit
+  codes to a pass/fail gate.
+- **Validation harnesses.** `scripts/serve_harness.py` and
+  `scripts/redline_daemon_harness.py` are the routes `docs/VALIDATION.md`
+  mandates and were POSIX-only in their process handling. They now spawn with
+  `CREATE_NEW_PROCESS_GROUP`, stop gracefully with `CTRL_BREAK_EVENT`, and
+  hard-kill the tree with `taskkill /F /T`, so an orphaned `daemon.exe` no
+  longer holds port 11435 across runs. The `/tmp` log default and the
+  `shell=True` `grep -c` call are gone. The Redline harness runs the HIP route
+  and records `retained_replay.available = false` with the reason, rather than
+  presenting a Linux-only capability as a regression.
+- **Redline.** The direct-KMD modules (`device`, `kfd`, `queue`, `dispatch`) are
+  gated to `target_os = "linux"`; `/dev/kfd`, `ioctl`, and `mmap` have no
+  Windows counterpart. ROCr loading refuses immediately on Windows with a
+  platform-accurate message instead of probing `.so` names and printing Linux
+  install advice. PM4 construction and HSACO parsing stay portable and keep
+  unit-testing everywhere.
+- **Cross-platform test suite.** Twelve tests only passed on Linux: they pinned
+  `libamdhip64` in host-shaped install guidance, compared paths without the
+  Windows `\\?\` canonicalization prefix, built a Debian multiarch layout
+  against a `cfg(not(windows))` scan, and wrote a `#!/bin/sh` fake `hipcc` that
+  `CreateProcess` cannot execute. All are now host-shaped.
+
+### Fixed
+
+- **lfm2moe AR streaming corrupted split code points.** The decode loop ran
+  `tokenizer.decode(&[tok])` per token, so a code point spanning two tokens was
+  `from_utf8_lossy`-ed in halves and reached the client as U+FFFD. On
+  LFM2.5-1.2B this rendered `252 ÷ 2 = 126` as `252 \u{fffd}\u{fffd} 2 = 126`.
+  The loop now decodes the whole run and emits the delta's longest valid UTF-8
+  prefix, carrying a truncated trailing code point to the next step, and flushes
+  the carry when the run ends. Greedy output is byte-identical to the n-gram
+  speculative path across code, prose, math, CJK, and emoji fixtures.
+
 ## v0.3.0 — MQ V2 wire schema, Bonsai, Redline across RDNA
 
 ### Quant wire schema (Bonsai + Magnum V2)

@@ -68,6 +68,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Human validation route selection | [`docs/VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Sole route selector. |
 | Machine admission registry | [`docs/admissions.yml`](admissions.yml) | shipped / ref-pinned | Schema v2; exactly one earned record (LFM2.5-350M MQ4 gfx1201 retained-PM4). |
 | Product onboarding | [`docs/GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | |
+| Windows / Linux parity surface map | [`docs/windows-parity.md`](windows-parity.md) | shipped / ref-pinned | Per-surface state, structural gaps, and the residual behavioral difference. |
 | CLI surface and model lifecycle commands | [`docs/CLI.md`](CLI.md) | shipped / ref-pinned | |
 | Daemon / user config keys | [`docs/CONFIG.md`](CONFIG.md) | shipped / ref-pinned | |
 | Copyable TOML config profiles | [`docs/configs/`](configs/README.md) | shipped / ref-pinned | User, developer, and retained-PM4 examples. |
@@ -124,6 +125,7 @@ Every current top-level page, exactly once.
 | [`VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Validation route selector. |
 | [`admissions.yml`](admissions.yml) | shipped / ref-pinned | Admission registry (schema v2; exactly one record). |
 | [`GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | Onboarding. |
+| [`windows-parity.md`](windows-parity.md) | shipped / ref-pinned | Windows / Linux parity. |
 | [`CLI.md`](CLI.md) | shipped / ref-pinned | CLI. |
 | [`CONFIG.md`](CONFIG.md) | shipped / ref-pinned | Config keys. |
 | [`env-vars.md`](env-vars.md) | shipped / ref-pinned | Environment variables. |

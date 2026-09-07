@@ -17,11 +17,34 @@ Audience: first install on an AMD GPU host. Goal: install → verify → pull a 
   [README.md](../README.md)). **ROCm 6.4+** for RDNA4 (`gfx1200`/`gfx1201`);
   **ROCm 7.2+** for Strix Halo / gfx115x. hipfire's path resolver does not
   hardcode a required release — install a supported stack for your GPU.
-- **Windows:** [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (`hipcc` + `amdhip64.dll`).
+- **Windows:** an Adrenalin driver plus a HIP **development** stack — the
+  driver's `amdhip64_*.dll` alone cannot compile kernels. Two routes work:
+  - [AMD HIP SDK](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
+    (`bin\hipcc.bat` + `amdhip64.dll`). Needs administrator rights.
+  - The `rocm-sdk` Python wheels, which install a complete SDK tree into a
+    virtualenv and need no administrator rights:
+
+    ```powershell
+    py -3.12 -m venv $env:USERPROFILE\rocmenv
+    & $env:USERPROFILE\rocmenv\Scripts\python.exe -m pip install --pre `
+      --index-url https://nightly.repo.amd.com/rocm/whl-next/ `
+      "rocm[libraries,devel,device-gfx1100]"     # match your arch
+    & $env:USERPROFILE\rocmenv\Scripts\rocm-sdk.exe init
+    $env:HIPFIRE_ROCM_PATH = "$env:USERPROFILE\rocmenv\Lib\site-packages\_rocm_sdk_devel"
+    ```
+
+    This layout keeps the AMDGCN device bitcode at
+    `lib\llvm\amdgcn\bitcode` instead of `<root>\amdgcn\bitcode`; hipfire
+    probes both and passes `--rocm-device-lib-path` when needed, so no extra
+    flags are required.
 - **WSL2:** install AMD WSL GPU support first (`sudo amdgpu-install --usecase=wsl`), then use the Linux installer inside the distro.
 - Disk space for models under `~/.hipfire/models/` (a few GB for small tags; tens of GB for 27B+).
 
 Live model tags, VRAM floors, and formats: [MODELS.md](MODELS.md). Full env list: [env-vars.md](env-vars.md).
+
+Windows: what is at parity with Linux, what has no Windows counterpart, and
+the one remaining behavioral difference are in
+[windows-parity.md](windows-parity.md).
 
 For a non-default or side-by-side install, pin one coherent SDK root before
 starting hipfire:
@@ -105,9 +128,10 @@ notepad "$env:TEMP\hipfire-install.ps1"
 ```
 
 PowerShell also accepts `-Branch beta`, `-Tag v0.2.1`, and `-Commit <sha>`.
-The native `hipfire update` command remains Linux-only because Windows cannot
-atomically replace the running executable; re-run `install.ps1` with the
-desired selector instead.
+`hipfire update` works on Windows: it drives `install.ps1` under a
+kill-on-close Job Object, and binary installation renames the running image
+aside before putting the new one in place, which Windows permits even though it
+refuses to overwrite it.
 
 Uses a GitHub release `daemon.exe` when available; otherwise builds from source
 under `~\.hipfire\src`. The native CLI is built from the same checkout, and the
