@@ -155,6 +155,21 @@ difference live in [docs/windows-parity.md](docs/windows-parity.md).
   honored or the single-stream path runs unchanged;
   `HIPFIRE_DOWNLOAD_STREAMS` overrides the worker count, and `1` restores the
   old behavior.
+- **A killed `hipfire pull` left the model's full size on disk.** Pre-sizing the
+  staging file means an interrupted transfer strands `.part.<pid>` at the full
+  artifact size rather than at the bytes fetched; two interrupted 11.78 GB
+  pulls cost 23.5 GB. `download_verified` now sweeps sibling staging files
+  first and removes the ones whose pid is gone, which the pid in the name makes
+  safe: a concurrent pull keeps its own file and a non-pid suffix is left alone.
+- **Benchmark prompt fixtures were not byte-identical across hosts.** AGENTS.md
+  pins prompt md5s and requires byte-identical prompts for any tok/s
+  comparison, but a Windows checkout rewrote LF to CRLF, so the two A3B
+  fixtures hashed to `46c8d967…` and `06eb2ebe…` instead of the pinned
+  `253c7ac5…` and `37c5aad9…`. A `.gitattributes` entry pins
+  `benchmarks/prompts` to LF and the tree is renormalized. The endings measured
+  no throughput effect on gfx1100 (29.1 vs 29.0 and 27.2 vs 27.2 tok/s), so
+  this restores reproducible fixture identity rather than fixing a token-shape
+  penalty.
 
 ## v0.3.0 — MQ V2 wire schema, Bonsai, Redline across RDNA
 

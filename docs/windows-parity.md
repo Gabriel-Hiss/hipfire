@@ -98,19 +98,32 @@ Get-Counter "\GPU Process Memory(pid_${d}*)\Dedicated Usage",
 
 Measured on `gfx1100` (16 GB) with Qwen3.8-27B, `--spec off`, 3 runs,
 `benchmarks/prompts/merge_sort_thinking_off.txt`
-(md5 `46c8d9674dcc8a8f18638bbd2d42c9ae`):
+(md5 `253c7ac50857fe6d0e10fb0d2c5e35c0`), `max_seq` at the registry default,
+counters sampled while the model served a request:
 
 | Tier | Weights | Dedicated | Shared | Decode |
 |---|---|---|---|---|
-| `mq3-xt` | 11.78 GB | 12.42 GB | 0.01 GB | 30.0 tok/s |
-| `mq3` | 12.62 GB | 12.30 GB | 0.97 GB | 29.5 tok/s |
-| `mq3-pro` | 13.18 GB | ~12.3 GB | ~1.5 GB | 5.6 tok/s |
-| `mq4-xt` | 14.98 GB | 12.19 GB | 3.21 GB | 5.5 tok/s |
+| `mq3-xt` | 11.78 GB | 12.75 GB | 1.76 GB | 29.5 tok/s |
+| `mq3` | 12.62 GB | 12.72 GB | 2.63 GB | 29.0 tok/s |
+| `mq3-pro` | 13.18 GB | 12.78 GB | 3.09 GB | 5.8 tok/s |
+| `mq4-xt` | 14.98 GB | 12.85 GB | 4.62 GB | 4.5 tok/s |
 
-The cost is not proportional to the overflow. Just under 1 GB of shared memory
-costs nothing measurable, and the next 0.5 GB costs 5x. Pick the largest tier
-whose weights leave the dedicated budget untouched, and confirm with the
-counters rather than with reported free memory.
+Dedicated usage saturates near 12.8 GB whatever the tier, and the overflow
+lands in shared memory. The cost of that overflow is not proportional: 2.63 GB
+shared costs 1.7% of decode, and the next half gigabyte costs 80%. Prefill
+falls harder than decode, 306 tok/s down to 29 on `mq4-xt`.
+
+Capping the context shrinks the shared footprint without buying throughput.
+`memory.max_seq 8192` took `mq3` from 2.63 GB shared to 0.97 GB and moved
+decode from 28.9 to 29.4 tok/s, within run-to-run spread. Untouched committed
+pages are not what costs the throughput, so size the tier, not the context.
+
+Pick a tier by measuring, not by subtracting weights from the nameplate
+capacity.
+
+Full arrays, artifact digests, and the speculation rows are in
+[`docs/perf-checkpoints/2026-09-07-qwen38-mq3-gfx1100-windows-vram-ceiling.md`](perf-checkpoints/2026-09-07-qwen38-mq3-gfx1100-windows-vram-ceiling.md)
+(lifecycle `historical`, measurement only, not an admission or a default).
 
 ## Environment note for isolated runs
 
