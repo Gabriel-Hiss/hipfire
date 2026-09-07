@@ -22,9 +22,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::Command,
     sync::{Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
@@ -761,6 +760,50 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    // A Windows console is shared by every process attached to it, and a
+    // console control event reaches all of them. Inheriting this console would
+    // couple the background serve to whatever launched it in both directions:
+    // closing the shell kills the serve, and a Ctrl-C anywhere in the tree
+    // takes down the caller. Observed: `hipfire serve --detach` terminating the
+    // parent process that ran it.
+    //
+    // DETACHED_PROCESS (0x8) gives the child no console at all, which is
+    // correct here because both of its streams are already redirected to
+    // serve.log. CREATE_NEW_PROCESS_GROUP (0x200) additionally makes it a group
+    // root, so it is not a Ctrl-Break target either, and it is the same flag
+    // `stop` relies on for a graceful signal.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+
+        // `CreateProcess` is always called with `bInheritHandles = TRUE`, so the
+        // child also receives every inheritable handle this process holds, not
+        // only the three named in its `STARTUPINFO`. With the caller's stdout on
+        // a pipe (`hipfire serve --detach | tee log`), the background serve keeps
+        // the write end open and the reader never sees EOF, so the shell blocks
+        // until the service exits. Windows cannot make a child drop a handle
+        // after the fact, so the flag has to be off at spawn time. No restore is
+        // needed: this function returns right after, and its own writes do not
+        // depend on the flag. Unix needs none of it, since Rust opens
+        // descriptors `CLOEXEC` and all three standard ones are redirected above.
+        for handle in [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ] {
+            if handle.is_null() {
+                continue;
+            }
+            // Safety: the handle belongs to a live standard stream of this
+            // process and the mask names exactly the bit being cleared.
+            unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
     if args.no_prewarm {
         command.arg("--no-prewarm");
     }
@@ -885,9 +928,9 @@ pub(crate) fn serve_foreground(
     };
     if multi_slot_enabled {
         eprintln!(
-            "serve: experimental multi-slot mode ({} slots, {} ctx) — daemon-owned, continuous batching deferred",
-            multi_slot_slots, multi_slot_ctx
-        );
+   "serve: experimental multi-slot mode ({} slots, {} ctx) — daemon-owned, continuous batching deferred",
+   multi_slot_slots, multi_slot_ctx
+  );
     }
     let shared = Arc::new(ServeShared {
         metrics: metrics::Metrics::default(),
@@ -1245,12 +1288,205 @@ pub(crate) fn serve_instance_token() -> String {
     format!("{:x}", digest.finalize())
 }
 
+#[cfg(unix)]
 pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = stat.rsplit_once(") ")?.1;
     after_comm.split_whitespace().nth(19)?.parse().ok()
 }
 
+#[cfg(windows)]
+pub(crate) fn proc_start_time(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FALSE, FILETIME},
+        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    // Safety: the process handle is checked before use, all FILETIME pointers
+    // are valid for writes, and the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let succeeded =
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) != 0;
+        let _ = CloseHandle(handle);
+        if !succeeded {
+            return None;
+        }
+        // This timestamp is an opaque identity token compared only for equality;
+        // its 100-nanosecond unit need not match Linux's jiffies.
+        Some(((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).is_dir()
+}
+
+#[cfg(windows)]
+pub(crate) fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FALSE, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    // Safety: the process handle is checked before use, the exit-code pointer
+    // is valid for writes, and the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let succeeded = GetExitCodeProcess(handle, &mut exit_code) != 0;
+        let _ = CloseHandle(handle);
+        succeeded && exit_code == STILL_ACTIVE as u32
+    }
+}
+
+#[cfg(windows)]
+fn windows_processes() -> Option<Vec<(u32, String)>> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+    };
+
+    // Safety: the snapshot handle is checked before use, PROCESSENTRY32W has
+    // the required size, and the handle is closed after enumeration.
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut processes = Vec::new();
+        let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
+        while has_entry {
+            let length = entry
+                .szExeFile
+                .iter()
+                .position(|character| *character == 0)
+                .unwrap_or(entry.szExeFile.len());
+            processes.push((
+                entry.th32ProcessID,
+                String::from_utf16_lossy(&entry.szExeFile[..length]),
+            ));
+            has_entry = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        let _ = CloseHandle(snapshot);
+        Some(processes)
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(String::from_utf8_lossy(&cmdline).replace('\0', " "))
+}
+
+#[cfg(windows)]
+pub(crate) fn process_command_line(pid: u32) -> Option<String> {
+    // ToolHelp exposes only the image name, not the argument vector, so the
+    // caller's identity check must remain satisfiable by the image name alone.
+    windows_processes()?
+        .into_iter()
+        .find_map(|(process_id, image)| (process_id == pid).then_some(image))
+}
+
+fn command_line_is_serve(command_line: &str, image_name_only: bool) -> bool {
+    if image_name_only {
+        command_line.eq_ignore_ascii_case("hipfire.exe")
+    } else {
+        command_line.contains("hipfire") && command_line.contains("serve")
+    }
+}
+
+#[cfg(windows)]
+fn windows_tcp_listeners() -> Option<Vec<(u16, u32)>> {
+    use windows_sys::Win32::{
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
+        NetworkManagement::IpHelper::{
+            GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+            TCP_TABLE_OWNER_PID_LISTENER,
+        },
+        Networking::WinSock::{AF_INET, AF_INET6},
+    };
+
+    let mut listeners = Vec::new();
+    for family in [AF_INET, AF_INET6] {
+        let mut size = 0u32;
+        // Safety: the first call intentionally supplies a null buffer to obtain
+        // its size; the second uses aligned storage of at least that size, and
+        // the returned row count is read only after the API reports success.
+        unsafe {
+            let first = GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                family as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+            if first != ERROR_INSUFFICIENT_BUFFER && first != NO_ERROR {
+                return None;
+            }
+            if size == 0 {
+                continue;
+            }
+            let mut buffer = vec![0u32; (size as usize).div_ceil(std::mem::size_of::<u32>())];
+            let result = GetExtendedTcpTable(
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                0,
+                family as u32,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            );
+            if result != NO_ERROR {
+                return None;
+            }
+            if family == AF_INET {
+                let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+                let rows = std::slice::from_raw_parts(
+                    (*table).table.as_ptr(),
+                    (*table).dwNumEntries as usize,
+                );
+                listeners.extend(rows.iter().map(|row| {
+                    (
+                        u16::from_be((row.dwLocalPort & u16::MAX as u32) as u16),
+                        row.dwOwningPid,
+                    )
+                }));
+            } else {
+                let table = buffer.as_ptr().cast::<MIB_TCP6TABLE_OWNER_PID>();
+                let rows = std::slice::from_raw_parts(
+                    (*table).table.as_ptr(),
+                    (*table).dwNumEntries as usize,
+                );
+                listeners.extend(rows.iter().map(|row| {
+                    (
+                        u16::from_be((row.dwLocalPort & u16::MAX as u32) as u16),
+                        row.dwOwningPid,
+                    )
+                }));
+            }
+        }
+    }
+    Some(listeners)
+}
+
+#[cfg(unix)]
 pub(crate) fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
     let mut listen_inodes = BTreeSet::new();
     let port_hex = format!("{port:04X}");
@@ -1297,18 +1533,25 @@ pub(crate) fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
     Some(false)
 }
 
+#[cfg(windows)]
+pub(crate) fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
+    windows_tcp_listeners().map(|listeners| {
+        listeners
+            .iter()
+            .any(|(listener_port, owner)| *listener_port == port && *owner == pid)
+    })
+}
+
 pub(crate) fn validate_serve_pid(
     record: &ServePidRecord,
     host: &str,
     fallback_port: u16,
 ) -> Result<()> {
-    let proc_dir = PathBuf::from(format!("/proc/{}", record.pid));
-    if !proc_dir.is_dir() {
+    if !process_is_alive(record.pid) {
         bail!("tracked serve PID {} is no longer alive", record.pid);
     }
-    let cmdline = fs::read(proc_dir.join("cmdline")).unwrap_or_default();
-    let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-    if !cmdline.contains("hipfire") || !cmdline.contains("serve") {
+    let cmdline = process_command_line(record.pid).unwrap_or_default();
+    if !command_line_is_serve(&cmdline, cfg!(windows)) {
         bail!("PID {} is not a hipfire serve process", record.pid);
     }
     if let Some(expected) = record.start_time {
@@ -1338,6 +1581,72 @@ pub(crate) fn validate_serve_pid(
             "could not prove ownership of PID {} with port or health token",
             record.pid
         )
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn request_process_stop(pid: u32) -> std::io::Result<()> {
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(pid.to_string())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "kill -TERM exited with {status}"
+        )))
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn request_process_stop(pid: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FALSE},
+        System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
+    };
+
+    // Windows has no cooperative termination signal, so the daemon cannot run
+    // its shutdown path before the operating system terminates the process.
+    // Safety: the process handle is checked before use and closed on every
+    // successful-open path.
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let succeeded = TerminateProcess(handle, 0) != 0;
+        let error = if succeeded {
+            None
+        } else {
+            Some(std::io::Error::last_os_error())
+        };
+        let _ = CloseHandle(handle);
+        error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(windows)]
+fn reap_windows_processes(include_quantize: bool, port: u16) {
+    if let Some(processes) = windows_processes() {
+        for (pid, image) in processes {
+            if image.eq_ignore_ascii_case("daemon.exe")
+                || include_quantize && image.eq_ignore_ascii_case("hipfire-quantize.exe")
+            {
+                let _ = request_process_stop(pid);
+            }
+        }
+    }
+    if let Some(listeners) = windows_tcp_listeners() {
+        let mut owners = BTreeSet::new();
+        owners.extend(
+            listeners
+                .into_iter()
+                .filter_map(|(listener_port, pid)| (listener_port == port).then_some(pid)),
+        );
+        for pid in owners {
+            let _ = request_process_stop(pid);
+        }
     }
 }
 
@@ -1373,16 +1682,11 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
                     "warning: {error}; refusing direct PID signal and continuing forced reap"
                 );
             } else {
-                let status = Command::new("kill")
-                    .arg("-TERM")
-                    .arg(record.pid.to_string())
-                    .status()
-                    .context("failed to invoke kill")?;
-                if !status.success() {
+                if request_process_stop(record.pid).is_err() {
                     bail!("failed to stop native serve PID {}", record.pid);
                 }
                 for _ in 0..50 {
-                    if !Path::new(&format!("/proc/{}", record.pid)).exists() {
+                    if !process_is_alive(record.pid) {
                         break;
                     }
                     thread::sleep(Duration::from_millis(100));
@@ -1401,15 +1705,20 @@ pub(crate) fn stop_command(paths: &Paths, args: StopArgs) -> Result<()> {
         let port = args
             .port
             .unwrap_or(config_u64(&resolved, "serve.port")? as u16);
-        let _ = Command::new("pkill").args(["-x", "daemon"]).status();
-        if args.all {
-            let _ = Command::new("pkill")
-                .args(["-f", "target/release/hipfire-quantize"])
+        #[cfg(unix)]
+        {
+            let _ = Command::new("pkill").args(["-x", "daemon"]).status();
+            if args.all {
+                let _ = Command::new("pkill")
+                    .args(["-f", "target/release/hipfire-quantize"])
+                    .status();
+            }
+            let _ = Command::new("fuser")
+                .args(["-k", &format!("{port}/tcp")])
                 .status();
         }
-        let _ = Command::new("fuser")
-            .args(["-k", &format!("{port}/tcp")])
-            .status();
+        #[cfg(windows)]
+        reap_windows_processes(args.all, port);
         println!("reaped orphan daemon processes and freed port {port}");
     }
     Ok(())
@@ -1493,6 +1802,17 @@ mod tests {
         assert!(meta.loading_model.is_none());
         assert!(!idle_model_expired(&meta, Duration::from_secs(300)));
         assert!(meta.last_activity.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn serve_process_identity_accepts_each_platform_shape() {
+        assert!(command_line_is_serve(
+            "/opt/hipfire/hipfire serve --port 11435",
+            false,
+        ));
+        assert!(!command_line_is_serve("/usr/bin/unrelated --serve", false,));
+        assert!(command_line_is_serve("hipfire.exe", true));
+        assert!(!command_line_is_serve("daemon.exe", true));
     }
 
     #[test]
