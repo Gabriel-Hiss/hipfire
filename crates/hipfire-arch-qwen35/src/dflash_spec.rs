@@ -22,8 +22,8 @@ use crate::speculative::{
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
-    request_rng_state, EvictRetain, PrefillOutcome, SpecGrammar, SpecRequestConfig, SpecStep,
-    SpecTarget, Speculator,
+    request_rng_state, EvictRetain, PldMatch, PldMatcher, PrefillOutcome, SpecGrammar,
+    SpecRequestConfig, SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -523,6 +523,57 @@ fn lower_qwen35(r: SpecStepResult) -> SpecStep {
     )
 }
 
+/// DFlash / DDTree speculator tuning: greedy CPU PLD → DFlash cascade
+/// (Goose bypass mode, Jin et al. 2026 §4.3). N-gram suffix lengths are
+/// fixed to [5, 4, 3] (paper values); only the gates and the extract cap
+/// are configurable.
+pub struct DflashPldConfig {
+    /// Minimum cross-length consensus for a match to bypass the draft.
+    /// Runtime default: 2.
+    pub min_consensus: usize,
+    /// Minimum spine length for a match to bypass the draft.
+    /// Runtime default: 5.
+    pub min_chain: usize,
+    /// Hard cap on extracted spine tokens. Runtime default: 8.
+    pub max_extract: usize,
+}
+impl Default for DflashPldConfig {
+    fn default() -> Self {
+        Self {
+            min_consensus: 2,
+            min_chain: 12,
+            max_extract: 15,
+        }
+    }
+}
+impl DflashPldConfig {
+    /// Fixed suffix lengths tried longest-first (paper {5, 4, 3}).
+    pub const NGRAM_LENS: [usize; 3] = [5, 4, 3];
+}
+
+/// State for the greedy CPU PLD → DFlash cascade owned by
+/// [`DflashSpeculator`]. `None` on the speculator = cascade disabled.
+struct PldCascade {
+    matcher: PldMatcher,
+    min_consensus: usize,
+    min_chain: usize,
+    /// Prompt snapshot seeded in `prefill`. `step` builds the lookup
+    /// context as `prompt ++ emitted`, terminated at the seed token.
+    prompt: Vec<u32>,
+    /// Disable further PLD probes after one underperforming bypass.
+    disabled_for_request: bool,
+}
+
+/// Pure gate for a PLD match: accept the spine only when consensus and
+/// chain length clear their thresholds, else fall back to the DFlash
+/// draft. GPU-free; unit-tested below.
+fn accept_pld_spine(m: &PldMatch, min_consensus: usize, min_chain: usize) -> Option<&[u32]> {
+    if m.consensus >= min_consensus && m.tokens.len() >= min_chain {
+        Some(&m.tokens)
+    } else {
+        None
+    }
+}
 /// DFlash / DDTree speculator: wraps the qwen35 `spec_step_*` chain/tree
 /// kernels behind the arch-generic [`Speculator`] trait. Chain-vs-tree is an
 /// internal detail resolved at build (`ddtree` presence comes from the loaded
@@ -550,6 +601,9 @@ pub struct DflashSpeculator {
     resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
+    /// Greedy-only CPU PLD → DFlash cascade. `None` = disabled: `step`
+    /// passes `pld_spine=None` and `name()` reports `"dflash"`.
+    pld: Option<PldCascade>,
 }
 
 impl DflashSpeculator {
@@ -574,7 +628,27 @@ impl DflashSpeculator {
             resume_enabled,
             ck_interval,
             ck_cap,
+            pld: None,
         }
+    }
+
+    /// Enable the greedy CPU PLD → DFlash cascade with the given gates.
+    /// The matcher uses the fixed paper n-gram lengths [5, 4, 3] with
+    /// `max_extract` as its cap; `min_extract` stays 1 so the matcher never
+    /// pre-filters — the `min_chain` gate in `step` decides. The prompt
+    /// history is seeded on the next `prefill`.
+    pub fn set_pld(&mut self, cfg: DflashPldConfig) {
+        self.pld = Some(PldCascade {
+            matcher: PldMatcher {
+                ngram_lens: DflashPldConfig::NGRAM_LENS.to_vec(),
+                max_extract: cfg.max_extract,
+                min_extract: 1,
+            },
+            min_consensus: cfg.min_consensus,
+            min_chain: cfg.min_chain,
+            prompt: Vec::new(),
+            disabled_for_request: false,
+        });
     }
 
     /// Borrow the retained-PM4 verify route (report / phase inspection).
@@ -590,9 +664,12 @@ impl DflashSpeculator {
 
 impl Speculator for DflashSpeculator {
     fn name(&self) -> &'static str {
-        "dflash"
+        if self.pld.is_some() {
+            "dflash+pld"
+        } else {
+            "dflash"
+        }
     }
-
     fn prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -695,6 +772,14 @@ impl Speculator for DflashSpeculator {
             .map_err(|e| e.to_string())?;
         }
         self.df.draft_scratch.thlog.seed_prompt(prompt_tokens.len());
+        // Seed the PLD cascade history with the full prompt. `step` builds
+        // each lookup context as `prompt ++ emitted`, terminated at the seed
+        // token, so the matcher always sees the whole committed prefix.
+        if let Some(pld) = self.pld.as_mut() {
+            pld.prompt.clear();
+            pld.prompt.extend_from_slice(prompt_tokens);
+            pld.disabled_for_request = false;
+        }
         if let Some(ckpt) = resume_from {
             // Divergent rows [ckpt..len) were just overwritten; drop the draft's
             // projection cursor so the first spec step re-projects from `ckpt`.
@@ -851,6 +936,7 @@ impl Speculator for DflashSpeculator {
         };
         // accepted drafts + bonus = emit; max accepted drafts = max_emit - 1.
         let max_accept = Some(max_emit.saturating_sub(1));
+        let mut used_pld = false;
 
         // Two-way dispatch: DDTree-batched (SWOR) when a tree is configured
         // (never for DFlash2 selector — load refused construction), else
@@ -889,6 +975,36 @@ impl Speculator for DflashSpeculator {
                 max_accept,
             )
         } else {
+            // Greedy-only CPU PLD → DFlash cascade: build the lookup context
+            // as `prompt ++ emitted`, terminated at the seed token, and run
+            // the matcher. A strong match (consensus + chain gates) bypasses
+            // the draft forward via the existing `pld_spine` arg; a weak
+            // match, sampled decode, tree mode, or DFlash2 candidate selector
+            // falls back to normal DFlash (`None`).
+            let pld_match = if self
+                .pld
+                .as_ref()
+                .is_some_and(|pld| !pld.disabled_for_request)
+                && !self.df.draft_weights.has_candidate_selector()
+                && temp <= 1e-6
+                && self.sample_temp <= 1e-6
+            {
+                self.pld.as_ref().and_then(|pld| {
+                    let mut ctx = Vec::with_capacity(pld.prompt.len() + emitted.len() + 1);
+                    ctx.extend_from_slice(&pld.prompt);
+                    ctx.extend_from_slice(emitted);
+                    if ctx.last() != Some(&seed) {
+                        ctx.push(seed);
+                    }
+                    pld.matcher
+                        .lookup(&ctx)
+                        .filter(|m| accept_pld_spine(m, pld.min_consensus, pld.min_chain).is_some())
+                })
+            } else {
+                None
+            };
+            let pld_spine: Option<&[u32]> = pld_match.as_ref().map(|m| m.tokens.as_slice());
+            used_pld = pld_spine.is_some();
             // Selector chain must error on invalid rewrites rather than silently
             // substituting 0/None — keep the CACTUS guard here (the other
             // rewrites are hard-wired to off/None in this path, but the direct
@@ -927,13 +1043,20 @@ impl Speculator for DflashSpeculator {
                 None,           // ngram_cache
                 emitted,
                 self.sample_cactus, // selector already checked — safe to pass through
-                None,               // pld_spine
+                pld_spine,          // Some only on a strong greedy PLD match; else normal DFlash
                 1.0_f32,            // repeat_penalty (off)
                 0,                  // repeat_window
                 max_accept,
                 Some(&mut self.df.verify_pm4),
             )
         };
+        if used_pld {
+            if let (Ok(step), Some(pld)) = (result.as_ref(), self.pld.as_mut()) {
+                if step.accepted < pld.min_chain {
+                    pld.disabled_for_request = true;
+                }
+            }
+        }
 
         result
             .map(lower_qwen35)
@@ -965,6 +1088,12 @@ impl Speculator for DflashSpeculator {
         self.df.draft_scratch.reset_upload_tracking();
         for (_, snap) in self.checkpoints.drain(..) {
             snap.free_gpu(gpu);
+        }
+        // Drop the PLD prompt history so the next request cannot match
+        // against a prior conversation's tokens.
+        if let Some(pld) = self.pld.as_mut() {
+            pld.prompt.clear();
+            pld.disabled_for_request = false;
         }
         Ok(())
     }
@@ -1065,6 +1194,37 @@ impl Speculator for DflashSpeculator {
 /// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`, matching the daemon's
 /// `ckpt_interval()`/`ckpt_max()` defaults). Called once at load.
 pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<dyn Speculator> {
+    Box::new(build_dflash_speculator_concrete(df, eviction_is_none, None))
+}
+
+/// Construct the DFlash speculator with the greedy CPU PLD → DFlash cascade.
+/// Same env resolution as [`build_dflash_speculator`]; `pld = None` builds
+/// the historical cascade-disabled speculator. `Some(cfg)` enables the
+/// cascade via [`DflashSpeculator::set_pld`] — the single convention for
+/// turning PLD on, fed by the loader from the four `SpecLoadCfg` PLD fields
+/// (`dflash_pld`, `dflash_pld_min_consensus`, `dflash_pld_min_chain`,
+/// `dflash_pld_max_extract`). Called once at load.
+pub fn build_dflash_speculator_with_pld(
+    df: DflashState,
+    eviction_is_none: bool,
+    pld: Option<DflashPldConfig>,
+) -> Box<dyn Speculator> {
+    Box::new(build_dflash_speculator_concrete(df, eviction_is_none, pld))
+}
+
+/// Shared env-resolving constructor behind [`build_dflash_speculator`] and
+/// [`build_dflash_speculator_with_pld`]: checkpoint resume
+/// (`HIPFIRE_DFLASH_CKPT_RESUME` + no-eviction) and interval/cap
+/// (`HIPFIRE_CACHE_CKPT_INTERVAL`/`_MAX`). `Some(pld)` enables the cascade
+/// via [`DflashSpeculator::set_pld`] — the single convention for turning
+/// PLD on, fed by the loader from the four `SpecLoadCfg` PLD fields
+/// (`dflash_pld`, `dflash_pld_min_consensus`, `dflash_pld_min_chain`,
+/// `dflash_pld_max_extract`).
+fn build_dflash_speculator_concrete(
+    df: DflashState,
+    eviction_is_none: bool,
+    pld: Option<DflashPldConfig>,
+) -> DflashSpeculator {
     let resume_enabled = hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
         .ok()
         .as_deref()
@@ -1080,12 +1240,13 @@ pub fn build_dflash_speculator(df: DflashState, eviction_is_none: bool) -> Box<d
         .and_then(|v| v.parse().ok())
         .unwrap_or(8usize)
         .max(1);
-    Box::new(DflashSpeculator::new(
-        df,
-        resume_enabled,
-        ck_interval,
-        ck_cap,
-    ))
+    let mut spec = DflashSpeculator::new(df, resume_enabled, ck_interval, ck_cap);
+    if let Some(cfg) = pld {
+        if spec.df.draft_config.runtime_block_size() == spec.df.draft_config.block_size {
+            spec.set_pld(cfg);
+        }
+    }
+    spec
 }
 
 // ─── Retained-PM4 admission (pure) ────────────────────────────────────
@@ -1447,5 +1608,64 @@ mod admit_dflash_verify_pm4_tests {
         for (args, expected) in cases {
             assert_eq!(admit(args).unwrap_err(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod dflash_pld_gate_tests {
+    use super::*;
+
+    fn gated_match(tokens: Vec<u32>, consensus: usize) -> PldMatch {
+        PldMatch {
+            tokens,
+            n: 5,
+            consensus,
+        }
+    }
+
+    #[test]
+    fn config_defaults_match_runtime_contract() {
+        let cfg = DflashPldConfig::default();
+        assert_eq!(cfg.min_consensus, 2);
+        assert_eq!(cfg.min_chain, 12);
+        assert_eq!(cfg.max_extract, 15);
+        assert_eq!(DflashPldConfig::NGRAM_LENS, [5, 4, 3]);
+    }
+
+    #[test]
+    fn strong_match_passes_gates() {
+        let m = gated_match((0..12).collect(), 2);
+        assert_eq!(accept_pld_spine(&m, 2, 12), Some(m.tokens.as_slice()));
+    }
+
+    #[test]
+    fn weak_consensus_falls_back_to_dflash() {
+        let m = gated_match((0..12).collect(), 1);
+        assert_eq!(accept_pld_spine(&m, 2, 12), None);
+    }
+
+    #[test]
+    fn short_chain_falls_back_to_dflash() {
+        let m = gated_match((0..8).collect(), 3);
+        assert_eq!(accept_pld_spine(&m, 2, 12), None);
+    }
+
+    #[test]
+    fn repeating_prompt_yields_gated_spine() {
+        // End-to-end through the real matcher on CPU: a repeated prompt
+        // phrase produces a lookup hit whose spine clears the default
+        // gates, mirroring the context `step` builds (prompt ++ seed).
+        let cfg = DflashPldConfig::default();
+        let matcher = PldMatcher {
+            ngram_lens: DflashPldConfig::NGRAM_LENS.to_vec(),
+            max_extract: cfg.max_extract,
+            min_extract: 1,
+        };
+        let phrase: Vec<u32> = (10..40).collect();
+        let mut ctx = Vec::new();
+        ctx.extend_from_slice(&phrase);
+        ctx.extend_from_slice(&phrase[..5]);
+        let m = matcher.lookup(&ctx).expect("repeated phrase must match");
+        assert!(accept_pld_spine(&m, cfg.min_consensus, cfg.min_chain).is_some());
     }
 }

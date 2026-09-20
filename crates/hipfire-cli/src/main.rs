@@ -381,7 +381,7 @@ struct RunArgs {
     #[arg(long, value_parser = ["contiguous", "vmm"])]
     /// One-shot KV storage backend override for this model load.
     kv_backend: Option<String>,
-    /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
+    /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, dspark, or cascade.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
     /// Explicit DFlash draft model.
@@ -466,7 +466,7 @@ pub(crate) struct BenchArgs {
     kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
-    /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
+    /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, cascade, or auto).
     #[arg(long = "spec")]
     speculation: Option<String>,
     /// Let the model think during the benchmark. Off by default: a reasoning
@@ -2858,6 +2858,10 @@ pub(crate) fn load_params(
         "ngram_min_count": config_u64(resolved, "speculation.ngram_min_count")?,
         "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
         "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
+        "dflash_pld": config_bool(resolved, "speculation.dflash_pld")?,
+        "dflash_pld_min_consensus": config_u64(resolved, "speculation.dflash_pld_min_consensus")?,
+        "dflash_pld_min_chain": config_u64(resolved, "speculation.dflash_pld_min_chain")?,
+        "dflash_pld_max_extract": config_u64(resolved, "speculation.dflash_pld_max_extract")?,
         "cask_sidecar": cask_sidecar,
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
@@ -2926,34 +2930,44 @@ fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) ->
             params["mtp_mode"] = serde_json::json!("off");
             params["ngram_draft"] = serde_json::json!(false);
             params["dspark_mode"] = serde_json::json!("off");
+            params["dflash_pld"] = serde_json::json!(false);
         }
         "dflash" => {
             params["dflash_mode"] = serde_json::json!("on");
             params["mtp_mode"] = serde_json::json!("off");
             params["ngram_draft"] = serde_json::json!(false);
             params["dspark_mode"] = serde_json::json!("off");
+            params["dflash_pld"] = serde_json::json!(false);
         }
         "mtp" => {
             params["dflash_mode"] = serde_json::json!("off");
             params["mtp_mode"] = serde_json::json!("on");
             params["ngram_draft"] = serde_json::json!(false);
             params["dspark_mode"] = serde_json::json!("off");
+            params["dflash_pld"] = serde_json::json!(false);
         }
         "ngram" => {
             params["dflash_mode"] = serde_json::json!("off");
             params["mtp_mode"] = serde_json::json!("off");
             params["ngram_draft"] = serde_json::json!(true);
             params["dspark_mode"] = serde_json::json!("off");
+            params["dflash_pld"] = serde_json::json!(false);
         }
         "dspark" => {
             params["dflash_mode"] = serde_json::json!("off");
             params["mtp_mode"] = serde_json::json!("off");
             params["ngram_draft"] = serde_json::json!(false);
             params["dspark_mode"] = serde_json::json!("on");
+            params["dflash_pld"] = serde_json::json!(false);
         }
-        "auto" => {
-            params["dspark_mode"] = serde_json::json!("auto");
+        "cascade" => {
+            params["dflash_mode"] = serde_json::json!("on");
+            params["mtp_mode"] = serde_json::json!("off");
+            params["ngram_draft"] = serde_json::json!(false);
+            params["dspark_mode"] = serde_json::json!("off");
+            params["dflash_pld"] = serde_json::json!(true);
         }
+        "auto" => {}
         other => bail!("unknown speculation selector '{other}'"),
     }
     Ok(())
@@ -7411,6 +7425,59 @@ mod tests {
             params.get("draft").is_none(),
             "final off must drop projected developer.dflash_draft"
         );
+    }
+    #[test]
+    fn cascade_selector_enables_dflash_pld_and_disables_others() {
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        // Schema defaults keep the cascade off until selected.
+        assert_eq!(params["dflash_pld"], false);
+        assert_eq!(params["dflash_pld_min_consensus"], 2);
+        assert_eq!(params["dflash_pld_min_chain"], 12);
+        assert_eq!(params["dflash_pld_max_extract"], 15);
+
+        apply_speculation_selector(&mut params, "cascade").unwrap();
+        assert_eq!(params["dflash_mode"], "on");
+        assert_eq!(params["dflash_pld"], true);
+        assert_eq!(params["mtp_mode"], "off");
+        assert_eq!(params["ngram_draft"], false);
+        assert_eq!(params["dspark_mode"], "off");
+
+        // Every other explicit mechanism keeps plain DFlash semantics.
+        for selector in ["off", "dflash", "mtp", "ngram", "dspark"] {
+            apply_speculation_selector(&mut params, selector).unwrap();
+            assert_eq!(params["dflash_pld"], false, "{selector}");
+        }
+        assert!(apply_speculation_selector(&mut params, "pld").is_err());
+    }
+
+    #[test]
+    fn load_params_forwards_configured_dflash_pld_limits() {
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.dflash_pld", "true").unwrap();
+        explicit
+            .set_cli("speculation.dflash_pld_min_consensus", "3")
+            .unwrap();
+        explicit
+            .set_cli("speculation.dflash_pld_min_chain", "6")
+            .unwrap();
+        explicit
+            .set_cli("speculation.dflash_pld_max_extract", "7")
+            .unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "dflash_pld-limits".into(),
+            },
+            layer: explicit,
+        }])
+        .unwrap();
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        assert_eq!(params["dflash_pld"], true);
+        assert_eq!(params["dflash_pld_min_consensus"], 3);
+        assert_eq!(params["dflash_pld_min_chain"], 6);
+        assert_eq!(params["dflash_pld_max_extract"], 7);
     }
 
     #[test]

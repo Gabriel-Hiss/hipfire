@@ -504,10 +504,7 @@ fn find_compiler_on_path() -> Option<PathBuf> {
 /// Try to find a device compiler in other discovered roots (excluding `selected` family).
 fn find_compiler_in_other_roots(selected: &Path) -> Option<(PathBuf, PathBuf)> {
     let family = root_family(selected);
-    let family_canonical: Vec<PathBuf> = family
-        .iter()
-        .map(|p| canonicalize_plain(p))
-        .collect();
+    let family_canonical: Vec<PathBuf> = family.iter().map(|p| canonicalize_plain(p)).collect();
     for root in all_roots_unfiltered() {
         let canon = canonicalize_plain(&root);
         if family_canonical.contains(&canon) {

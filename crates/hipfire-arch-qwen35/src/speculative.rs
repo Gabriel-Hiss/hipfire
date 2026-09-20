@@ -2906,8 +2906,7 @@ fn verify_dflash_block_inner(
                             .stream_synchronize(gpu.active_stream.as_ref().unwrap())
                     });
                 if let Err(err) = first_launch {
-                    gpu.graphs
-                        .verify_graph_destroy_all(&gpu.hip, gpu.device_id);
+                    gpu.graphs.verify_graph_destroy_all(&gpu.hip, gpu.device_id);
                     return Err(err);
                 }
                 if capture_lmhead_argmax {
@@ -7589,9 +7588,7 @@ mod tests {
             DType::MQ5G256V2,
             DType::MQ6G256V2,
         ] {
-            assert!(!dflash_verify_graph_env_eligible(
-                "gfx1100", dtype, None
-            ));
+            assert!(!dflash_verify_graph_env_eligible("gfx1100", dtype, None));
             assert!(!dflash_verify_graph_env_eligible(
                 "gfx1100",
                 dtype,

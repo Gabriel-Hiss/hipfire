@@ -12,13 +12,15 @@
 //! `spec_ngram`). The registry is what lets the loader pick a drafter at load
 //! time without the daemon learning which ran.
 
-use hipfire_arch_qwen35::Qwen35Bundle;
-use std::any::Any;
-use hipfire_arch_qwen35::dflash_spec::{build_dflash_speculator, DflashState};
+use hipfire_arch_qwen35::dflash_spec::{
+    build_dflash_speculator, build_dflash_speculator_with_pld, DflashPldConfig, DflashState,
+};
 use hipfire_arch_qwen35::mtp_head::Qwen35MtpHead;
 use hipfire_arch_qwen35::speculative::ModelSlot;
+use hipfire_arch_qwen35::Qwen35Bundle;
 use hipfire_runtime::spec::{SpecTarget, SpecTargetGuard, Speculator};
 use hipfire_runtime::spec_ngram::{ChainSpeculator, NgramDrafter};
+use std::any::Any;
 use std::path::Path;
 
 /// RAII scope that moves the live `Qwen35Bundle` out of `m.state`, lends it to
@@ -66,7 +68,10 @@ impl<'m> Qwen35SlotGuard<'m> {
     /// untouched) if the model is not a loaded Qwen3.5 bundle — note the
     /// `matches!` guard *before* `take()` so a non-Qwen35 model is never moved
     /// out and dropped.
-    pub fn take(state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>, model_path: &str) -> Result<Self, String> {
+    pub fn take(
+        state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        model_path: &str,
+    ) -> Result<Self, String> {
         if !state
             .as_ref()
             .is_some_and(|s| (s.as_ref() as &dyn Any).is::<Qwen35Bundle>())
@@ -76,7 +81,7 @@ impl<'m> Qwen35SlotGuard<'m> {
         let Some(state_box) = state.take() else {
             unreachable!("guarded by the matches! above")
         };
-        let bundle = * (state_box as Box<dyn Any>)
+        let bundle = *(state_box as Box<dyn Any>)
             .downcast::<Qwen35Bundle>()
             .unwrap();
         Ok(Self {
@@ -170,6 +175,15 @@ pub fn build_speculator(
     spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Option<Box<dyn Speculator>> {
     if let Some(df) = dflash {
+        let pld = spec.dflash_pld.unwrap_or(false).then(|| DflashPldConfig {
+            min_consensus: spec.dflash_pld_min_consensus.unwrap_or(2).clamp(1, 32),
+            min_chain: spec.dflash_pld_min_chain.unwrap_or(12).clamp(1, 32),
+            max_extract: spec.dflash_pld_max_extract.unwrap_or(15).clamp(1, 32),
+        });
+        if pld.is_some() {
+            eprintln!("  DFlash CPU PLD cascade enabled (greedy bypass)");
+            return Some(build_dflash_speculator_with_pld(df, eviction_is_none, pld));
+        }
         return Some(build_dflash_speculator(df, eviction_is_none));
     }
     // qwen35 MTP head (arch 5/6). MTP wins over n-gram when present; the load

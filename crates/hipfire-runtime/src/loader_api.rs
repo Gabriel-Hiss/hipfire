@@ -132,8 +132,18 @@ pub struct SpecLoadCfg {
     pub mtp: Option<bool>,
     /// MTP draft window K. `None` = runtime default (`HIPFIRE_MTP_K`).
     pub mtp_k: Option<usize>,
+    /// Greedy CPU PLD -> DFlash cascade enable, lowered from the `cascade`
+    /// speculation selector or `speculation.dflash_pld`. `Some(true)` enables
+    /// the PLD spine proposal path, `Some(false)`/absent keeps plain DFlash.
+    /// `None` = unspecified (loader default: disabled).
+    pub dflash_pld: Option<bool>,
+    /// PLD spine consensus threshold. `None` = runtime default (2).
+    pub dflash_pld_min_consensus: Option<usize>,
+    /// PLD minimum accepted spine chain length. `None` = runtime default (12).
+    pub dflash_pld_min_chain: Option<usize>,
+    /// PLD maximum spine tokens extracted per step. `None` = runtime default (15).
+    pub dflash_pld_max_extract: Option<usize>,
 }
-
 /// CASK/TriAttention params forwarded by the CLI at load time.
 #[derive(Default)]
 pub struct CaskConfig {

@@ -734,12 +734,13 @@ def _write_native_config(cfg, home):
         # Mirrors apply_speculation_selector(): each named selector pins every
         # sibling off so the arms are mutually exclusive and legible in the log.
         pins = {
-            "off":    ('off',    'off',  'off', 'off'),
-            "dflash": ('dflash', 'on',   'off', 'off'),
-            "mtp":    ('mtp',    'off',  'on',  'off'),
-            "ngram":  ('ngram',  'off',  'off', 'on'),
-            "dspark": ('dspark', 'off',  'off', 'off'),
-            "auto":   ('auto',   'auto', mtp,   'off'),
+            "off":     ('off',     'off',  'off', 'off', False),
+            "dflash":  ('dflash',  'on',   'off', 'off', False),
+            "mtp":     ('mtp',     'off',  'on',  'off', False),
+            "ngram":   ('ngram',   'off',  'off', 'on',  False),
+            "dspark":  ('dspark',  'off',  'off', 'off', False),
+            "cascade": ('cascade', 'on',   'off', 'off', True),
+            "auto":    ('auto',    'auto', mtp,   'off', False),
         }[explicit]
         speculation = (
             '[speculation]\n'
@@ -747,6 +748,7 @@ def _write_native_config(cfg, home):
             f'dflash = {json.dumps(pins[1])}\n'
             f'mtp = {json.dumps(pins[2])}\n'
             f'ngram = {json.dumps(pins[3])}\n'
+            f'dflash_pld = {str(pins[4]).lower()}\n'
         )
         if ngram_k is not None and pins[0] == "ngram":
             speculation += f'ngram_k = {int(ngram_k)}\n'
@@ -2821,12 +2823,10 @@ def main():
                     help="DFlash mode written to temporary [speculation] TOML (default off). "
                          "'on' emits mode=dflash + dflash=on + mtp/ngram off.")
     ap.add_argument("--speculation", default=None,
-                    choices=["off", "auto", "ngram", "dflash", "mtp", "dspark"],
+                    choices=["off", "auto", "ngram", "dflash", "mtp", "dspark", "cascade"],
                     help="explicit speculation selector; overrides --dflash/--mtp and mirrors the "
-                         "CLI's apply_speculation_selector. Required to reach DSpark: the "
-                         "--dflash/--mtp matrix can only get there by accident, via the schema "
-                         "default mode=auto auto-discovering the sidecar. DeepSeek V4 ships its "
-                         "speculative module in the checkpoint, so use --speculation dspark.")
+                         "CLI's apply_speculation_selector. Cascade enables greedy CPU PLD over "
+                         "compatible DFlash drafts.")
     ap.add_argument(
         "--deepseek4-experts-per-token",
         type=int,

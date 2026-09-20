@@ -1410,6 +1410,29 @@ fn main() {
                         _ => None, // "auto" → loader default
                     },
                     mtp_k: Some(mtp_k),
+                    // Greedy CPU PLD -> DFlash cascade: the CLI lowers `--spec
+                    // cascade` (or `speculation.dflash_pld`) into `dflash_pld`
+                    // plus its tuning limits. Absent params leave `None` so the
+                    // runtime falls back to its defaults (off / 2 / 12 / 15).
+                    dflash_pld: msg
+                        .get("params")
+                        .and_then(|p| p.get("dflash_pld"))
+                        .and_then(|v| v.as_bool()),
+                    dflash_pld_min_consensus: msg
+                        .get("params")
+                        .and_then(|p| p.get("dflash_pld_min_consensus"))
+                        .and_then(|v| v.as_u64())
+                        .map(|c| c as usize),
+                    dflash_pld_min_chain: msg
+                        .get("params")
+                        .and_then(|p| p.get("dflash_pld_min_chain"))
+                        .and_then(|v| v.as_u64())
+                        .map(|c| c as usize),
+                    dflash_pld_max_extract: msg
+                        .get("params")
+                        .and_then(|p| p.get("dflash_pld_max_extract"))
+                        .and_then(|v| v.as_u64())
+                        .map(|e| e as usize),
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.

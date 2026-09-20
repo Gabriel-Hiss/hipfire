@@ -521,7 +521,7 @@ const THINKING_BUDGETS: &[&str] = &["off", "low", "med", "high", "xhigh", "max",
 // non-Qwen3.8 parents still validate. Values pass through as request strings;
 // model-specific mapping lives downstream of config validation.
 const REASONING_EFFORTS: &[&str] = &["auto", "none", "low", "medium", "high", "xhigh", "max"];
-const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark"];
+const SPECULATION_MODES: &[&str] = &["off", "auto", "ngram", "dflash", "mtp", "dspark", "cascade"];
 
 macro_rules! field {
     ($key:literal, $legacy:literal, $category:ident, $scope:ident, $default:expr, $rule:expr, $registry:expr, $experimental:expr, $env:expr, $help:literal) => {
@@ -1597,6 +1597,54 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         Some("HIPFIRE_DDTREE_TOPK"),
         "DFlash verify-tree fanout."
+    ),
+    field!(
+        "speculation.dflash_pld",
+        "dflash_pld",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_PLD"),
+        "Greedy CPU PLD -> DFlash cascade enable."
+    ),
+    field!(
+        "speculation.dflash_pld_min_consensus",
+        "dflash_pld_min_consensus",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(2),
+        ValueRule::Integer { min: 1, max: 32 },
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_PLD_MIN_CONSENSUS"),
+        "PLD spine consensus threshold."
+    ),
+    field!(
+        "speculation.dflash_pld_min_chain",
+        "dflash_pld_min_chain",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(12),
+        ValueRule::Integer { min: 1, max: 32 },
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_PLD_MIN_CHAIN"),
+        "PLD minimum accepted spine chain length."
+    ),
+    field!(
+        "speculation.dflash_pld_max_extract",
+        "dflash_pld_max_extract",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(15),
+        ValueRule::Integer { min: 1, max: 32 },
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_PLD_MAX_EXTRACT"),
+        "PLD maximum spine tokens extracted per step."
     ),
     field!(
         "prompt.chat_template",
@@ -4598,6 +4646,40 @@ mod tests {
                 .to_value(),
             ConfigValue::String("off".into())
         );
+    }
+    #[test]
+    fn dflash_pld_cascade_is_opt_in_with_bounded_limits() {
+        assert_eq!(
+            field("speculation.dflash_pld").unwrap().default.to_value(),
+            ConfigValue::Bool(false)
+        );
+        assert_eq!(
+            field("speculation.dflash_pld_min_consensus")
+                .unwrap()
+                .default
+                .to_value(),
+            ConfigValue::Integer(2)
+        );
+        assert_eq!(
+            field("speculation.dflash_pld_min_chain")
+                .unwrap()
+                .default
+                .to_value(),
+            ConfigValue::Integer(12)
+        );
+        assert_eq!(
+            field("speculation.dflash_pld_max_extract")
+                .unwrap()
+                .default
+                .to_value(),
+            ConfigValue::Integer(15)
+        );
+        let mode = field("speculation.mode").unwrap();
+        assert_eq!(
+            mode.parse_cli("cascade").unwrap(),
+            ConfigValue::String("cascade".into())
+        );
+        assert!(mode.parse_cli("pld").is_err());
     }
 
     #[test]

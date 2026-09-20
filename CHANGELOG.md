@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Speculative cascade
+
+- Added the `cascade` speculation mode for greedy Qwen3.8/Qwen35 generation.
+  A CPU prompt-lookup matcher uses strong repeated-context continuations as the
+  verification spine and bypasses the DFlash draft for that cycle; weak matches,
+  sampled requests, DDTree, and DFlash2 selector drafts retain the existing
+  DFlash path. The CLI forwards bounded PLD gates through the daemon's typed
+  load contract, and plain DFlash remains unchanged unless the cascade is
+  explicitly selected.
+
 ### Windows host support
 
 hipfire builds, serves, and generates on `x86_64-pc-windows-msvc` at parity with

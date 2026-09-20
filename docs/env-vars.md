@@ -104,12 +104,16 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 | Variable | Default / sense | Notes |
 |---|---|---|
-| `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
+| `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark`/`cascade` | Canonical selector; `cascade` enables greedy CPU PLD bypass over DFlash |
 | `HIPFIRE_DFLASH_DRAFT` | retired engine read | Still appears in legacy gate scripts; product draft discovery uses typed speculation/load policy and registry/filename matching. |
 | `HIPFIRE_DFLASH_CTX_CAP` | **8192**; `0` restores uncapped legacy behavior | Caps draft-side context storage; over-cap requests fall back to AR |
 | `HIPFIRE_DFLASH_WINDOW` | **0 / unset** (legacy), unless declared by draft metadata | Enables bounded draft SWA; refused with CASK eviction |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
+| `HIPFIRE_DFLASH_PLD` | **off** | Enable greedy CPU prompt-lookup bypass for DFlash |
+| `HIPFIRE_DFLASH_PLD_MIN_CONSENSUS` | **2** | Required agreement across the fixed 5/4/3-token suffix matchers |
+| `HIPFIRE_DFLASH_PLD_MIN_CHAIN` | **12** | Minimum continuation length before PLD bypasses DFlash |
+| `HIPFIRE_DFLASH_PLD_MAX_EXTRACT` | **15** | Maximum tokens copied into one PLD verification spine |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash path |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |
 | `HIPFIRE_DRAFT_MAX` | routes to active mech window | CLI |
@@ -242,6 +246,10 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `flash_mode` | `HIPFIRE_ATTN_FLASH` |
 | `prompt_normalize` | `HIPFIRE_NORMALIZE_PROMPT` |
 | `dflash_ngram_block` | `HIPFIRE_DFLASH_NGRAM_BLOCK` |
+| `dflash_pld` | `HIPFIRE_DFLASH_PLD` |
+| `dflash_pld_min_consensus` | `HIPFIRE_DFLASH_PLD_MIN_CONSENSUS` |
+| `dflash_pld_min_chain` | `HIPFIRE_DFLASH_PLD_MIN_CHAIN` |
+| `dflash_pld_max_extract` | `HIPFIRE_DFLASH_PLD_MAX_EXTRACT` |
 | `experimental_budget_alert` | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` |
 | `max_total_think_tokens` | `HIPFIRE_MAX_TOTAL_THINK_TOKENS` |
 | `mtp_mode` / `mtp_k` | `HIPFIRE_MTP_MODE` / `HIPFIRE_MTP_K` |
@@ -460,6 +468,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DFLASH_MOE_DRAFT_FFN_GRAPH` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_DFLASH_MOE_VERIFY_GRAPH_LMHEAD` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_DFLASH_PLD` / `HIPFIRE_DFLASH_PLD_*` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_DFLASH_OFF` | scripts/serve-loop-gate.sh |
 | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | crates/hipfire-arch-qwen35/src/speculative.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_DFLASH_REFERENCE` | scripts/dflash_ref_spec_test.py, scripts/dflash_spec_debug.py |
