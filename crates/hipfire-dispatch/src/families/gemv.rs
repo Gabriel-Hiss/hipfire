@@ -137,6 +137,7 @@ pub fn select_rotation_variant(
     match plan {
         RotationPlan::FwhtG128 => RotationVariant::PlainG128,
         RotationPlan::Givens => RotationVariant::Givens,
+        RotationPlan::PrismHadamard => RotationVariant::PrismHadamard,
         RotationPlan::Mq8Internal => {
             if has_norm {
                 RotationVariant::WithRmsnorm
@@ -433,6 +434,24 @@ fn prepare_rotation_scratch(
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             Ok((mq(gpu)?, awq, batched))
         }
+        RotationPlan::PrismHadamard => {
+            let min_elems = w
+                .k
+                .checked_mul(inputs.batch_size.max(1))
+                .ok_or_else(|| DispatchError::Hip("Prism Hadamard scratch overflow".into()))?;
+            gpu.ensure_prism_hadamard_scratch(w.k, min_elems)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            let scratch = gpu.scratch.prism_x_rot.as_ref().unwrap();
+            Ok((
+                GpuTensor {
+                    buf: unsafe { scratch.buf.alias() },
+                    shape: vec![min_elems],
+                    dtype: DType::F32,
+                },
+                awq,
+                batched,
+            ))
+        }
         RotationPlan::Givens => {
             gpu.ensure_paro_scratch(w.k)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
@@ -491,6 +510,7 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvHfq2G256 => hip!(gpu.gemv_hfq2g256(w.buf, x, y, m, k)),
         K::GemvHfq2G128 => hip!(gpu.gemv_hfq2g128(w.buf, x, y, m, k)),
         K::GemvTQ2G128 => hip!(gpu.gemv_tq2g128(w.buf, x, y, m, k)),
+        K::GemvPTQ1G128 => hip!(gpu.gemv_ptq1g128(w.buf, x, y, m, k)),
         K::GemvBQ1G128 => hip!(gpu.gemv_bq1g128(w.buf, x, y, m, k)),
         K::GemvHfq6G256 => hip!(gpu.gemv_hfq6g256(w.buf, x, y, m, k)),
         K::GemvHfp4G32 => hip!(gpu.gemv_hfp4g32(w.buf, x, y, m, k)),

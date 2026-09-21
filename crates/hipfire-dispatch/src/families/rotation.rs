@@ -80,6 +80,36 @@ impl RotationFamily {
                 // rotate_x_mq_128 internally calls ensure_mq_signs_128()
                 gpu.rotate_x_mq_128(params.x, params.x_rot, params.k)
             }
+            RotationVariant::PrismHadamard => {
+                if has_awq {
+                    return Err(HipError::new(
+                        0,
+                        "Prism Hadamard does not support AWQ sidecars",
+                    ));
+                }
+                let source = if let Some(w_norm) = params.w_norm {
+                    gpu.rmsnorm_batched(
+                        params.x,
+                        w_norm,
+                        params.x_plain,
+                        params.batch_size,
+                        params.k,
+                        params.eps,
+                    )?;
+                    params.x_plain
+                } else if let Some(x_up) = params.x_up {
+                    gpu.silu_mul_f32(params.x, x_up, params.x_plain)?;
+                    params.x_plain
+                } else {
+                    params.x
+                };
+                gpu.rotate_x_prism_hadamard(
+                    source,
+                    params.x_rot,
+                    params.k,
+                    params.batch_size,
+                )
+            }
             RotationVariant::Plain => match (has_awq, batched) {
                 (false, false) => {
                     self.registry.resolve(KernelKey::RotateMq, ctx, None)

@@ -23,6 +23,14 @@ pub fn populate(registry: &mut KernelRegistry) {
         tile: TileImpl::None,
     });
     registry.register(KernelVariant {
+        key: KernelKey::GemmPTQ1G128Prefill,
+        arch_required: ArchPredicate::Always,
+        shape_gate: Some(ShapePredicate::BatchGe(1)),
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
         key: KernelKey::GemmBQ1G128Prefill,
         arch_required: ArchPredicate::Always,
         shape_gate: Some(ShapePredicate::BatchGe(32)),

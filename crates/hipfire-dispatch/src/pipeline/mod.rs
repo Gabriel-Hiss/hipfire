@@ -69,6 +69,14 @@ pub fn execute_pipeline(
         match step {
             PipelineOp::RotateFwht => {
                 use crate::families::rotation::{RotationFamily, RotationParams};
+                // The Gemv step below re-derives the rotation from raw `x`
+                // through `run_auto`, so only the FWHT-G256 family needs the
+                // shared `mq_x_rot` staging here. Prism-Hadamard, Givens and
+                // G128 plans own different scratch and sign tables; running
+                // this arm for them would rotate with the wrong transform.
+                if crate::types::dtype_rotation_plan(dtype) != RotationPlan::FwhtG256 {
+                    continue;
+                }
                 let rot = RotationFamily::new();
                 gpu.ensure_mq_signs()
                     .map_err(|e| DispatchError::Hip(e.to_string()))?;

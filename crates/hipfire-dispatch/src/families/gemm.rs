@@ -143,6 +143,7 @@ impl GemmFamily {
             }
             DType::HFQ4G128 => KernelKey::GemmHfq4G128,
             DType::TQ2G128 => KernelKey::GemmTQ2G128Prefill,
+            DType::PTQ1G128H => KernelKey::GemmPTQ1G128Prefill,
             DType::BQ1G128 => KernelKey::GemmBQ1G128Prefill,
             DType::MQ4G256V2 => KernelKey::GemmMq4G256V2,
             DType::MQ6G256V2 => KernelKey::GemmMq6G256V2,
@@ -402,6 +403,9 @@ impl GemmFamily {
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmTQ2G128Prefill => {
                 hip!(gpu.gemm_tq2g128_prefill(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmPTQ1G128Prefill => {
+                hip!(gpu.gemm_ptq1g128_prefill(w.buf, x, y, m, k, batch_size))
             }
             K::GemmBQ1G128Prefill => {
                 hip!(gpu.gemm_bq1g128_prefill(w.buf, x, y, m, k, batch_size))

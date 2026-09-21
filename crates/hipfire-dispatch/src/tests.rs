@@ -768,6 +768,12 @@ fn gemv_steps_rotation_matches_plan() {
                 assert!(!has_fwht && !has_givens, "{dtype:?}: no rotation");
             }
             RotationPlan::Mq8Internal => {}
+            RotationPlan::PrismHadamard => {
+                assert!(
+                    has_fwht && !has_givens,
+                    "{dtype:?}: Prism-Hadamard plan rotates through the FWHT pipeline slot"
+                );
+            }
         }
     }
 }

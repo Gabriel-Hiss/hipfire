@@ -963,7 +963,11 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
                             k: *k,
                             eps: *eps,
                             batch_size: 1,
-                            variant: RotationVariant::WithRmsnorm,
+                            variant: if *rotation == RotationPlan::PrismHadamard {
+                                RotationVariant::PrismHadamard
+                            } else {
+                                RotationVariant::WithRmsnorm
+                            },
                             givens_pairs: None,
                             givens_theta: None,
                             givens_scales: None,

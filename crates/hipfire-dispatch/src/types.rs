@@ -97,6 +97,7 @@ pub enum MoeVariant {
 pub enum RotationVariant {
     Plain,
     PlainG128,
+    PrismHadamard,
     Givens,
     WithRmsnorm,
     WithSwiGLU,
@@ -109,6 +110,7 @@ pub enum RotationPlan {
     None,
     FwhtG256,
     FwhtG128,
+    PrismHadamard,
     Mq8Internal,
     Givens,
 }
@@ -127,6 +129,7 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         // falling through to RotationPlan::None leaves x unrotated against weights
         // that were encoded post-rotation, which is silent garbage, not an error.
         MQ4G128 => RotationPlan::FwhtG128,
+        TQ2G128H | PTQ1G128H => RotationPlan::PrismHadamard,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
         // MQ2G256LloydU is the UNROTATED Lloyd sibling: its weights are encoded
@@ -152,9 +155,8 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         // prerotated GEMV route.
         MQ4G256 | MQ4G256V2 | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
         | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
-            GemvVariant::Prerotated
-        }
+        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128
+        | TQ2G128H | PTQ1G128H => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -228,6 +230,7 @@ pub enum KernelKey {
     GemvHfq2G256,
     GemvHfq2G128,
     GemvTQ2G128,
+    GemvPTQ1G128,
     GemvBQ1G128,
     GemvHfq6G256,
     GemvMq4G256,
@@ -309,6 +312,7 @@ pub enum KernelKey {
     /// 64x64 output tile; beats the per-token GEMV loop from N~32 up.
     GemmTQ2G128Prefill,
     /// Binary sibling of `GemmTQ2G128Prefill`.
+    GemmPTQ1G128Prefill,
     GemmBQ1G128Prefill,
     GemmHfq4G256,
     GemmHfq4G128,
@@ -692,6 +696,8 @@ impl KernelKey {
             (HFQ2G256, Plain) => Ok(Self::GemvHfq2G256),
             (HFQ2G128, Plain) => Ok(Self::GemvHfq2G128),
             (TQ2G128, Plain) => Ok(Self::GemvTQ2G128),
+            (TQ2G128H, Plain) => Ok(Self::GemvTQ2G128),
+            (PTQ1G128H, Plain) => Ok(Self::GemvPTQ1G128),
             (BQ1G128, Plain) => Ok(Self::GemvBQ1G128),
             (HFQ6G256, Plain) => Ok(Self::GemvHfq6G256),
             (MQ4G256, Plain) => Ok(Self::GemvMq4G256),
@@ -750,6 +756,8 @@ impl KernelKey {
             MFP4G32P => Ok(Self::GemvMfp4G32PPrerotated),
             MFP4G32E8 => Ok(Self::GemvMfp4G32E8Prerotated),
             MFP4G32E8SOA => Ok(Self::GemvMfp4G32E8SoaPrerotated),
+            TQ2G128H => Ok(Self::GemvTQ2G128),
+            PTQ1G128H => Ok(Self::GemvPTQ1G128),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()
@@ -858,7 +866,7 @@ impl KernelKey {
             // TQ2G128: ternary GEMV kernel (gemv_tq2g128, Task 9) is a generic
             // wave32/wave64 kernel with no ISA-specific intrinsics, same as its
             // HFQ2G128 sibling — identical arch gating.
-            | TQ2G128
+            | TQ2G128 | TQ2G128H | PTQ1G128H
             // BQ1G128: binary Bonsai-27B sibling of TQ2G128. Its GEMV kernel
             // (gemv_bq1g128, fp32-activation, no ISA-specific intrinsics) has the
             // same generic wave32/wave64 shape as TQ2G128 — identical Always gating.
