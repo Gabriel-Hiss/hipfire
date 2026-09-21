@@ -4703,6 +4703,22 @@ pub const DEQUANT_BQ1G128_TO_F16_SRC: &str =
 /// [FP16 d (2B)][32B codes] (34B) block and the `scale*code+zero` map for
 /// `(code - 1) * d`.
 pub const GEMV_TQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_tq2g128.hip");
+/// PrismML checkpoint-declared blockwise normalized Hadamard rotation.
+pub const ROTATE_X_PRISM_HADAMARD_SRC: &str =
+    include_str!("../../../kernels/src/rotate_x_prism_hadamard.hip");
+
+/// TQ2-G128 embedding-row decode (Bonsai latent table): one row of packed
+/// ternary blocks to F32, consumed by the inverse Prism-Hadamard rotation.
+pub const EMBEDDING_LOOKUP_TQ2G128_SRC: &str =
+    include_str!("../../../kernels/src/embedding_lookup_tq2g128.hip");
+
+/// Prism PTQ1-G128 dense base-3 trit GEMV + weight-reusing prefill GEMM.
+pub const GEMV_PTQ1G128_SRC: &str =
+    include_str!("../../../kernels/src/gemv_ptq1g128.hip");
+
+/// PTQ1-G128 latent embedding row decode; inverse Hadamard follows separately.
+pub const EMBEDDING_LOOKUP_PTQ1G128_SRC: &str =
+    include_str!("../../../kernels/src/embedding_lookup_ptq1g128.hip");
 
 /// BQ1-G128 GEMV: correctness-first FP decode GEMV for PrismML Q1_0 binary.
 /// Mirrors GEMV_TQ2G128_SRC's layout/reduction, swapping the ternary

@@ -23,6 +23,11 @@ pub struct ScratchState {
     pub mq_signs1_128: Option<GpuTensor>,
     pub mq_signs2_128: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>,
+    /// PrismML checkpoint-declared normalized block Hadamard transform.
+    pub prism_hadamard_block_size: usize,
+    pub prism_hadamard_identity: bool,
+    pub prism_hadamard_signs: HashMap<usize, GpuTensor>,
+    pub prism_x_rot: Option<GpuTensor>,
     pub mq_x_rot_fp8: Option<DeviceBuffer>,
     pub mq_x_rot_fp8_bytes: usize,
     pub mq_x_q8: Option<DeviceBuffer>,
@@ -475,6 +480,81 @@ impl ScratchState {
         if self.mq_x_rot.is_none() {
             let x_rot = alloc_tensor_on(hip, pool, device_id, &[32768], DType::F32)?;
             self.mq_x_rot = Some(x_rot);
+        }
+        Ok(())
+    }
+
+    pub fn configure_prism_hadamard(
+        &mut self,
+        hip: &HipRuntime,
+        pool: &mut crate::pool::GpuPool,
+        device_id: i32,
+        block_size: usize,
+        identity: bool,
+        signs: &HashMap<usize, Vec<i32>>,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if self.prism_hadamard_block_size == block_size
+            && self.prism_hadamard_identity == identity
+            && self.prism_hadamard_signs.len() == signs.len()
+            && signs
+                .keys()
+                .all(|width| self.prism_hadamard_signs.contains_key(width))
+        {
+            return Ok(());
+        }
+        self.prism_hadamard_block_size = block_size;
+        self.prism_hadamard_identity = identity;
+        self.prism_hadamard_signs.clear();
+        for (&width, values) in signs {
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|&value| (value as f32).to_ne_bytes())
+                .collect();
+            let tensor = alloc_tensor_on(hip, pool, device_id, &[width], DType::F32)?;
+            hip.memcpy_htod(&tensor.buf, &bytes)?;
+            self.prism_hadamard_signs.insert(width, tensor);
+        }
+        Ok(())
+    }
+
+    pub fn ensure_prism_hadamard(
+        &mut self,
+        hip: &HipRuntime,
+        pool: &mut crate::pool::GpuPool,
+        device_id: i32,
+        width: usize,
+        min_elems: usize,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if !self.prism_hadamard_signs.contains_key(&width) {
+            if !self.prism_hadamard_identity {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("Prism Hadamard sign vector missing for width {width}"),
+                ));
+            }
+            let values = vec![1.0f32; width];
+            let bytes: Vec<u8> = values.iter().flat_map(|value| value.to_ne_bytes()).collect();
+            let tensor = alloc_tensor_on(hip, pool, device_id, &[width], DType::F32)?;
+            hip.memcpy_htod(&tensor.buf, &bytes)?;
+            self.prism_hadamard_signs.insert(width, tensor);
+        }
+        let needed_bytes = min_elems
+            .checked_mul(4)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "Prism Hadamard scratch overflow"))?;
+        if self
+            .prism_x_rot
+            .as_ref()
+            .is_none_or(|scratch| scratch.buf.size() < needed_bytes)
+        {
+            self.prism_x_rot = Some(alloc_tensor_on(
+                hip,
+                pool,
+                device_id,
+                &[min_elems],
+                DType::F32,
+            )?);
         }
         Ok(())
     }

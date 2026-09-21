@@ -2094,6 +2094,221 @@ impl Gpu {
             .ensure_mq_signs_128(&self.hip, &mut self.pool, self.device_id)
     }
 
+    pub fn configure_prism_hadamard(
+        &mut self,
+        block_size: usize,
+        identity: bool,
+        signs: &std::collections::HashMap<usize, Vec<i32>>,
+    ) -> HipResult<()> {
+        self.scratch.configure_prism_hadamard(
+            &self.hip,
+            &mut self.pool,
+            self.device_id,
+            block_size,
+            identity,
+            signs,
+        )
+    }
+
+    pub fn ensure_prism_hadamard_scratch(
+        &mut self,
+        width: usize,
+        min_elems: usize,
+    ) -> HipResult<()> {
+        self.scratch.ensure_prism_hadamard(
+            &self.hip,
+            &mut self.pool,
+            self.device_id,
+            width,
+            min_elems,
+        )
+    }
+
+    pub fn rotate_x_prism_hadamard(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.prism_hadamard(x, out, k, batch_size, false)
+    }
+
+    /// Inverse-after-lookup order (H, then signs): returns a latent embedding
+    /// row to the primal basis, mirroring the transform the publisher's
+    /// runtime applies to the token-embedding output.
+    pub fn prism_hadamard(
+        &mut self,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+        inverse: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let block_size = self.scratch.prism_hadamard_block_size;
+        if block_size == 0 || !block_size.is_power_of_two() || k % block_size != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "invalid Prism Hadamard geometry: K={k}, block_size={block_size}"
+                ),
+            ));
+        }
+        self.scratch.ensure_prism_hadamard(
+            &self.hip,
+            &mut self.pool,
+            self.device_id,
+            k,
+            k.checked_mul(batch_size)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "Prism Hadamard batch overflow"))?,
+        )?;
+        self.ensure_kernel(
+            "rotate_x_prism_hadamard",
+            kernels::ROTATE_X_PRISM_HADAMARD_SRC,
+            "rotate_x_prism_hadamard",
+        )?;
+        let signs = self.scratch.prism_hadamard_signs[&k].buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let k_i = k as i32;
+        let block_i = block_size as i32;
+        let batch_i = batch_size as i32;
+        let inverse_i = i32::from(inverse);
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &signs as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+            &block_i as *const _ as *mut c_void,
+            &batch_i as *const _ as *mut c_void,
+            &inverse_i as *const _ as *mut c_void,
+        ];
+        let blocks = batch_size * (k / block_size);
+        self.launch_maybe_blob(
+            "rotate_x_prism_hadamard",
+            [blocks as u32, 1, 1],
+            [256, 1, 1],
+            (block_size * 4) as u32,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(xp);
+                blob.push_ptr(signs);
+                blob.push_ptr(op);
+                blob.push_i32(k_i);
+                blob.push_i32(block_i);
+                blob.push_i32(batch_i);
+                blob.push_i32(inverse_i);
+                blob
+            },
+        )
+    }
+
+    /// Bonsai latent embedding lookup: decode one packed ternary row, then
+    /// undo the checkpoint's Hadamard fold so the rest of the forward pass
+    /// sees a primal-basis embedding.
+    pub fn embedding_lookup_tq2g128_prism(
+        &mut self,
+        table: &GpuTensor,
+        out: &GpuTensor,
+        token: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            dim % 128,
+            0,
+            "TQ2G128 embedding requires dim%128==0, got {dim}"
+        );
+        self.ensure_prism_hadamard_scratch(dim, dim)?;
+        self.ensure_kernel(
+            "embedding_lookup_tq2g128",
+            kernels::EMBEDDING_LOOKUP_TQ2G128_SRC,
+            "embedding_lookup_tq2g128",
+        )?;
+        let latent = GpuTensor {
+            buf: unsafe { self.scratch.prism_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![dim],
+            dtype: DType::F32,
+        };
+        let tp = table.buf.as_ptr();
+        let lp = latent.buf.as_ptr();
+        let token_i = token as i32;
+        let dim_i = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &token_i as *const _ as *mut c_void,
+            &dim_i as *const _ as *mut c_void,
+        ];
+        let groups = (dim / 128) as u32;
+        self.launch_maybe_blob(
+            "embedding_lookup_tq2g128",
+            [groups, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(tp);
+                blob.push_ptr(lp);
+                blob.push_i32(token_i);
+                blob.push_i32(dim_i);
+                blob
+            },
+        )?;
+        self.prism_hadamard(&latent, out, dim, 1, true)
+    }
+
+    pub fn embedding_lookup_ptq1g128_prism(
+        &mut self,
+        table: &GpuTensor,
+        out: &GpuTensor,
+        token: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(dim % 128, 0, "PTQ1G128 embedding requires dim%128==0");
+        self.ensure_prism_hadamard_scratch(dim, dim)?;
+        self.ensure_kernel(
+            "embedding_lookup_ptq1g128",
+            kernels::EMBEDDING_LOOKUP_PTQ1G128_SRC,
+            "embedding_lookup_ptq1g128",
+        )?;
+        let latent = GpuTensor {
+            buf: unsafe { self.scratch.prism_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![dim],
+            dtype: DType::F32,
+        };
+        let tp = table.buf.as_ptr();
+        let lp = latent.buf.as_ptr();
+        let token_i = token as i32;
+        let dim_i = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &token_i as *const _ as *mut c_void,
+            &dim_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "embedding_lookup_ptq1g128",
+            [(dim / 128) as u32, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(tp);
+                blob.push_ptr(lp);
+                blob.push_i32(token_i);
+                blob.push_i32(dim_i);
+                blob
+            },
+        )?;
+        self.prism_hadamard(&latent, out, dim, 1, true)
+    }
+
     /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256. Rotates x per group via ds_swizzle,
     /// then standard 4-bit dot product. signs1/signs2 are the FWHT sign tables (256 floats each).
     pub fn gemv_mq4g256(
@@ -5935,6 +6150,96 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    pub fn gemv_ptq1g128(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        assert_eq!(k % 128, 0, "PTQ1G128 GEMV requires K%128==0");
+        self.bind_thread()?;
+        let xp = self.ensure_q8_1_mmq_x(x, 1, k)?;
+        self.ensure_kernel("gemv_ptq1g128", kernels::GEMV_PTQ1G128_SRC, "gemv_ptq1g128")?;
+        let ap = a_raw.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemv_ptq1g128",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(ap);
+                blob.push_ptr(xp);
+                blob.push_ptr(yp);
+                blob.push_i32(mi);
+                blob.push_i32(ki);
+                blob
+            },
+        )
+    }
+
+    pub fn gemm_ptq1g128_prefill(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(k % 128, 0, "PTQ1G128 prefill requires K%128==0");
+        self.bind_thread()?;
+        let xp = self.ensure_q8_1_mmq_x(x, n, k)?;
+        self.ensure_kernel(
+            "gemm_ptq1g128_prefill",
+            kernels::GEMV_PTQ1G128_SRC,
+            "gemm_ptq1g128_prefill",
+        )?;
+        let ap = a_raw.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let mi = m as i32;
+        let ki = k as i32;
+        let ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gemm_ptq1g128_prefill",
+            [m as u32, n.div_ceil(8) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(ap);
+                blob.push_ptr(xp);
+                blob.push_ptr(yp);
+                blob.push_i32(mi);
+                blob.push_i32(ki);
+                blob.push_i32(ni);
+                blob
+            },
+        )
     }
 
     /// BQ1-G128 GEMV. K must be multiple of 128. Binary sibling of TQ2-G128.

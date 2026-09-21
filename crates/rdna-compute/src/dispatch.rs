@@ -381,6 +381,8 @@ pub enum DType {
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     TQ2G128,   // ternary Bonsai-27B: 34 bytes per 128 elements (flat 2-bit ternary, group 128)
+    TQ2G128H,  // Prism ternary g128 with checkpoint-declared Hadamard activation transform
+    PTQ1G128H, // Prism dense-trit 1.75 bpw g128 with checkpoint Hadamard contract
     // Phase 4: ternary kernels wire GPU decode/dispatch; this Task 7 slice is
     // CPU-foundation only (variant + byte-size + RawCodec load mapping).
     BQ1G128,    // binary Bonsai-27B: 18 bytes per 128 elements (flat 1-bit sign, group 128)
@@ -410,6 +412,8 @@ impl DType {
             | DType::HFQ2G256
             | DType::HFQ2G128
             | DType::TQ2G128
+            | DType::TQ2G128H
+            | DType::PTQ1G128H
             | DType::BQ1G128
             | DType::HFQ6G256
             | DType::MQ4G256
@@ -1322,6 +1326,10 @@ impl Gpu {
                 mq_signs1: None,
                 mq_signs2: None,
                 mq_signs1_128: None,
+                prism_hadamard_block_size: 0,
+                prism_hadamard_identity: false,
+                prism_hadamard_signs: HashMap::new(),
+                prism_x_rot: None,
                 mq_signs2_128: None,
                 mq_x_rot: None,
                 mq_x_rot_fp8: None,

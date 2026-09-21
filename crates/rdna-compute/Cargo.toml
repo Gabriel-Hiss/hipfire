@@ -544,6 +544,14 @@ name = "test_gemv_tq2g128"
 required-features = ["lab"]
 
 [[example]]
+name = "test_prism_hadamard"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_ptq1g128"
+required-features = ["lab"]
+
+[[example]]
 name = "test_gfx12_ds4_prefill_native"
 required-features = ["lab"]
 

@@ -1021,6 +1021,18 @@ impl KernelCompiler {
             "-O3".into(),
             "--no-offload-compress".into(),
         ];
+        // MSVC 14.51 (VS 18) declares the `<cmath>` comparison helpers as
+        // host+device builtins, which collides with the redeclarations in
+        // ROCm 7.2's `__clang_hip_cmath.h`; `<complex>` then fails on the same
+        // include chain. Every kernel here is `--cuda-device-only` and uses
+        // HIP intrinsics, never the MSVC math headers, so skipping those two
+        // headers is the narrow fix. Drop it once ROCm ships a clang that
+        // knows this toolset.
+        #[cfg(windows)]
+        {
+            args.push("-D_CMATH_".into());
+            args.push("-D_COMPLEX_".into());
+        }
         args.extend(passthrough);
         args.push("-o".into());
         args.push(obj_path.to_str().unwrap().into());
