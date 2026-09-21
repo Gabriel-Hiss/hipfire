@@ -764,8 +764,8 @@ pub fn drafter_step(
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(&target_weights.embed_tokens, &ds.embed_half, prev_token, bb)
             .map_err(|e| format!("gemma4-drafter: target embed f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => {
-            return Err("gemma4-drafter: Q4K target embed unsupported".to_string())
+        EmbeddingFormat::Q4K | EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            return Err("gemma4-drafter: target embed format unsupported".to_string())
         }
     }
     let _ = target_cfg; // embed scale uses bb (= target hidden), not target_cfg directly

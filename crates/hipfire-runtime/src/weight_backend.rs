@@ -98,19 +98,22 @@ pub enum EmbedPlan {
 /// Pure quant_type → plan. GPU-free, unit-testable.
 ///
 /// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 3 → Raw(Q8_0),
-/// qt 1|2|16|40|41 → HostF32, else → panic with the supported-format list.
+/// qt 42 → Raw(TQ2G128H) (Bonsai latent table, decoded + un-folded by the
+/// lookup), qt 1|2|16|40|41 → HostF32, else → panic with the supported list.
 pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
     match quant_type {
         6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
         7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
         3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
+        42 => Ok(EmbedPlan::Raw(EmbeddingFormat::TQ2G128H)),
+        43 => Ok(EmbedPlan::Raw(EmbeddingFormat::PTQ1G128H)),
         1 | 2 | 16 | 40 | 41 => Ok(EmbedPlan::HostF32),
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "unsupported embedding quant_type {other}; \
                  handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32), \
-                 40 (TQ2G128→F32), 41 (BQ1G128→F32). \
+                 40 (TQ2G128→F32), 41 (BQ1G128→F32), 42 (TQ2G128H raw). \
                  Add the format to embed_classify to support it."
             ),
         )),
@@ -149,7 +152,9 @@ pub fn embedding_format_dtype(fmt: EmbeddingFormat) -> DType {
         EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
         EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
         EmbeddingFormat::Q8_0 => DType::Q8_0,
+        EmbeddingFormat::TQ2G128H => DType::TQ2G128H,
         EmbeddingFormat::F32 => DType::F32,
+        EmbeddingFormat::PTQ1G128H => DType::PTQ1G128H,
         EmbeddingFormat::Q4K => panic!("embedding_format_dtype: Q4K not valid for tied lm_head"),
     }
 }
@@ -436,6 +441,14 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         dtype: DType::BQ1G128,
     },
     RawCodec {
+        quant_type: 42,
+        dtype: DType::TQ2G128H,
+    },
+    RawCodec {
+        quant_type: 43,
+        dtype: DType::PTQ1G128H,
+    },
+    RawCodec {
         quant_type: 44,
         dtype: DType::MQ4G256V2,
     },
@@ -592,7 +605,8 @@ pub(crate) fn decode_raw_codec(
 /// Block bytes for low-bit codecs, or None for other codecs.
 fn lowbit_block_bytes(dtype: DType) -> Option<usize> {
     match dtype {
-        DType::TQ2G128 => Some(34),
+        DType::TQ2G128 | DType::TQ2G128H => Some(34),
+        DType::PTQ1G128H => Some(28),
         DType::BQ1G128 => Some(18),
         _ => None,
     }
@@ -1242,6 +1256,7 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
             out
         }
         40 => dequant_tq2_to_f32(data, n),
+        42 => dequant_tq2_to_f32(data, n),
         41 => dequant_bq1_to_f32(data, n),
         _ => panic!("unsupported quant_type {quant_type} for dequant_f32"),
     };
@@ -1694,9 +1709,14 @@ mod tests {
             // 96 B/group (or vice versa) → token soup, not a crash.
             (38, DType::MQ2G256GL),
             (39, DType::MQ3G256GL),
+            (43, DType::PTQ1G128H), // dense base-3 trits, 28 B/group-128
             // Bonsai ternary/binary — renumbered off 38/39 (taken by GL above).
             (40, DType::TQ2G128), // ternary Bonsai-27B, 34 B/group-128
             (41, DType::BQ1G128), // binary Bonsai-27B, 18 B/group-128
+            // qt=42: same 34 B/group ternary payload as qt=40, but the weights
+            // are folded under the checkpoint's Prism Hadamard basis; decoding
+            // it as qt=40 would run the GEMV against unrotated activations.
+            (42, DType::TQ2G128H),
             // qt=44/45: 136 B/group pad layouts (PR599). MQ4C is NOT 132.
             (44, DType::MQ4G256V2),
             (45, DType::MQ4CG256),

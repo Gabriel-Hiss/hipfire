@@ -340,6 +340,8 @@ impl Gemma4Weights {
                 EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
                 EmbeddingFormat::F32 => DType::F32,
                 EmbeddingFormat::Q4K => DType::Q4K,
+                EmbeddingFormat::TQ2G128H => DType::TQ2G128H,
+                EmbeddingFormat::PTQ1G128H => DType::PTQ1G128H,
             };
             let alias_tensor = GpuTensor {
                 buf: alias_buf,

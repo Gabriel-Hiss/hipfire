@@ -370,10 +370,12 @@ pub(crate) fn forward_decode_batch_prepared_glimmer(
                 }
                 true
             }
-            EmbeddingFormat::Q4K => false,
+            EmbeddingFormat::Q4K
+            | EmbeddingFormat::TQ2G128H
+            | EmbeddingFormat::PTQ1G128H => false,
         };
         if !ok {
-            return Err("glimmer batch: unsupported embedding format Q4K".to_string());
+            return Err("glimmer batch: unsupported embedding format".to_string());
         }
         gpu.rmsnorm_batched(&x, &state.embed_norm_ones, &x, b, dim, rms_eps)
             .map_err(|e| format!("glimmer batch embed_norm batched: {e:?}"))?;

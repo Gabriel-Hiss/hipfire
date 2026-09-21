@@ -411,7 +411,9 @@ fn embed_lookup(
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("gemma4: embed f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => return Err("gemma4: Q4K embedding format unsupported".to_string()),
+        EmbeddingFormat::Q4K | EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            return Err("gemma4: embedding format unsupported".to_string())
+        }
     }
     gpu.scale_f32(&state.x, cfg.embed_scale)
         .map_err(|e| format!("gemma4: embed scale: {e:?}"))?;
@@ -441,7 +443,9 @@ fn embedding_lookup_to(
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(table, dst, token_id, dim)
             .map_err(|e| format!("gemma4: {label} f32: {e:?}")),
-        EmbeddingFormat::Q4K => Err(format!("gemma4: {label} Q4K embedding format unsupported")),
+        EmbeddingFormat::Q4K | EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            Err(format!("gemma4: {label} embedding format unsupported"))
+        }
     }
 }
 
@@ -464,7 +468,10 @@ fn embedding_lookup_batched_to(
             gpu.embedding_lookup_hfq4g128_batched(table, dst, token_ids, batch, dim)
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, dst, token_ids, batch, dim),
-        EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
+        EmbeddingFormat::F32
+        | EmbeddingFormat::Q4K
+        | EmbeddingFormat::TQ2G128H
+        | EmbeddingFormat::PTQ1G128H => return Ok(false),
     };
     result
         .map(|_| true)
@@ -2093,7 +2100,9 @@ fn embed_lookup_row(
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(&weights.embed_tokens, dst, token_id, dim)
             .map_err(|e| format!("gemma4 forward_batch embed f32: {e:?}")),
-        EmbeddingFormat::Q4K => Err("gemma4 forward_batch: Q4K embedding unsupported".to_string()),
+        EmbeddingFormat::Q4K | EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            Err("gemma4 forward_batch: embedding format unsupported".to_string())
+        }
     }
 }
 

@@ -399,7 +399,9 @@ fn embed_lookup(
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("glimmer: embed f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => return Err("glimmer: Q4K embedding format unsupported".to_string()),
+        EmbeddingFormat::Q4K | EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            return Err("glimmer: embedding format unsupported".to_string())
+        }
     }
     // Scale-less RMSNorm over the embedding.
     //
@@ -450,7 +452,10 @@ fn embed_lookup_batched(
         EmbeddingFormat::Q8_0 => gpu
             .embedding_lookup_q8_batched(&weights.embed_tokens, x, token_ids, b, dim)
             .map_err(|e| format!("glimmer: embed q8 batched: {e:?}"))?,
-        EmbeddingFormat::F32 | EmbeddingFormat::Q4K => return Ok(false),
+        EmbeddingFormat::F32
+        | EmbeddingFormat::Q4K
+        | EmbeddingFormat::TQ2G128H
+        | EmbeddingFormat::PTQ1G128H => return Ok(false),
     }
     if !abl("HIPFIRE_GLIMMER_NO_EMBED_NORM") {
         gpu.rmsnorm_batched(x, &state.embed_norm_ones, x, b, dim, rms_eps)
@@ -1110,8 +1115,8 @@ pub fn embed_raw(
         EmbeddingFormat::F32 => gpu
             .embedding_lookup(&weights.embed_tokens, &state.x, token_id, dim)
             .map_err(|e| format!("glimmer embed_raw f32: {e:?}"))?,
-        EmbeddingFormat::Q4K => {
-            return Err("glimmer embed_raw: Q4K unsupported".into());
+        EmbeddingFormat::Q4K | EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            return Err("glimmer embed_raw: embedding format unsupported".into());
         }
     }
     let host = gpu

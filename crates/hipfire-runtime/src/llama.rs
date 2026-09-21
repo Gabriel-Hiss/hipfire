@@ -625,6 +625,11 @@ pub use hipfire_dispatch::types::{dtype_post_rotation_variant, dtype_rotation_pl
 pub enum EmbeddingFormat {
     F32,      // dequantized to F32, use D2D copy
     Q4K,      // raw Q4K blocks, use GPU dequant kernel
+    /// Bonsai latent ternary table: packed TQ2-G128 rows that the lookup
+    /// decodes and then returns to the primal basis with the checkpoint's
+    /// inverse Hadamard transform.
+    TQ2G128H,
+    PTQ1G128H,
     HFQ4G256, // raw HFQ4-G256 blocks, use GPU dequant kernel
     HFQ4G128, // raw HFQ4-G128 blocks, use GPU dequant kernel
     Q8_0,     // raw Q8_0 blocks, use GPU dequant kernel
@@ -647,6 +652,12 @@ pub fn embedding_lookup_dispatch(
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(table, output, token, dim),
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(table, output, token, dim),
         EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(table, output, token, dim),
+        EmbeddingFormat::TQ2G128H => {
+            gpu.embedding_lookup_tq2g128_prism(table, output, token as usize, dim)
+        }
+        EmbeddingFormat::PTQ1G128H => {
+            gpu.embedding_lookup_ptq1g128_prism(table, output, token as usize, dim)
+        }
         EmbeddingFormat::F32 => gpu.embedding_lookup(table, output, token, dim),
     }
 }
@@ -876,6 +887,32 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
             )
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
+        // Prism-Hadamard ternary: the transform, its block size and its sign
+        // vector come from the checkpoint, so it owns its own scratch and
+        // cannot borrow the FWHT-256 sign tables the `_` arm below sets up.
+        DType::TQ2G128H | DType::PTQ1G128H => {
+            gpu.ensure_prism_hadamard_scratch(w.k, w.k)?;
+            let xr = GpuTensor {
+                buf: unsafe { gpu.scratch.prism_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![w.k],
+                dtype: DType::F32,
+            };
+            gpu.rotate_x_prism_hadamard(x, &xr, w.k, 1)?;
+            gemv.run(
+                &ctx,
+                gpu,
+                &GemvParams {
+                    w: &wr,
+                    x: &xr,
+                    y,
+                    variant: GemvVariant::Prerotated,
+                    residual: None,
+                    gate: None,
+                    up: None,
+                },
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
+        }
         // All other FWHT-requiring dtypes (MQ4G256, MQ6G256, MQ3G256, MQ2G256,
         // MQ2G256Lloyd, MQ3G256Lloyd, MQ4G256Lloyd, MFP4G32):
         // ensure_mq_signs + rotate_x_mq_for + run_auto
@@ -1001,6 +1038,14 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
             gpu.rotate_quantize_x_mq8(tmp, sample_weight.k)?;
             Ok(None)
         }
+        // Prism-Hadamard: the transform is declared by the checkpoint, not the
+        // shared FWHT-256 kernel, so rmsnorm stays unfused and the rotation
+        // runs as its own launch.
+        DType::TQ2G128H | DType::PTQ1G128H => {
+            gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+            gpu.rotate_x_prism_hadamard(tmp, x_rot_scratch, sample_weight.k, 1)?;
+            Ok(Some(x_rot_scratch))
+        }
         _ => {
             gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
             Ok(None)
@@ -1051,6 +1096,12 @@ pub fn rotate_x_for_mq<'a>(
             gpu.rotate_quantize_x_mq8(x, sample_weight.k)?;
             Ok(None)
         }
+        // Prism-Hadamard ternary carries its own transform; returning `None`
+        // here would hand the caller an unrotated x for rotated weights.
+        DType::TQ2G128H | DType::PTQ1G128H => {
+            gpu.rotate_x_prism_hadamard(x, x_rot_scratch, sample_weight.k, 1)?;
+            Ok(Some(x_rot_scratch))
+        }
         _ => Ok(None),
     }
 }
@@ -1073,6 +1124,9 @@ pub fn rotate_x_mq_for(
     x_rot: &GpuTensor,
     k: usize,
 ) -> HipResult<()> {
+    if matches!(next_linear.gpu_dtype, DType::TQ2G128H | DType::PTQ1G128H) {
+        return gpu.rotate_x_prism_hadamard(x, x_rot, k, 1);
+    }
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.rotate_x_mq_awq(x, awq, x_rot, k)
     } else {
@@ -1131,6 +1185,9 @@ pub fn rotate_x_mq_batched_for(
     k: usize,
     batch_size: usize,
 ) -> HipResult<()> {
+    if matches!(next_linear.gpu_dtype, DType::TQ2G128H | DType::PTQ1G128H) {
+        return gpu.rotate_x_prism_hadamard(x, x_rot, k, batch_size);
+    }
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.rotate_x_mq_awq_batched(x, awq, x_rot, k, batch_size)
     } else {
@@ -1851,6 +1908,7 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             | DType::MQ6G256
             | DType::HFQ6G256
             | DType::Q8_0
+            | DType::PTQ1G128H
             // TQ2G128/BQ1G128 (PrismML Bonsai ternary/binary). Unrotated plain
             // tiled prefill GEMMs; lockstep with qwen35::is_batchable_la.
             | DType::TQ2G128
@@ -2482,6 +2540,17 @@ fn forward_prefill_chunk(
             match weights.embd_format {
                 EmbeddingFormat::Q4K => {
                     gpu.embedding_lookup_q4k(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::TQ2G128H => {
+                    gpu.embedding_lookup_tq2g128_prism(&weights.token_embd, &s.x, tok as usize, dim)?
+                }
+                EmbeddingFormat::PTQ1G128H => {
+                    gpu.embedding_lookup_ptq1g128_prism(
+                        &weights.token_embd,
+                        &s.x,
+                        tok as usize,
+                        dim,
+                    )?
                 }
                 EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?

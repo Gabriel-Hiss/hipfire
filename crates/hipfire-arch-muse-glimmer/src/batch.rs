@@ -19,7 +19,9 @@ pub fn batch_weight_formats_supported(weights: &GlimmerWeights) -> Result<(), St
         | EmbeddingFormat::HFQ4G128
         | EmbeddingFormat::Q8_0
         | EmbeddingFormat::F32 => {}
-        EmbeddingFormat::Q4K => return Err("glimmer batch: Q4K embed unsupported".to_string()),
+        EmbeddingFormat::Q4K | EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            return Err("glimmer batch: embed format unsupported".to_string())
+        }
     }
     // lm_head: Q8_0 batched chunked or F32/BF16 batched (GemmF32Batched / GemmBf16Mfma)
     if weights.lm_head.gpu_dtype != DType::Q8_0
@@ -731,8 +733,8 @@ impl GlimmerDecodeBatchState {
                 EmbeddingFormat::F32 => gpu
                     .embedding_lookup(&weights.embed_tokens, &x_lane, tok, dim)
                     .map_err(|e| format!("glimmer prefill embed f32: {e:?}"))?,
-                EmbeddingFormat::Q4K => {
-                    return Err("glimmer prefill: unsupported embed format Q4K".to_string())
+                EmbeddingFormat::Q4K | EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+                    return Err("glimmer prefill: unsupported embed format".to_string())
                 }
             }
             // scale-less embed_norm (treat ABI env as off for prefill parity)

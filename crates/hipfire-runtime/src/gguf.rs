@@ -47,6 +47,8 @@ pub enum GgmlType {
     F64 = 28,
     IQ1M = 29,
     BF16 = 30,
+    PQ2_0 = 142,
+    PTQ1_0 = 143,
 }
 
 impl GgmlType {
@@ -68,6 +70,8 @@ impl GgmlType {
             14 => Some(Self::Q6K),
             15 => Some(Self::Q8K),
             30 => Some(Self::BF16),
+            142 => Some(Self::PQ2_0),
+            143 => Some(Self::PTQ1_0),
             _ => None,
         }
     }
@@ -78,6 +82,7 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
+            Self::PQ2_0 | Self::PTQ1_0 => 128,
             _ => 32,
         }
     }
@@ -99,6 +104,8 @@ impl GgmlType {
             Self::Q5K => 2 + 2 + 12 + 128 + 32, // 176: d(2) + dmin(2) + scales(12) + qs(128) + qh(32)
             Self::Q6K => 128 + 64 + 16 + 2,     // ~210
             Self::Q8K => 256 + 2 + 32,          // ~290 (not commonly used)
+            Self::PQ2_0 => 34,
+            Self::PTQ1_0 => 28,
             _ => 0,
         }
     }

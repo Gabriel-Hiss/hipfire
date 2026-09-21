@@ -1052,6 +1052,12 @@ pub fn forward_step(
             gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen2: Bonsai ternary embedding unsupported",
+            ))
+        }
     }
 
     forward_step_after_x(gpu, weights, cfg, state, pos)
@@ -1115,6 +1121,12 @@ pub fn embed_token_row(
             gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::TQ2G128H | EmbeddingFormat::PTQ1G128H => {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "qwen2: Bonsai ternary embedding unsupported",
+            ))
+        }
     }
     gpu.download_f32(&state.x)
 }
