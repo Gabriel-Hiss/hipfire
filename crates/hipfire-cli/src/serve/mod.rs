@@ -1167,6 +1167,7 @@ impl ServeRuntime {
             path = entry.map(|entry| self.paths.models.join(&entry.file));
         }
         let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
+        let path = crate::prepare_model_path(&self.paths, path)?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
         if let Some(minimum) = minimum_max_seq
             .filter(|minimum| self.multi_slot_enabled && *minimum > self.multi_slot_ctx)

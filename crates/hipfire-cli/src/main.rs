@@ -2170,6 +2170,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         }
     }
     let model_path = model_path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let model_path = prepare_model_path(paths, model_path)?;
     if let Some(image) = &args.image {
         if !image.is_file() {
             bail!("image not found: {}", image.display());
@@ -2708,6 +2709,76 @@ fn scan_local_models(local: &[PathBuf], search: &str, mode: MatchMode) -> Vec<Pa
         })
         .cloned()
         .collect()
+}
+
+/// Resolve a user-supplied model path to something the daemon can load.
+///
+/// PrismML ternary GGUFs (Bonsai: `PQ2_0` / `PTQ1_0` payloads plus the
+/// `prism.hadamard.*` transform contract) are converted to hipfire's native
+/// container on first use and cached in the models directory, so the second
+/// run starts instantly. Every other path — including ordinary GGUFs, which
+/// need a quantization choice hipfire must not make silently — is returned
+/// unchanged or refused with the command that converts it.
+pub(crate) fn prepare_model_path(paths: &Paths, model_path: PathBuf) -> Result<PathBuf> {
+    let is_gguf = model_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("gguf"));
+    if !is_gguf {
+        return Ok(model_path);
+    }
+    let is_ternary = {
+        let gguf = hipfire_runtime::gguf::GgufFile::open(&model_path)
+            .with_context(|| format!("failed to parse GGUF {}", model_path.display()))?;
+        gguf.tensors.iter().any(|tensor| {
+            matches!(
+                tensor.dtype,
+                hipfire_runtime::gguf::GgmlType::PQ2_0 | hipfire_runtime::gguf::GgmlType::PTQ1_0
+            )
+        })
+    };
+    if !is_ternary {
+        bail!(
+            "{} is a GGUF without PrismML ternary weights; pick a quantization first:\n  \
+             hipfire quantize --input {} --format mq4 --install",
+            model_path.display(),
+            model_path.display()
+        );
+    }
+    let stem = model_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("invalid model path {}", model_path.display()))?;
+    fs::create_dir_all(&paths.models)?;
+    let converted = paths.models.join(format!("{stem}.tq2"));
+    if converted.is_file() {
+        return Ok(converted);
+    }
+    let quantizer = find_workspace_binary(paths, "hipfire-quantize").ok_or_else(|| {
+        anyhow!(
+            "hipfire-quantize is not installed; build `cargo build --release -p hipfire-quantize`"
+        )
+    })?;
+    let staging = converted.with_extension("tq2.partial");
+    eprintln!(
+        "Converting PrismML ternary GGUF -> {} (one time)",
+        converted.display()
+    );
+    run_checked(
+        Command::new(&quantizer)
+            .arg("--input")
+            .arg(&model_path)
+            .arg("--output")
+            .arg(&staging)
+            .arg("--format")
+            .arg("ternary"),
+        "hipfire-quantize",
+    )
+    .inspect_err(|_| {
+        let _ = fs::remove_file(&staging);
+    })?;
+    fs::rename(&staging, &converted)?;
+    Ok(converted)
 }
 pub(crate) fn find_model_path(
     paths: &Paths,
@@ -4286,6 +4357,7 @@ fn open_bench_engine(
         path = entry.as_ref().map(|entry| paths.models.join(&entry.file));
     }
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let path = prepare_model_path(paths, path)?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
     let daemon = find_daemon(paths).ok_or_else(|| anyhow!("daemon binary not found"))?;
     let environment = BTreeMap::new();
@@ -5773,7 +5845,7 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
     }
     let mut seen = BTreeSet::new();
     args.formats.retain(|format| seen.insert(format.clone()));
-    let valid = ["mq4", "mq6", "q8", "q8f16", "hf4", "hf6"];
+    let valid = ["mq4", "mq6", "q8", "q8f16", "hf4", "hf6", "tq2"];
     for format in &args.formats {
         if !valid.contains(&format.as_str()) {
             bail!(
@@ -5781,8 +5853,8 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
                 valid.join(", ")
             );
         }
-        if is_gguf && !matches!(format.as_str(), "hf4" | "hf6" | "mq4" | "mq6") {
-            bail!("GGUF input supports hf4, hf6, mq4, or mq6");
+        if is_gguf && !matches!(format.as_str(), "hf4" | "hf6" | "mq4" | "mq6" | "tq2") {
+            bail!("GGUF input supports hf4, hf6, mq4, mq6, or tq2");
         }
     }
     if args.output.is_some() && args.formats.len() != 1 {
