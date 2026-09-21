@@ -80,6 +80,8 @@ impl QuantType {
             39 => Some(Self::MQ3G256GL),
             40 => Some(Self::TQ2G128),
             41 => Some(Self::BQ1G128),
+            42 => Some(Self::TQ2G128H),
+            43 => Some(Self::PTQ1G128H),
             44 => Some(Self::MQ4G256V2),
             45 => Some(Self::MQ4CG256),
             47 => Some(Self::MQ6G256V2),
@@ -185,6 +187,12 @@ pub(crate) enum QuantType {
     BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
     // (1.14 bpw). [FP16 d][16B sign bits], bit set for +d.
     // Byte-identical to GGUF ggml_type Q1_0=41.
+    /// PrismML PQ2/PTQ1 g128 payload consumed with the checkpoint-declared
+    /// blockwise Hadamard activation transform.
+    TQ2G128H = 42,
+    /// Prism PTQ1_0 dense base-3 trit packing, 28 B per 128 weights, with the
+    /// checkpoint-declared Hadamard activation contract.
+    PTQ1G128H = 43,
     /// MQ4-G256 v2 (qt=44): FWHT-rotated 4-bit, per-128 asymmetric. 136 B/group,
     /// byte-identical to qt=13 (MQ4G256) except the 8 header bytes. Payload is
     /// unchanged: 128 B of 4-bit nibbles at offset 8, lane `t` reading the u32 at

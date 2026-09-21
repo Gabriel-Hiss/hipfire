@@ -121,6 +121,26 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
         "output_norm.weight" => return Some("model.norm.weight".to_string()),
         _ => {}
     }
+    // Qwen3.5/3.6 (arch 5 dense, arch 6 MoE) carry the Gated-DeltaNet stack
+    // under llama.cpp's SSM slot names and ship two tensors without the
+    // `.weight` suffix, so they are resolved before the generic `<slot>.weight`
+    // split below.
+    if matches!(arch_id, 5 | 6) {
+        if let Some(rest) = gguf_name.strip_prefix("blk.") {
+            if let Some(dot) = rest.find('.') {
+                let layer_idx = &rest[..dot];
+                match &rest[dot + 1..] {
+                    "ssm_a" => {
+                        return Some(format!("model.layers.{layer_idx}.linear_attn.A_log"));
+                    }
+                    "ssm_dt.bias" => {
+                        return Some(format!("model.layers.{layer_idx}.linear_attn.dt_bias"));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
     if let Some(rest) = gguf_name.strip_prefix("blk.") {
         // rest = "{N}.<slot>.weight"
@@ -156,6 +176,24 @@ pub(crate) fn gguf_to_safetensors_name(gguf_name: &str, arch_id: u32) -> Option<
                     return Some(format!("model.layers.{layer_idx}.layer_scalar"));
                 }
                 _ => {}
+            }
+        }
+        if matches!(arch_id, 5 | 6) {
+            let deltanet = match slot {
+                "attn_qkv" => Some("linear_attn.in_proj_qkv"),
+                "attn_gate" => Some("linear_attn.in_proj_z"),
+                "ssm_alpha" => Some("linear_attn.in_proj_a"),
+                "ssm_beta" => Some("linear_attn.in_proj_b"),
+                "ssm_out" => Some("linear_attn.out_proj"),
+                "ssm_conv1d" => Some("linear_attn.conv1d"),
+                "ssm_norm" => Some("linear_attn.norm"),
+                // Qwen3.5 names its FFN norm `post_attention_norm`; the
+                // generic table below only knows llama's `ffn_norm`.
+                "post_attention_norm" => Some("post_attention_layernorm"),
+                _ => None,
+            };
+            if let Some(translated) = deltanet {
+                return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
             }
         }
         let translated = match slot {
@@ -762,9 +800,139 @@ pub(crate) fn config_json_from_gguf(
     if arch_id == 13 {
         apply_gemma4_fields(gguf, prefix, &mut cfg);
     }
+    if matches!(arch_id, 5 | 6) {
+        apply_qwen35_fields(gguf, prefix, &mut cfg);
+    }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
     serde_json::Value::Object(cfg)
+}
+
+/// Translate the Qwen3.5/3.6 Gated-DeltaNet hyperparameters into the fields
+/// `Qwen35Config` reads. The generic Llama-shaped emission above covers the
+/// full-attention half; everything the DeltaNet half needs lives under
+/// `<arch>.ssm.*`, and the per-layer LinearAttention/FullAttention plan is
+/// only implied by `<arch>.full_attention_interval`.
+///
+/// `rope_theta` is written inside `rope_parameters` because that is the only
+/// place the loader reads it; a flat key silently falls back to the default.
+fn apply_qwen35_fields(
+    gguf: &gguf_input::GgufFile,
+    prefix: &str,
+    cfg: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let read_u = |k: &str| -> Option<u64> {
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::U32(x) => Some(*x as u64),
+            gguf_input::MetaValue::I32(x) => Some(*x as u64),
+            gguf_input::MetaValue::U64(x) => Some(*x),
+            gguf_input::MetaValue::I64(x) => Some(*x as u64),
+            _ => None,
+        })
+    };
+
+    let n_value_heads = read_u(&format!("{prefix}.ssm.time_step_rank"));
+    let n_key_heads = read_u(&format!("{prefix}.ssm.group_count"));
+    let state_size = read_u(&format!("{prefix}.ssm.state_size"));
+    let conv_kernel = read_u(&format!("{prefix}.ssm.conv_kernel"));
+    for (key, value) in [
+        ("linear_num_value_heads", n_value_heads),
+        ("linear_num_key_heads", n_key_heads),
+        ("linear_key_head_dim", state_size),
+        ("linear_value_head_dim", state_size),
+        ("linear_conv_kernel_dim", conv_kernel),
+    ] {
+        if let Some(value) = value {
+            cfg.insert(key.to_string(), serde_json::Value::from(value));
+        }
+    }
+
+    // Partial rotary: llama.cpp stores the rotated width, hipfire the fraction.
+    let head_dim = cfg.get("head_dim").and_then(serde_json::Value::as_u64);
+    if let (Some(rope_dims), Some(head_dim)) = (
+        read_u(&format!("{prefix}.rope.dimension_count")),
+        head_dim.filter(|v| *v > 0),
+    ) {
+        cfg.insert(
+            "partial_rotary_factor".to_string(),
+            serde_json::Value::from(rope_dims as f64 / head_dim as f64),
+        );
+    }
+
+    let mut rope = serde_json::Map::new();
+    if let Some(theta) = gguf
+        .metadata
+        .get(&format!("{prefix}.rope.freq_base"))
+        .and_then(|v| match v {
+            gguf_input::MetaValue::F32(x) => Some(*x as f64),
+            gguf_input::MetaValue::F64(x) => Some(*x),
+            _ => None,
+        })
+    {
+        rope.insert("rope_theta".to_string(), serde_json::Value::from(theta));
+    }
+    if let Some(gguf_input::MetaValue::Array(sections)) = gguf
+        .metadata
+        .get(&format!("{prefix}.rope.dimension_sections"))
+    {
+        let values: Vec<serde_json::Value> = sections
+            .iter()
+            .filter_map(|item| match item {
+                gguf_input::MetaValue::I32(x) => Some(serde_json::Value::from(*x as i64)),
+                gguf_input::MetaValue::U32(x) => Some(serde_json::Value::from(*x as u64)),
+                _ => None,
+            })
+            .take(3)
+            .collect();
+        if values.len() == 3 {
+            rope.insert(
+                "mrope_section".to_string(),
+                serde_json::Value::Array(values),
+            );
+        }
+    }
+    if !rope.is_empty() {
+        cfg.insert(
+            "rope_parameters".to_string(),
+            serde_json::Value::Object(rope),
+        );
+    }
+
+    // Layer plan: llama.cpp marks layer i recurrent when (i+1) % interval != 0.
+    let n_layers = cfg
+        .get("num_hidden_layers")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let interval = read_u(&format!("{prefix}.full_attention_interval")).unwrap_or(4);
+    if n_layers > 0 && interval > 0 {
+        let layer_types: Vec<serde_json::Value> = (0..n_layers)
+            .map(|i| {
+                serde_json::Value::from(if (i + 1) % interval == 0 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                })
+            })
+            .collect();
+        cfg.insert(
+            "layer_types".to_string(),
+            serde_json::Value::Array(layer_types),
+        );
+    }
+
+    for (key, gguf_key) in [
+        ("num_experts", "expert_count"),
+        ("num_experts_per_tok", "expert_used_count"),
+        ("moe_intermediate_size", "expert_feed_forward_length"),
+        (
+            "shared_expert_intermediate_size",
+            "expert_shared_feed_forward_length",
+        ),
+    ] {
+        if let Some(value) = read_u(&format!("{prefix}.{gguf_key}")) {
+            cfg.insert(key.to_string(), serde_json::Value::from(value));
+        }
+    }
 }
 
 /// Translate gemma4-specific GGUF metadata into the `text_config` fields the

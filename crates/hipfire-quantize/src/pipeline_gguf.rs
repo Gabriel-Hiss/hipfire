@@ -11,7 +11,7 @@
     clippy::all
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -196,6 +196,113 @@ pub(crate) fn convert_binary_tensor(
     (src.to_vec(), crate::hfq::QuantType::BQ1G128, 128)
 }
 
+fn meta_string_array(gguf: &gguf_input::GgufFile, key: &str) -> Vec<String> {
+    match gguf.metadata.get(key) {
+        Some(gguf_input::MetaValue::Array(values)) => values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn meta_i32_array(gguf: &gguf_input::GgufFile, key: &str) -> Vec<i32> {
+    match gguf.metadata.get(key) {
+        Some(gguf_input::MetaValue::Array(values)) => values
+            .iter()
+            .filter_map(|value| match value {
+                gguf_input::MetaValue::I32(v) => Some(*v),
+                gguf_input::MetaValue::U32(v) => i32::try_from(*v).ok(),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn repack_ptq1_to_tq2(src: &[u8], n: usize) -> Vec<u8> {
+    let values = gguf_input::tensor_to_f32(
+        &gguf_input::TensorInfo {
+            name: "ptq1-repack".into(),
+            shape: vec![n],
+            dtype: gguf_input::GgmlType::PTQ1_0,
+            offset: 0,
+        },
+        src,
+    );
+    quantize_tq2g128(&values)
+}
+
+/// Rows of a Gated-DeltaNet tensor that carry V heads, as
+/// `(first_row, rows_per_v_head)`, or `None` when the tensor has no V rows.
+/// `ssm_out` is deliberately absent: its V axis is the input dimension and a
+/// folded checkpoint leaves it in training order.
+fn deltanet_v_row_span(
+    gguf_name: &str,
+    n_k: usize,
+    n_v: usize,
+    head_v: usize,
+    head_k: usize,
+    rows: usize,
+) -> Option<(usize, usize)> {
+    if n_k == 0 || n_v == 0 || n_v % n_k != 0 || n_v == n_k {
+        return None;
+    }
+    let value_rows = n_v * head_v;
+    let qk_rows = 2 * n_k * head_k;
+    let span = if gguf_name.ends_with(".attn_qkv.weight") && rows == qk_rows + value_rows {
+        (qk_rows, head_v)
+    } else if gguf_name.ends_with(".attn_gate.weight") && rows == value_rows {
+        (0, head_v)
+    } else if gguf_name.ends_with(".ssm_conv1d.weight") && rows == qk_rows + value_rows {
+        (qk_rows, head_v)
+    } else if (gguf_name.ends_with(".ssm_alpha.weight")
+        || gguf_name.ends_with(".ssm_beta.weight")
+        || gguf_name.ends_with(".ssm_a")
+        || gguf_name.ends_with(".ssm_dt.bias"))
+        && rows == n_v
+    {
+        (0, 1)
+    } else {
+        return None;
+    };
+    Some(span)
+}
+
+/// Permute `[rep][k_head][head_rows]` back to `[k_head][rep][head_rows]` over
+/// a row span. Rows are fixed-size records (a quantized weight row, an F32
+/// conv1d channel, one scalar), so this is a byte move and the payload size is
+/// unchanged.
+fn untile_v_rows(
+    data: Vec<u8>,
+    rows: usize,
+    first_row: usize,
+    n_k: usize,
+    rep: usize,
+    head_rows: usize,
+) -> std::io::Result<Vec<u8>> {
+    if rows == 0 || data.len() % rows != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("DeltaNet V reorder: {} bytes do not divide {rows} rows", data.len()),
+        ));
+    }
+    let row_bytes = data.len() / rows;
+    let mut out = data.clone();
+    for k in 0..n_k {
+        for r in 0..rep {
+            for h in 0..head_rows {
+                let tiled = first_row + (r * n_k + k) * head_rows + h;
+                let grouped = first_row + (k * rep + r) * head_rows + h;
+                let src = tiled * row_bytes;
+                let dst = grouped * row_bytes;
+                out[dst..dst + row_bytes].copy_from_slice(&data[src..src + row_bytes]);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
 /// applies to 2D weight matrices; the embedding table is always Q8F16
 /// (Q4-grade is too lossy for embeddings) and 1D norms stay F16. Tensor
@@ -279,6 +386,79 @@ pub(crate) fn run_gguf_pipeline(
         "gguf_meta": gguf_meta_to_json(&gguf.metadata),
     });
     let metadata_json = serde_json::to_string(&metadata)?;
+    let prism_version = gguf.meta_u32("prism.hadamard.version").unwrap_or(0);
+    let prism_block_size = gguf.meta_u32("prism.hadamard.block_size").unwrap_or(0) as usize;
+    let prism_weights: HashSet<String> = meta_string_array(&gguf, "prism.hadamard.weight_names")
+        .into_iter()
+        .collect();
+    let prism_inverse: HashSet<String> =
+        meta_string_array(&gguf, "prism.hadamard.inverse_weight_names")
+            .into_iter()
+            .collect();
+    let mut prism_signs = HashMap::<usize, Vec<i32>>::new();
+    if prism_version != 0 {
+        if prism_version != 1 || prism_block_size == 0 || !prism_block_size.is_power_of_two() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported Prism Hadamard contract: version={prism_version}, block_size={prism_block_size}"
+                ),
+            ));
+        }
+        let widths = meta_i32_array(&gguf, "prism.hadamard.sign_widths");
+        let values = meta_i32_array(&gguf, "prism.hadamard.sign_values");
+        let mut offset = 0usize;
+        for width in widths {
+            let width = usize::try_from(width).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "negative Prism sign width")
+            })?;
+            let end = offset.checked_add(width).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "Prism sign width overflow")
+            })?;
+            if width % prism_block_size != 0 || end > values.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid Prism sign vector width {width}"),
+                ));
+            }
+            prism_signs.insert(width, values[offset..end].to_vec());
+            offset = end;
+        }
+        if offset != values.len() || prism_weights.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "incomplete Prism Hadamard metadata",
+            ));
+        }
+    }
+    if prism_version != 0 && matches!(arch_id, 5 | 6) {
+        // A folded Gated-DeltaNet checkpoint keeps `ssm_out` in the training
+        // (grouped) V-head order only when the converter says so; without the
+        // flag the columns are in llama.cpp's tiled order, which hipfire's
+        // DeltaNet output does not produce and a packed ternary weight cannot
+        // be re-permuted into.
+        let grouped = matches!(
+            gguf.metadata.get("prism.hadamard.gdn_v_grouped"),
+            Some(gguf_input::MetaValue::Bool(true))
+        );
+        if !grouped {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "prism.hadamard.gdn_v_grouped is not set: ssm_out columns are in llama.cpp's tiled V-head order and cannot be repacked",
+            ));
+        }
+    }
+    if matches!(format, GgufFormat::Ternary)
+        && gguf
+            .metadata
+            .keys()
+            .any(|key| key.ends_with(".expert_count"))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "MoE GGUFs are not supported on the ternary path: the per-expert tensor layout has no hipfire mapping",
+        ));
+    }
     // safetensors path so the engine's runtime FWHT inverse stays identical.
     let needs_signs = matches!(
         format,
@@ -415,16 +595,123 @@ pub(crate) fn run_gguf_pipeline(
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
-        let (data, quant_type, group_size, label) = if is_norm || !is_2d {
-            // Norms and 1D tensors always F16 (primary gate)
+        let source_passthrough = match info.dtype {
+            gguf_input::GgmlType::F32 => Some((QuantType::F32, "F32 (passthrough)")),
+            gguf_input::GgmlType::F16 => Some((QuantType::F16, "F16 (passthrough)")),
+            gguf_input::GgmlType::BF16 => Some((QuantType::BF16, "BF16 (passthrough)")),
+            _ => None,
+        };
+        // Two Qwen3.5 tensors are stored in llama.cpp's convention, not
+        // HuggingFace's, and hipfire reads the HuggingFace one. Left alone they
+        // are silent wrong-math, not load errors:
+        //   * every `*_norm.weight` except `linear_attn.norm` ships as `w + 1`
+        //     (conversion/qwen.py:394), and hipfire's norm loader adds 1 again;
+        //   * `ssm_a` ships as `-exp(A_log)` (qwen35.cpp:459 multiplies it
+        //     straight in), while hipfire's gate kernel computes `-exp(a_log)`
+        //     itself.
+        // Both stay F32, so undoing the convention costs no bytes.
+        let convention_fix: Option<fn(f32) -> f32> = if matches!(arch_id, 5 | 6) {
+            if info.name.ends_with(".ssm_a") {
+                Some(|v: f32| (-v).max(f32::MIN_POSITIVE).ln())
+            } else if is_norm && !info.name.contains("ssm_norm") {
+                Some(|v: f32| v - 1.0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let (data, quant_type, group_size, label) = if let Some(fix) = convention_fix {
+            let values: Vec<f32> = gguf_input::tensor_to_f32(info, raw)
+                .into_iter()
+                .map(fix)
+                .collect();
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            (bytes, QuantType::F32, 0u32, "F32 (convention-adjusted)")
+        } else if let (GgufFormat::Ternary, Some((qt, label))) = (format, source_passthrough) {
+            // Bonsai ships mixed precision on purpose: the conv1d bank and the
+            // DeltaNet alpha/beta gates are the precision the publisher chose.
+            // Re-encoding them would make this a different model than the one
+            // the GGUF describes.
+            (raw.to_vec(), qt, 0u32, label)
+        } else if is_norm || !is_2d || info.name.contains("conv1d") {
+            // Norms, 1D tensors and the DeltaNet conv1d bank (K=4, no group
+            // divides it) always F16.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
+        } else if matches!(format, GgufFormat::Ternary)
+            && matches!(
+                info.dtype,
+                gguf_input::GgmlType::Q2_0
+                    | gguf_input::GgmlType::PQ2_0
+                    | gguf_input::GgmlType::PTQ1_0
+            )
+        {
+            let expected_block_bytes = if info.dtype == gguf_input::GgmlType::PTQ1_0 {
+                28
+            } else {
+                34
+            };
+            let expected = n_elements.div_ceil(128) * expected_block_bytes;
+            if raw.len() != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: ternary payload has {} bytes, expected {expected}",
+                        info.name,
+                        raw.len()
+                    ),
+                ));
+            }
+            let bytes = raw.to_vec();
+            // The embedding table is folded too, but as `inverse-after-lookup`:
+            // its rows stay latent on disk and the runtime un-folds the row it
+            // reads. PTQ1 stays in the publisher's dense base-3 packing; it is
+            // never expanded to the 2-bit-slot TQ2 container.
+            let folded =
+                prism_weights.contains(&info.name) || prism_inverse.contains(&info.name);
+            if prism_version != 0 && !folded {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: ternary tensor is in neither prism.hadamard.weight_names nor inverse_weight_names",
+                        info.name
+                    ),
+                ));
+            }
+            let ptq1 = info.dtype == gguf_input::GgmlType::PTQ1_0;
+            (
+                bytes,
+                if ptq1 {
+                    QuantType::PTQ1G128H
+                } else if folded {
+                    QuantType::TQ2G128H
+                } else {
+                    QuantType::TQ2G128
+                },
+                128u32,
+                if ptq1 {
+                    "PTQ1G128H (Prism Hadamard)"
+                } else if folded {
+                    "TQ2G128H (Prism Hadamard)"
+                } else {
+                    "TQ2G128 (passthrough)"
+                },
+            )
         } else if kmap_level == QuantLevel::Q8 || is_embed {
-            // K-map Q8 or embedding
+            let f32_data = gguf_input::tensor_to_f32(info, raw);
+            let q = quantize_q8f16(&f32_data);
+            quant_params += n_elements as u64;
+            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+        } else if matches!(format, GgufFormat::Ternary) {
+            // A Bonsai GGUF is mixed precision by construction: the matmuls the
+            // publisher chose to ternarize are already ternary, and everything
+            // else (DeltaNet alpha/beta gates here) is the precision they kept.
+            // Re-quantizing those to ternary would be our loss, not theirs.
             let f32_data = gguf_input::tensor_to_f32(info, raw);
             let q = quantize_q8f16(&f32_data);
             quant_params += n_elements as u64;
@@ -919,6 +1206,40 @@ pub(crate) fn run_gguf_pipeline(
             let q = quantize_hfq4g128(&f32_data);
             quant_params += n_elements as u64;
             (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+        };
+
+        // llama.cpp stores the Gated-DeltaNet V heads tiled
+        // (`[rep][k_head][head_dim]`, conversion/qwen.py `_reorder_v_heads`)
+        // because its binary ops broadcast that way. hipfire reads the
+        // HuggingFace grouped order, so the V rows are permuted back here.
+        // `ssm_out` is excluded: a folded checkpoint never reordered it, which
+        // is exactly what `gdn_v_grouped` asserts and the loader requires.
+        let data = if matches!(arch_id, 5 | 6) {
+            let n_k = config_json
+                .get("linear_num_key_heads")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let n_v = config_json
+                .get("linear_num_value_heads")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let head_v = config_json
+                .get("linear_value_head_dim")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let head_k = config_json
+                .get("linear_key_head_dim")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let rows = if is_2d { info.shape[1] } else { n_elements };
+            match deltanet_v_row_span(&info.name, n_k, n_v, head_v, head_k, rows) {
+                Some((first_row, head_rows)) => {
+                    untile_v_rows(data, rows, first_row, n_k, n_v / n_k, head_rows)?
+                }
+                None => data,
+            }
+        } else {
+            data
         };
 
         total_bytes_out += data.len() as u64;

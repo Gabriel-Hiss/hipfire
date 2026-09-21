@@ -36,6 +36,8 @@ pub enum GgmlType {
     BF16 = 30,
     Q1_0 = 41,
     Q2_0 = 42,
+    PQ2_0 = 142,
+    PTQ1_0 = 143,
 }
 
 impl GgmlType {
@@ -58,6 +60,8 @@ impl GgmlType {
             30 => Some(Self::BF16),
             41 => Some(Self::Q1_0),
             42 => Some(Self::Q2_0),
+            142 => Some(Self::PQ2_0),
+            143 => Some(Self::PTQ1_0),
             _ => None,
         }
     }
@@ -67,7 +71,7 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
             Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::Q8K => 256,
-            Self::Q1_0 | Self::Q2_0 => 128,
+            Self::Q1_0 | Self::Q2_0 | Self::PQ2_0 | Self::PTQ1_0 => 128,
         }
     }
 
@@ -89,6 +93,8 @@ impl GgmlType {
             Self::Q8K => 290,
             Self::Q1_0 => 18,
             Self::Q2_0 => 34,
+            Self::PQ2_0 => 34,
+            Self::PTQ1_0 => 28,
         }
     }
 
@@ -407,6 +413,40 @@ fn dequant_q1_0(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+fn dequant_ptq1_0(data: &[u8], n: usize) -> Vec<f32> {
+    const QK: usize = 128;
+    const BLK: usize = 28;
+    const STAGES: [usize; 3] = [32, 16, 8];
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+    let mut out = Vec::with_capacity(n);
+    for block in data.chunks_exact(BLK).take(n.div_ceil(QK)) {
+        let d = f16_to_f32(u16::from_le_bytes([block[26], block[27]]));
+        let qs = &block[..24];
+        let mut j = 0usize;
+        for c in STAGES {
+            while j + c <= qs.len() {
+                for &pow in &POW3 {
+                    for m in 0..c {
+                        let q = qs[j + m].wrapping_mul(pow);
+                        let trit = (((q as u16) * 3) >> 8) as i16 - 1;
+                        out.push(trit as f32 * d);
+                    }
+                }
+                j += c;
+            }
+        }
+        for &pow in &POW3[..4] {
+            for &packed in &block[24..26] {
+                let q = packed.wrapping_mul(pow);
+                let trit = (((q as u16) * 3) >> 8) as i16 - 1;
+                out.push(trit as f32 * d);
+            }
+        }
+    }
+    out.truncate(n);
+    out
+}
+
 fn dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 256;
     let block_bytes = 144;
@@ -590,6 +630,8 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
         GgmlType::Q8_0 => dequant_q8_0(data, n),
         GgmlType::Q2_0 => dequant_q2_0(data, n),
         GgmlType::Q1_0 => dequant_q1_0(data, n),
+        GgmlType::PQ2_0 => dequant_q2_0(data, n),
+        GgmlType::PTQ1_0 => dequant_ptq1_0(data, n),
         GgmlType::Q4K => dequant_q4_k(data, n),
         GgmlType::Q5K => dequant_q5_k(data, n),
         GgmlType::Q6K => dequant_q6_k(data, n),
@@ -656,5 +698,78 @@ mod q1_0_tests {
         let mixed = dequant_q1_0(&blk, 128);
         assert!((mixed[0] + 0.5).abs() < 1e-3);
         assert!((mixed[1] - 0.5).abs() < 1e-3);
+    }
+}
+
+#[cfg(test)]
+mod ptq1_0_tests {
+    use super::*;
+
+    /// Verbatim port of PrismML's `quantize_row_ptq1_0_ref`
+    /// (ggml/src/ggml-quants.c): five trits per byte in base-3 through three
+    /// staging widths, then four more per byte in `qh`, then the fp16 scale.
+    /// The decoder under test must invert exactly this packing — a stage-width
+    /// or traversal-order slip decodes fluent-looking garbage, not an error.
+    fn pack_ptq1_0(values: &[f32]) -> Vec<u8> {
+        const STAGES: [usize; 3] = [32, 16, 8];
+        let mut out = vec![0u8; 28];
+        let amax = values.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        let id = if amax != 0.0 { 1.0 / amax } else { 0.0 };
+        out[26..28].copy_from_slice(&hipfire_quantize::float16::f32_to_f16(amax).to_le_bytes());
+        let mut read = 0usize;
+        let mut j = 0usize;
+        for c in STAGES {
+            while j + c <= 24 {
+                for m in 0..c {
+                    let mut q: u8 = 0;
+                    for n in 0..5 {
+                        let xi = (values[read + m + n * c] * id).round() as i32 + 1;
+                        q = q.wrapping_mul(3).wrapping_add(xi as u8);
+                    }
+                    out[j + m] = (((q as u16) * 256 + 242) / 243) as u8;
+                }
+                read += 5 * c;
+                j += c;
+            }
+        }
+        for h in 0..2 {
+            let mut q: u8 = 0;
+            for m in 0..4 {
+                let xi = (values[read + h + m * 2] * id).round() as i32 + 1;
+                q = q.wrapping_mul(3).wrapping_add(xi as u8);
+            }
+            q = q.wrapping_mul(3);
+            out[24 + h] = (((q as u16) * 256 + 242) / 243) as u8;
+        }
+        out
+    }
+
+    #[test]
+    fn ptq1_0_type_params() {
+        let t = GgmlType::from_u32(143).expect("ggml_type 143 = PTQ1_0");
+        assert_eq!(t, GgmlType::PTQ1_0);
+        assert_eq!(t.block_size(), 128);
+        assert_eq!(t.block_bytes(), 28);
+    }
+
+    #[test]
+    fn ptq1_0_dequant_inverts_the_reference_packer() {
+        // Deterministic ternary block scaled by 2.0; every trit value appears.
+        let mut state = 0x9E3779B9u32;
+        let values: Vec<f32> = (0..128)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                match state % 3 {
+                    0 => -2.0,
+                    1 => 0.0,
+                    _ => 2.0,
+                }
+            })
+            .collect();
+        let packed = pack_ptq1_0(&values);
+        let decoded = dequant_ptq1_0(&packed, 128);
+        assert_eq!(decoded, values);
     }
 }
