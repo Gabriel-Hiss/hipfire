@@ -708,6 +708,30 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        42 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::TQ2G128H,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        43 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::PTQ1G128H,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         41 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
@@ -2453,6 +2477,7 @@ pub fn load_weights(
     Ok(Qwen35Weights {
         token_embd,
         embd_format,
+
         output_norm,
         output,
         moe_has_mq6: layers_have_mq6_moe(&layers),
@@ -2461,6 +2486,87 @@ pub fn load_weights(
         lm_head_aliases_embd,
         ep_shard: None,
     })
+}
+fn configure_prism_hadamard(hfq: &HfqFile, gpu: &mut Gpu) -> HipResult<()> {
+    let root: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+        .map_err(|e| HipError::new(0, &format!("invalid HFQ metadata JSON: {e}")))?;
+    let meta = root.get("gguf_meta").unwrap_or(&serde_json::Value::Null);
+    let version = meta
+        .get("prism.hadamard.version")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if version == 0 {
+        return Ok(());
+    }
+    let block_size = meta
+        .get("prism.hadamard.block_size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| HipError::new(0, "Prism Hadamard block size missing"))?
+        as usize;
+    let transform = meta
+        .get("prism.hadamard.transform")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let axis = meta
+        .get("prism.hadamard.axis")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let sign_mode = meta
+        .get("prism.hadamard.sign_mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if version != 1
+        || transform != "normalized-sylvester-walsh-hadamard"
+        || axis != "input-last-dimension"
+        || !matches!(sign_mode, "identity" | "explicit")
+        || block_size == 0
+        || !block_size.is_power_of_two()
+    {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "unsupported Prism Hadamard contract: version={version}, transform={transform}, axis={axis}, sign_mode={sign_mode}, block_size={block_size}"
+            ),
+        ));
+    }
+    let widths: Vec<usize> = meta
+        .get("prism.hadamard.sign_widths")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_u64)
+        .map(|v| v as usize)
+        .collect();
+    let values: Vec<i32> = meta
+        .get("prism.hadamard.sign_values")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_i64)
+        .map(|v| v as i32)
+        .collect();
+    let mut signs = std::collections::HashMap::new();
+    let mut offset = 0usize;
+    for width in widths {
+        let end = offset
+            .checked_add(width)
+            .ok_or_else(|| HipError::new(0, "Prism Hadamard sign width overflow"))?;
+        if width % block_size != 0
+            || end > values.len()
+            || values[offset..end].iter().any(|&v| v != -1 && v != 1)
+        {
+            return Err(HipError::new(
+                0,
+                &format!("invalid Prism Hadamard sign vector width {width}"),
+            ));
+        }
+        signs.insert(width, values[offset..end].to_vec());
+        offset = end;
+    }
+    if offset != values.len() || (sign_mode == "explicit" && signs.is_empty()) {
+        return Err(HipError::new(0, "incomplete Prism Hadamard sign metadata"));
+    }
+    gpu.configure_prism_hadamard(block_size, sign_mode == "identity", &signs)
 }
 
 // ── HfqSource ─────────────────────────────────────────────────────────────
@@ -2505,6 +2611,7 @@ impl WeightSource for HfqSource<'_> {
         // Fired once per load here (the first read with both hfq + gpu in scope,
         // after master's loader refactor split source from devices).
         warn_rdna2_unvalidated_dtypes(self.hfq, gpu);
+        configure_prism_hadamard(self.hfq, gpu)?;
         let c = self.c;
         eprintln!("  loading token_embd...");
         if c.is_vl_text {
@@ -2521,6 +2628,7 @@ impl WeightSource for HfqSource<'_> {
     }
 
     fn read_final_norm(&mut self, gpu: &mut Gpu) -> HipResult<GpuTensor> {
+        configure_prism_hadamard(self.hfq, gpu)?;
         eprintln!("  loading output_norm...");
         load_norm_weight(self.hfq, gpu, "norm.weight", &[self.c.dim])
     }
@@ -2532,6 +2640,7 @@ impl WeightSource for HfqSource<'_> {
         embd_fmt: EmbeddingFormat,
         can_alias: bool,
     ) -> HipResult<(WeightTensor, bool)> {
+        configure_prism_hadamard(self.hfq, gpu)?;
         let c = self.c;
         let hfq = &*self.hfq;
         let has_separate = qwen35_tensor_name_candidates("lm_head.weight")
@@ -2561,6 +2670,7 @@ impl WeightSource for HfqSource<'_> {
     }
 
     fn read_layer(&mut self, gpu: &mut Gpu, layer_idx: usize) -> HipResult<LayerWeights> {
+        configure_prism_hadamard(self.hfq, gpu)?;
         let c = self.c;
         let is_moe = c.num_experts > 0;
         eprintln!(

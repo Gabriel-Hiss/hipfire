@@ -2057,6 +2057,12 @@ fn embed_lookup_into(
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, out, token, dim),
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::TQ2G128H => {
+            gpu.embedding_lookup_tq2g128_prism(&weights.token_embd, out, token as usize, dim)
+        }
+        EmbeddingFormat::PTQ1G128H => {
+            gpu.embedding_lookup_ptq1g128_prism(&weights.token_embd, out, token as usize, dim)
+        }
     }
 }
 

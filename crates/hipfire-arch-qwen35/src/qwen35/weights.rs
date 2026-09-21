@@ -196,6 +196,8 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         39 => Ok(DType::MQ3G256GL),
         40 => Ok(DType::TQ2G128),
         41 => Ok(DType::BQ1G128),
+        42 => Ok(DType::TQ2G128H),
+        43 => Ok(DType::PTQ1G128H),
         44 => Ok(DType::MQ4G256V2),
         45 => Ok(DType::MQ4CG256),
         // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction

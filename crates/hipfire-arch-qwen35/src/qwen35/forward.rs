@@ -760,6 +760,12 @@ pub fn forward(
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::TQ2G128H => {
+            gpu.embedding_lookup_tq2g128_prism(&weights.token_embd, &x, token as usize, dim)?
+        }
+        EmbeddingFormat::PTQ1G128H => {
+            gpu.embedding_lookup_ptq1g128_prism(&weights.token_embd, &x, token as usize, dim)?
+        }
         _ => panic!("unsupported embedding format"),
     }
 
@@ -1558,6 +1564,18 @@ pub fn forward_scratch(
         EmbeddingFormat::F32 => {
             gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
         }
+        EmbeddingFormat::TQ2G128H => gpu.embedding_lookup_tq2g128_prism(
+            &weights.token_embd,
+            &scratch.x,
+            token as usize,
+            dim,
+        )?,
+        EmbeddingFormat::PTQ1G128H => gpu.embedding_lookup_ptq1g128_prism(
+            &weights.token_embd,
+            &scratch.x,
+            token as usize,
+            dim,
+        )?,
         _ => panic!("unsupported embedding format"),
     }
 
@@ -1751,6 +1769,18 @@ pub fn forward_scratch_with_hidden(
         EmbeddingFormat::F32 => {
             gpu.embedding_lookup(&weights.token_embd, &scratch.x, token, dim)?
         }
+        EmbeddingFormat::TQ2G128H => gpu.embedding_lookup_tq2g128_prism(
+            &weights.token_embd,
+            &scratch.x,
+            token as usize,
+            dim,
+        )?,
+        EmbeddingFormat::PTQ1G128H => gpu.embedding_lookup_ptq1g128_prism(
+            &weights.token_embd,
+            &scratch.x,
+            token as usize,
+            dim,
+        )?,
         _ => panic!("unsupported embedding format"),
     }
 
@@ -2640,6 +2670,66 @@ fn paro_to_givens(p: &ParoRotation) -> GivensRef<'_> {
     }
 }
 
+/// Does `dtype`'s own required activation rotation disagree with the shared
+/// `wqkv_rotation` a `qkvza_via_execute_steps`-style caller already applied
+/// to the group's normalized activation?
+///
+/// Bonsai-style mixed precision breaks the "one shared rotated activation"
+/// premise `qkvza_via_execute_steps` otherwise relies on: `wqkv`/`wz` can be
+/// PTQ1G128H (Prism-Hadamard rotated) while `w_beta`/`w_alpha` stay Q8F16
+/// (`RotationPlan::None`). Reusing the Hadamard-rotated activation as a
+/// Q8F16 weight's "prerotated" input feeds it the wrong basis — its GEMV
+/// kernel does no de-rotation, since its own plan says none is needed.
+///
+/// Only fires for `RotationPlan::PrismHadamard`: that is the one rotation
+/// variant guaranteed to also leave the PLAIN (unrotated) normalized
+/// activation in `x_plain` (see `RotationFamily::run`'s `PrismHadamard` arm
+/// in `families/rotation.rs`), which is what a disagreeing projection needs
+/// to fall back to via `GemvInput::Raw`.
+fn shared_rotation_disagrees(wqkv_rotation: RotationPlan, dtype: DType) -> bool {
+    wqkv_rotation == RotationPlan::PrismHadamard && dtype_rotation_plan(dtype) != wqkv_rotation
+}
+
+#[cfg(test)]
+mod shared_rotation_disagrees_tests {
+    use super::shared_rotation_disagrees;
+    use hipfire_dispatch::types::RotationPlan;
+    use rdna_compute::DType;
+
+    #[test]
+    fn flags_q8_0_gate_under_prism_hadamard_qkv() {
+        // Bonsai: wqkv/wz = PTQ1G128H (Hadamard); alpha/beta land on the
+        // runtime as Q8_0-shaped (34 B/32 elem — same layout the quantizer's
+        // Q8F16 arm emits), no rotation.
+        assert!(shared_rotation_disagrees(
+            RotationPlan::PrismHadamard,
+            DType::Q8_0
+        ));
+    }
+
+    #[test]
+    fn does_not_flag_matching_prism_hadamard_dtype() {
+        // wz sharing wqkv's PTQ1G128H family must keep the shared rotated
+        // activation — no regression on the common (uniform-dtype) case.
+        assert!(!shared_rotation_disagrees(
+            RotationPlan::PrismHadamard,
+            DType::PTQ1G128H
+        ));
+        assert!(!shared_rotation_disagrees(
+            RotationPlan::PrismHadamard,
+            DType::TQ2G128H
+        ));
+    }
+
+    #[test]
+    fn does_not_flag_when_wqkv_itself_is_unrotated() {
+        // rotation == None means x_plain is never populated (RmsnormAutomatic
+        // writes only `out` in that case), so there is nothing to fall back
+        // to — the shared buffer is already the correct plain activation.
+        assert!(!shared_rotation_disagrees(RotationPlan::None, DType::Q8_0));
+    }
+}
+
 /// Unified QKVZA (4-way) projection via execute_steps for DeltaNet layers.
 /// Covers all dtypes — the interpreter selects fused QKVZA kernels for eligible
 /// dtypes via FUSED_TABLE guards; everything else falls through to per-op
@@ -2738,7 +2828,20 @@ fn qkvza_via_execute_steps(
     } else {
         // FWHT-rotated (MQ family) or non-rotated (HFQ, Q8, etc.) dtypes.
         // RmsnormAutomatic handles FWHT when rotation != None;
-        // downstream Gemv steps use Prerotated to avoid double-FWHT.
+        // downstream Gemv steps use Prerotated to avoid double-FWHT — EXCEPT
+        // when a projection's own rotation plan disagrees with wqkv's. Bonsai
+        // ships mixed precision: wqkv/wz can be PTQ1G128H (Prism-Hadamard
+        // rotated) while w_beta/w_alpha stay Q8F16 (RotationPlan::None).
+        // Reusing the Hadamard-rotated `x_rot` as a Q8F16 weight's
+        // "prerotated" input feeds it the wrong basis — its GEMV kernel does
+        // no de-rotation, since its own plan says none is needed. When
+        // rotation == PrismHadamard, `RotationFamily::run` always writes the
+        // PLAIN normalized activation into `x_plain` (`tmp`) before rotating
+        // into `x_rot` (see families/rotation.rs), so route any disagreeing
+        // projection through `Raw(tmp)` instead — its own GEMV then applies
+        // whatever rotation (here: none) its dtype actually needs.
+        let wqkv_rotation = rotation;
+        let disagrees = |w: &WeightTensor| shared_rotation_disagrees(wqkv_rotation, w.gpu_dtype);
         let wr_qkv = WeightRef {
             buf: &wqkv.buf,
             dtype: wqkv.gpu_dtype,
@@ -2775,6 +2878,9 @@ fn qkvza_via_execute_steps(
             rotation: None,
             awq_scale: None,
         };
+        let z_input = if disagrees(wz) { GemvInput::Raw(tmp) } else { GemvInput::Prerotated(x_rot) };
+        let beta_input = if disagrees(w_beta) { GemvInput::Raw(tmp) } else { GemvInput::Prerotated(x_rot) };
+        let alpha_input = if disagrees(w_alpha) { GemvInput::Raw(tmp) } else { GemvInput::Prerotated(x_rot) };
         let steps = [
             Step::RmsnormAutomatic {
                 x,
@@ -2793,17 +2899,17 @@ fn qkvza_via_execute_steps(
             },
             Step::Gemv {
                 w: &wr_z,
-                input: GemvInput::Prerotated(x_rot),
+                input: z_input,
                 out: dn_z,
             },
             Step::Gemv {
                 w: &wr_beta,
-                input: GemvInput::Prerotated(x_rot),
+                input: beta_input,
                 out: dn_beta,
             },
             Step::Gemv {
                 w: &wr_alpha,
-                input: GemvInput::Prerotated(x_rot),
+                input: alpha_input,
                 out: dn_alpha,
             },
         ];
@@ -6017,6 +6123,12 @@ pub fn forward_gpu(
         }
         EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &x, token, dim)?,
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &x, token, dim)?,
+        EmbeddingFormat::TQ2G128H => {
+            gpu.embedding_lookup_tq2g128_prism(&weights.token_embd, &x, token as usize, dim)?
+        }
+        EmbeddingFormat::PTQ1G128H => {
+            gpu.embedding_lookup_ptq1g128_prism(&weights.token_embd, &x, token as usize, dim)?
+        }
         _ => panic!("unsupported embedding format"),
     }
     forward_from_x_gpu(gpu, weights, config, x, pos, kv_cache, dn_state)
