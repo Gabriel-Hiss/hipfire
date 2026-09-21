@@ -25,7 +25,7 @@ HFP4 family detail: [quant-formats/hfp4.md](quant-formats/hfp4.md).
 | `hf6` (`hfq6`, `hfq6g256`) | qt 8 | 6 | none | Dense, higher quality |
 | `q8` / `q8f16` | qt 3 | 8 | none | Reference / debug (safetensors path) |
 | `mq3` | qt 17 | 3 | FWHT | Sub-4-bit v1 — **`hipfire-quantize` direct only** (thin CLI rejects it) |
-| `tq2` / `bq1` | qt 40 / 41 | ternary / 1 | none | Bonsai — `hipfire-quantize` direct |
+| `tq2` / `bq1` | qt 40 / 41 / 42 | ternary / 1 | none, or Prism Hadamard | Bonsai. `tq2` on a PrismML GGUF is byte-verbatim; folded Bonsai 2 files become qt 42 and carry their transform contract |
 | `hfp4` / `mfp4` / E8 / Lloyd | varies | see docs | Advanced; usually via `hipfire-quantize` directly |
 
 FWHT (the “M” in MQ) applies the two-sign rotation
@@ -38,9 +38,38 @@ quality benefit — prefer HFQ.
 `q8f16`, and `hf4`/`hf6` aliases. **Unchanged surface** — the wrapper does not
 grow V2/`mq3`/Lloyd/HFP flags. Because the binary maps `mq4` → qt 44, a thin
 CLI `hipfire quantize … --format mq4` produces **MQ4G256V2**. **GGUF input**
-further narrows to `hf4`, `hf6`, `mq4`, `mq6`. Formats such as `mq3`,
-`mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, HFP/MFP, Lloyd, Bonsai, and graded MoE need
+further narrows to `hf4`, `hf6`, `mq4`, `mq6`, `tq2`. Formats such as `mq3`,
+`mq{2,3,5,6}v2`, `mq4v1`, `mq4c`, HFP/MFP, Lloyd, `bq1`, and graded MoE need
 `hipfire-quantize` directly.
+
+## PrismML Bonsai GGUFs
+
+`--format tq2` consumes a Bonsai GGUF as published. `PQ2_0` payloads and every
+F32/F16/BF16 tensor pass through byte-for-byte, `PTQ1_0` payloads are repacked
+into the same 34 B/group ternary block, and the token-embedding table stays
+ternary in its latent basis — the runtime un-folds the row it looks up. Payload
+bytes in equal payload bytes out, so the artifact is the publisher's model, not
+a re-quantization of it.
+
+Three storage conventions are llama.cpp's, not HuggingFace's, and hipfire reads
+the HuggingFace ones, so conversion undoes them (all three keep their F32
+width, so nothing grows):
+
+| Tensor | GGUF stores | hipfire expects |
+|---|---|---|
+| `*_norm.weight` except `linear_attn.norm` | `w + 1` | `w` |
+| `ssm_a` | `-exp(A_log)` | `A_log` |
+| V heads of `attn_qkv`, `attn_gate`, `ssm_alpha`, `ssm_beta`, `ssm_a`, `ssm_dt`, `ssm_conv1d` | tiled `[rep][k_head]` | grouped `[k_head][rep]` |
+
+`ssm_out` is the exception: a Hadamard-folded checkpoint never reorders it, and
+`prism.hadamard.gdn_v_grouped` says so. A folded GGUF without that flag is
+refused, because a packed ternary weight cannot be permuted back.
+
+`hipfire run` and `hipfire serve` accept a Bonsai `.gguf` path directly and
+convert it once into `~/.hipfire/models/<stem>.tq2`. GGUFs without ternary
+payloads are refused with the `hipfire quantize` command to run instead —
+picking a quantization for someone else's checkpoint is not a decision the
+serving path should make silently.
 
 **Not produced by the thin CLI path:** graded per-expert MoE recipes
 (`mq4p`, tiered Lloyd, imatrix/Hessian GPTQ-E8, REAP overlays), product-tier

@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+### PrismML Bonsai 2 (Ternary-Bonsai-2-27B)
+
+- Bonsai GGUFs load through the Qwen3.5 carrier. The GGUF reader accepts the
+  fork-private `PQ2_0` (142) and `PTQ1_0` (143) block types, the Gated-DeltaNet
+  tensor names (`attn_qkv`, `attn_gate`, `ssm_*`) map onto hipfire's
+  `linear_attn.*` schema, and the DeltaNet hyperparameters plus the
+  LinearAttention/FullAttention layer plan are derived from `<arch>.ssm.*` and
+  `full_attention_interval`.
+- New quant type `TQ2G128H` (qt 42): the Bonsai ternary payload plus the
+  checkpoint's `prism.hadamard` activation contract. Weight bytes are the qt 40
+  layout; the runtime applies the declared blockwise normalized
+  Walsh-Hadamard transform and sign vector to the activation before the GEMV,
+  and the reverse order (transform, then signs) to the token-embedding row it
+  reads, matching the publisher's runtime.
+- Conversion rewrites nothing it does not have to: `PQ2_0` and every
+  F32/F16/BF16 tensor pass through byte-for-byte, `PTQ1_0` is repacked into the
+  same 34 B/group ternary block, and the embedding table stays ternary in its
+  latent basis. Payload bytes in equal payload bytes out.
+- Three llama.cpp storage conventions are undone at convert time, because
+  hipfire reads the HuggingFace ones and each mismatch is silent wrong math:
+  norms ship as `w + 1`, `ssm_a` ships as `-exp(A_log)`, and the Gated-DeltaNet
+  V heads are tiled rather than grouped in seven tensors. A folded `ssm_out`
+  keeps its grouped order, which is what `prism.hadamard.gdn_v_grouped`
+  asserts; a checkpoint without that flag is refused.
+- `hipfire run` / `hipfire serve` take a Bonsai `.gguf` path and convert it
+  once into `~/.hipfire/models/<stem>.tq2`. GGUFs without ternary payloads are
+  refused with the `hipfire quantize` invocation to run instead.
+- Conversion also refuses MoE GGUFs and ternary matrices missing from the
+  `prism.hadamard` name lists.
+
+### Windows kernel compilation with Visual Studio 18
+
+- MSVC 14.51 declares the `<cmath>` comparison helpers as host+device
+  builtins, which collides with ROCm 7.2's `__clang_hip_cmath.h` and fails
+  every kernel compile with "cannot overload __host__ __device__ function".
+  Device-only kernel builds now skip the MSVC `<cmath>` and `<complex>`
+  headers, which they never use.
+
 ### Speculative cascade
 
 - Added the `cascade` speculation mode for greedy Qwen3.8/Qwen35 generation.

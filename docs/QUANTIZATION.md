@@ -80,6 +80,7 @@ from wire ids. A product row must satisfy measured model bpw ∈ [N, N+1).
 |---|---:|---|
 | `TQ2G128` | 40 | PrismML Bonsai ternary — passthrough |
 | `BQ1G128` | 41 | PrismML Bonsai 1-bit — passthrough; won qt=41 adjudication 2026-08-18 |
+| `TQ2G128H` | 42 | PrismML Bonsai 2 ternary — same 34 B/group payload as qt 40, plus the checkpoint's `prism.hadamard` activation contract. The runtime applies the blockwise normalized Walsh-Hadamard transform (with the file's explicit sign vector) to the activation before the GEMV; qt 40 must not be substituted, it would feed unrotated activations to rotated weights. |
 
 ### Sub-4-bit and research formats (v1 / Lloyd / FP4)
 

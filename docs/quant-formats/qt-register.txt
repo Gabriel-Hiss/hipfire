@@ -76,6 +76,8 @@
 39  MQ3G256GL     passthrough
 40  TQ2G128       passthrough  PR #597 Bonsai ternary
 41  BQ1G128       passthrough  PR #597 Bonsai 1-bit; won the qt=41 adjudication 2026-08-18
+42  TQ2G128H      passthrough  PrismML Bonsai ternary carrying the prism.hadamard activation contract
+43  PTQ1G128H     passthrough  PrismML Bonsai dense base-3 trits plus prism.hadamard contract
 44  MQ4G256V2     passthrough
 45  MQ4CG256      passthrough
 47  MQ6G256V2     passthrough
