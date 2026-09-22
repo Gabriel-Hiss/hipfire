@@ -13929,6 +13929,41 @@ impl Gpu {
             blob_builder,
         )
     }
+    /// Throwaway probe for the wave32 iu8 WMMA fragment layout. Channel-test
+    /// only; see `kernels/src/probe_wmma_iu8.hip`.
+    pub fn probe_wmma_iu8(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        c: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("probe_wmma_iu8", kernels::PROBE_WMMA_IU8_SRC, "probe_wmma_iu8")?;
+        let ap = a.buf.as_ptr();
+        let bp = b.buf.as_ptr();
+        let cp = c.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "probe_wmma_iu8",
+            [1, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(bp);
+                b.push_ptr(cp);
+                b
+            },
+        );
+        result
+    }
+
     /// Batched sibling of [`Self::gemv_bf16_xf32`]: `Y[N x M] = X[N x K] @ W[M x K]^T`
     /// with BF16 weights widened losslessly to F32. Output layout matches
     /// `gemm_ptq1g128_prefill` (`Y[n * M + row]`).

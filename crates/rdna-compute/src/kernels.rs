@@ -6599,6 +6599,11 @@ pub const GEMV_BF16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf1
 pub const GEMM_BF16_XF32_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemm_bf16_xf32_batched.hip");
 
+/// Throwaway channel-test probe for the wave32 iu8 WMMA fragment layout.
+/// Exposed so `crates/rdna-compute/examples/test_wmma_iu8_layout.rs` can compile
+/// it; production dispatch does not reference this source.
+pub const PROBE_WMMA_IU8_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu8.hip");
+
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
 pub const V4F_SILU_MUL_CLAMP_SRC: &str =
