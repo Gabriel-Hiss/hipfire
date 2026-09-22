@@ -356,3 +356,31 @@ pub fn gated_norm_bytes(n: usize) -> usize {
     // Read x, z, weight. Write out.
     n * 4 * 4
 }
+
+/// Prism PTQ1_0 weight footprint: 28 B per 128-element group (24 B qs +
+/// 2 B qh + 2 B fp16 scale). See `kernels/src/gemv_ptq1g128.hip`.
+pub fn ptq1g128_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 128;
+    m * groups * 28
+}
+
+/// Single-row PTQ1G128 GEMV bytes: weight + quantized Q8_1-MMQ x block
+/// (144 B per 128-element group, shared across the whole row) + output.
+pub fn gemv_ptq1g128_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 128;
+    ptq1g128_weight_bytes(m, k) + groups * 144 + m * 4
+}
+
+/// B-way batched PTQ1G128 GEMM: weight read once, B quantized x blocks + B
+/// output vectors.
+pub fn gemm_ptq1g128_bytes(m: usize, k: usize, batch: usize) -> usize {
+    let groups = k / 128;
+    ptq1g128_weight_bytes(m, k) + batch * groups * 144 + batch * m * 4
+}
+
+/// Prism Hadamard block rotation: read x, read the per-width sign vector,
+/// write x_rot. `batch_size` scales the whole pass (embedding lookup = 1).
+pub fn prism_hadamard_bytes(k: usize, batch_size: usize) -> usize {
+    (k * 4 * 2 + k * 4) * batch_size
+}
+

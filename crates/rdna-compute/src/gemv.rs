@@ -2185,7 +2185,10 @@ impl Gpu {
             &inverse_i as *const _ as *mut c_void,
         ];
         let blocks = batch_size * (k / block_size);
-        self.launch_maybe_blob(
+        let bytes = crate::profile::prism_hadamard_bytes(k, batch_size);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "fwht", "rotate_x_prism_hadamard", bytes);
+        let result = self.launch_maybe_blob(
             "rotate_x_prism_hadamard",
             [blocks as u32, 1, 1],
             [256, 1, 1],
@@ -2202,7 +2205,11 @@ impl Gpu {
                 blob.push_i32(inverse_i);
                 blob
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Bonsai latent embedding lookup: decode one packed ternary row, then
@@ -6175,7 +6182,9 @@ impl Gpu {
             &mi as *const _ as *mut c_void,
             &ki as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
+        let bytes = crate::profile::gemv_ptq1g128_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_ptq1g128", bytes);
+        let result = self.launch_maybe_blob(
             "gemv_ptq1g128",
             [m as u32, 1, 1],
             [32, 1, 1],
@@ -6190,7 +6199,11 @@ impl Gpu {
                 blob.push_i32(ki);
                 blob
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     pub fn gemm_ptq1g128_prefill(
@@ -6223,7 +6236,9 @@ impl Gpu {
             &ki as *const _ as *mut c_void,
             &ni as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
+        let bytes = crate::profile::gemm_ptq1g128_bytes(m, k, n);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_prefill", bytes);
+        let result = self.launch_maybe_blob(
             "gemm_ptq1g128_prefill",
             [m as u32, n.div_ceil(8) as u32, 1],
             [32, 1, 1],
@@ -6239,7 +6254,11 @@ impl Gpu {
                 blob.push_i32(ni);
                 blob
             },
-        )
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// BQ1-G128 GEMV. K must be multiple of 128. Binary sibling of TQ2-G128.
