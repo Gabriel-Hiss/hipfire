@@ -928,7 +928,9 @@ impl ScratchState {
             ];
             let grid_x = ((k + 1023) / 1024) as u32;
             let grid_y = batch_size as u32;
-            launch_maybe_blob(
+            let bytes = k * 4 * batch_size;
+            let timer = crate::profile::begin_timer(hip, "quant", "quantize_q8_1_mmq_ds4", bytes);
+            let result = launch_maybe_blob(
                 hip,
                 Some(&*compiler),
                 functions,
@@ -950,7 +952,11 @@ impl ScratchState {
                     b.push_i32(n_val);
                     b
                 },
-            )?;
+            );
+            if let Some(t) = timer {
+                t.finish(hip);
+            }
+            result?;
         }
 
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
