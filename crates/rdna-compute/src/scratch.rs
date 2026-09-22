@@ -938,6 +938,25 @@ impl ScratchState {
             src_ptr,
         ) || self.q8_1_mmq_x_source_batch != batch_size
             || self.q8_1_mmq_x_source_k != k;
+        if std::env::var("HIPFIRE_Q81_CACHE_TRACE").is_ok() {
+            static HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            static MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = if must_convert {
+                MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            } else {
+                HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            };
+            if (n + 1) % 500 == 0 {
+                eprintln!(
+                    "[q8_1-cache] hits={} miss={} (ptr={:?} b={} k={})",
+                    HITS.load(std::sync::atomic::Ordering::Relaxed),
+                    MISS.load(std::sync::atomic::Ordering::Relaxed),
+                    src_ptr,
+                    batch_size,
+                    k
+                );
+            }
+        }
         if must_convert {
             let out_ptr = self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
             let mut xp = src_ptr;
