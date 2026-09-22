@@ -326,5 +326,72 @@ fn main() {
         );
     }
 
+    // Achieved DRAM bandwidth of the decode GEMV, at an M large enough that the
+    // per-launch activation quantization (~10-20 us) is a small fraction of the
+    // kernel time. This is the number the decode ceiling rests on.
+    {
+        const GM: usize = 131072;
+        const GK: usize = 5120;
+        let groups = GK / 128;
+        let mut pk = vec![0u8; GM * groups * 28];
+        for r in 0..GM {
+            for g in 0..groups {
+                let mut trits = [0i8; 128];
+                for t in &mut trits {
+                    *t = (next() % 3) as i8 - 1;
+                }
+                let blk = pack_block(&trits, 0.5);
+                pk[(r * groups + g) * 28..(r * groups + g) * 28 + 28].copy_from_slice(&blk);
+            }
+        }
+        let a = gpu.upload_raw(&pk, &[pk.len()]).expect("upload bw a");
+        let x: Vec<f32> = (0..GK)
+            .map(|_| (next() as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            .collect();
+        let dx = gpu.upload_f32(&x, &[GK]).expect("upload bw x");
+        let y1 = gpu.alloc_tensor(&[GM], DType::F32).expect("alloc bw y");
+        const GI: usize = 20;
+        for _ in 0..3 {
+            gpu.gemv_ptq1g128(&a, &dx, &y1, GM, GK).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..GI {
+            gpu.gemv_ptq1g128(&a, &dx, &y1, GM, GK).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let ms = t0.elapsed().as_secs_f64() / GI as f64 * 1e3;
+        let wbytes = (GM * groups * 28) as f64;
+        println!(
+            "  decode gemv bw {GM}x{GK}: {ms:.3} ms for {:.1} MB weights = {:.1} GB/s",
+            wbytes / 1e6,
+            wbytes / (ms * 1e-3) / 1e9
+        );
+
+        // Reference: what this card can actually read, on the same allocation
+        // size. The decode ceiling is stated as a fraction of this, not of the
+        // spec sheet.
+        let n4 = (wbytes as usize / 16) * 16 / 16;
+        let src: Vec<f32> = vec![0.0f32; n4 * 4];
+        let dsrc = gpu.upload_f32(&src, &[n4 * 4]).expect("upload bw src");
+        let dout = gpu.alloc_tensor(&[4], DType::F32).expect("alloc bw out");
+        for _ in 0..3 {
+            gpu.probe_dram_bw(&dsrc, &dout, n4).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let t2 = std::time::Instant::now();
+        for _ in 0..GI {
+            gpu.probe_dram_bw(&dsrc, &dout, n4).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let ms2 = t2.elapsed().as_secs_f64() / GI as f64 * 1e3;
+        let b2 = (n4 * 16) as f64;
+        println!(
+            "  peak read bw ({:.1} MB buffer): {ms2:.3} ms = {:.1} GB/s",
+            b2 / 1e6,
+            b2 / (ms2 * 1e-3) / 1e9
+        );
+    }
+
     println!("PASS");
 }
