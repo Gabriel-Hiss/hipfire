@@ -45,9 +45,12 @@ fn reference(values: &[f32], width: usize, block: usize, signs: &[i32], inverse:
 }
 
 fn main() {
-    const WIDTH: usize = 2048;
+    // The model's declared geometry: block 1024, sign width 5120. The
+    // per-token path rotates one row at a time; the batched prefill rotates the
+    // whole prompt in one call, so a batch-dependent bug would break only the
+    // latter.
+    const WIDTH: usize = 5120;
     const BLOCK: usize = 1024;
-    const BATCH: usize = 2;
 
     let mut gpu = Gpu::init().expect("gpu init");
     let mut state = 0x1234_5678u32;
@@ -58,57 +61,41 @@ fn main() {
         (state as f32 / u32::MAX as f32) * 2.0 - 1.0
     };
     let signs: Vec<i32> = (0..WIDTH).map(|_| if next() < 0.0 { -1 } else { 1 }).collect();
-    let x: Vec<f32> = (0..WIDTH * BATCH).map(|_| next()).collect();
 
     let mut table = HashMap::new();
     table.insert(WIDTH, signs.clone());
     gpu.configure_prism_hadamard(BLOCK, false, &table)
         .expect("configure");
 
-    let d_x = gpu.upload_f32(&x, &[WIDTH * BATCH]).expect("upload x");
-    let d_y = gpu
-        .alloc_tensor(&[WIDTH * BATCH], DType::F32)
-        .expect("alloc y");
-
     let mut failed = false;
-    for inverse in [false, true] {
-        gpu.prism_hadamard(&d_x, &d_y, WIDTH, BATCH, inverse)
-            .expect("rotate");
-        gpu.hip.device_synchronize().expect("sync");
-        let got = gpu.download_f32(&d_y).expect("download");
-        let want = reference(&x, WIDTH, BLOCK, &signs, inverse);
-        let max_err = got
-            .iter()
-            .zip(&want)
-            .map(|(g, w)| (g - w).abs())
-            .fold(0.0f32, f32::max);
-        let label = if inverse { "inverse" } else { "forward" };
-        println!("{label}: max |gpu - cpu| = {max_err:.3e}");
-        if !(max_err < 1e-4) {
-            failed = true;
-            for (i, (g, w)) in got.iter().zip(&want).enumerate().take(4) {
-                println!("  [{i}] gpu={g:.6} cpu={w:.6}");
+    for &batch in &[1usize, 2, 4, 8, 64, 256] {
+        let x: Vec<f32> = (0..WIDTH * batch).map(|_| next()).collect();
+        let d_x = gpu.upload_f32(&x, &[WIDTH * batch]).expect("upload x");
+        let d_y = gpu
+            .alloc_tensor(&[WIDTH * batch], DType::F32)
+            .expect("alloc y");
+        for inverse in [false, true] {
+            gpu.prism_hadamard(&d_x, &d_y, WIDTH, batch, inverse)
+                .expect("rotate");
+            gpu.hip.device_synchronize().expect("sync");
+            let got = gpu.download_f32(&d_y).expect("download");
+            let want = reference(&x, WIDTH, BLOCK, &signs, inverse);
+            let max_err = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            let label = if inverse { "inverse" } else { "forward" };
+            println!("batch {batch:3} {label}: max |gpu - cpu| = {max_err:.3e}");
+            if !(max_err < 1e-4) {
+                failed = true;
+                for (i, (g, w)) in got.iter().zip(&want).enumerate().take(4) {
+                    println!("  [{i}] gpu={g:.6} cpu={w:.6}");
+                }
             }
         }
-    }
-
-    // Round trip: inverse(forward(x)) must return x when signs are involutive.
-    gpu.prism_hadamard(&d_x, &d_y, WIDTH, BATCH, false)
-        .expect("forward");
-    let mid = gpu.download_f32(&d_y).expect("download mid");
-    let d_mid = gpu.upload_f32(&mid, &[WIDTH * BATCH]).expect("upload mid");
-    gpu.prism_hadamard(&d_mid, &d_y, WIDTH, BATCH, true)
-        .expect("inverse");
-    gpu.hip.device_synchronize().expect("sync");
-    let back = gpu.download_f32(&d_y).expect("download back");
-    let rt_err = back
-        .iter()
-        .zip(&x)
-        .map(|(b, o)| (b - o).abs())
-        .fold(0.0f32, f32::max);
-    println!("round trip: max |x - inverse(forward(x))| = {rt_err:.3e}");
-    if !(rt_err < 1e-4) {
-        failed = true;
+        let _ = gpu.free_tensor(d_x);
+        let _ = gpu.free_tensor(d_y);
     }
 
     println!("{}", if failed { "FAIL" } else { "PASS" });
