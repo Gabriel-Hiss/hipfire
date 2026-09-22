@@ -13987,6 +13987,36 @@ impl Gpu {
         result
     }
 
+    /// Probe: achievable read bandwidth. Channel-test only; see
+    /// `kernels/src/probe_dram_bw.hip`.
+    pub fn probe_dram_bw(&mut self, src: &GpuTensor, out: &GpuTensor, n4: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("probe_dram_bw", kernels::PROBE_DRAM_BW_SRC, "probe_dram_bw")?;
+        let sp = src.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let n = n4 as i64;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+        ];
+        let grid = (n4 / (256 * 8)).clamp(1, 65535) as u32;
+        self.launch_maybe_blob(
+            "probe_dram_bw",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(sp);
+                blob.push_ptr(op);
+                blob.push_u64(n as u64);
+                blob
+            },
+        )
+    }
+
     /// Throwaway probe for the wave32 iu8 WMMA fragment layout. Channel-test
     /// only; see `kernels/src/probe_wmma_iu8.hip`.
     pub fn probe_wmma_iu8(

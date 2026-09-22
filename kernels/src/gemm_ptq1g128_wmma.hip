@@ -51,19 +51,11 @@ struct block_q8_1_mmq {
 };
 static_assert(sizeof(block_q8_1_mmq) == 144, "bad Q8_1 layout");
 
-// VERBATIM copy of the validated `ptq1_trit` from kernels/src/gemv_ptq1g128.hip.
-static __device__ __forceinline__ int ptq1_tile_trit(const unsigned char* block, int e) {
-    const unsigned char* qs = block;
-    const unsigned char* qh = block + 24;
-    unsigned int v;
-    int n;
-    if (e < 80) { v = qs[e & 15]; n = e >> 4; }
-    else if (e < 120) { const int t = e - 80; v = qs[16 + (t & 7)]; n = t >> 3; }
-    else { const int t = e - 120; v = qh[t & 1]; n = t >> 1; }
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) if (i < n) v = (v * 3) & 0xFF;
-    return (int)((v * 3) >> 8) - 1;
-}
+// Trit decode. The group-at-a-time branchless form below replaces the
+// per-element `ptq1_trit` the scalar kernel uses: extracting digit t of a byte
+// needs t conditional multiplies, while walking a byte's digits in order costs
+// one unconditional multiply each. The channel test pins both to the same
+// values (test_gemv_ptq1g128, 7.6e-6 on 257x512x17).
 
 // Pack 16 consecutive values into the 4x int32 iu8 fragment. Byte b of word w is
 // the value at w*4+b, matching the layout test_wmma_iu8_layout.rs pins.
@@ -124,7 +116,51 @@ extern "C" __global__ void gemm_ptq1g128_wmma(
             __builtin_memcpy(&h, &bits, 2);
             dwrow[j] = (float)h;
         }
+        // Pre-decode the whole 128-trit group ONCE, branchless.
+        //
+        // The per-element `ptq1_tile_trit` costs up to four conditional
+        // multiplies plus two branches per trit, because extracting digit t of a
+        // byte needs t multiplies. Walking each byte's digits in order instead
+        // costs exactly one multiply per trit with no branches: the base-3
+        // recurrence already produces all five digits as it advances.
+        signed char trits[128];
+        #pragma unroll
+        for (int m = 0; m < 16; ++m) {
+            unsigned int v = q[m];
+            #pragma unroll
+            for (int d = 0; d < 5; ++d) {
+                const unsigned int w = v * 3;
+                v = w & 0xFF;
+                trits[d * 16 + m] = (signed char)((int)(w >> 8) - 1);
+            }
+        }
+        #pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            unsigned int v = q[16 + m];
+            #pragma unroll
+            for (int d = 0; d < 5; ++d) {
+                const unsigned int w = v * 3;
+                v = w & 0xFF;
+                trits[80 + d * 8 + m] = (signed char)((int)(w >> 8) - 1);
+            }
+        }
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            unsigned int v = q[24 + h];
+            #pragma unroll
+            for (int d = 0; d < 4; ++d) {
+                const unsigned int w = v * 3;
+                v = w & 0xFF;
+                trits[120 + d * 2 + h] = (signed char)((int)(w >> 8) - 1);
+            }
+        }
         const signed char* xq = (Xq + (long long)g * N + safe_col)->qs;
+        // The 16 consecutive activation bytes for a sub-block ARE the B fragment
+        // (byte b of word w is element w*4+b). Loading them as one i8x16 beats
+        // assembling the four words byte by byte: that cost ~40 ALU ops per
+        // fragment against 320 WMMA ops per block, and it was the larger half of
+        // the packing, since the activation needs no decode at all.
+        const i8x16* xq_v = (const i8x16*)xq;
 
         #pragma unroll
         for (int s = 0; s < 4; ++s) {
@@ -133,9 +169,8 @@ extern "C" __global__ void gemm_ptq1g128_wmma(
             for (int half = 0; half < 2; ++half) {
                 const int t = s * 2 + half;
                 i8x16 av;
-                PTQ1_PACK16(av, ptq1_tile_trit(q, t * 16 + w * 4 + b));
-                i8x16 bv;
-                PTQ1_PACK16(bv, xq[t * 16 + w * 4 + b]);
+                PTQ1_PACK16(av, trits[t * 16 + w * 4 + b]);
+                const i8x16 bv = xq_v[t];
                 i32x8 part = {0, 0, 0, 0, 0, 0, 0, 0};
                 part = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
                     true, av, true, bv, part, false);
