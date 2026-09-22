@@ -2459,15 +2459,28 @@ pub fn prefill_batch_pbs_eligible(
         .layers
         .iter()
         .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),));
+    // Record WHY the first inadmissible layer was rejected. This used to be
+    // discarded, so a model that silently fell back to per-token prefill gave
+    // no clue whether the cause was dtype, geometry, or the MoE arm — which is
+    // exactly the question a reader of the HIPFIRE_DEBUG_BATCH line is asking.
+    let mut first_reject: Option<String> = None;
     let all_layers_ok = weights.layers.iter().all(|lw| {
         if matches!(
             lw,
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
         ) && !moe_router_logits_present
         {
+            first_reject
+                .get_or_insert_with(|| "MoE layer requested without router logits".to_string());
             return false;
         }
-        qwen35_layer_batch_admissible(lw, config, arch).is_ok()
+        match qwen35_layer_batch_admissible(lw, config, arch) {
+            Ok(()) => true,
+            Err(e) => {
+                first_reject.get_or_insert_with(|| e.to_string());
+                false
+            }
+        }
     });
     let result = !force_fallback
         && n >= MIN_BATCH
@@ -2493,7 +2506,7 @@ pub fn prefill_batch_pbs_eligible(
              force_fallback={force_fallback} \
              has_dn={has_dn} \
              moe_router_logits_present={moe_router_logits_present} \
-             all_layers_ok={all_layers_ok}",
+             all_layers_ok={all_layers_ok} first_reject={first_reject:?}",
             n >= MIN_BATCH,
         );
     }
