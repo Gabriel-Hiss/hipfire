@@ -26,8 +26,67 @@ struct block_q8_1_mmq {
 };
 static_assert(sizeof(block_q8_1_mmq) == 144, "bad Q8_1 layout");
 
-// PTQ1 x Q8_1, matching PrismML llama.cpp's GPU vecdot. One lane owns four
-// consecutive K elements; every eight lanes share one 32-value Q8_1 scale.
+// Decode and dot one complete PTQ1 block per lane. This follows the HIP
+// `vec_dot_ptq1_0_q8_1` traversal published by PrismML-Eng/llama.cpp
+// (MIT): sequential base-3 recurrence over qs[16], qs[8], qh[2], with four
+// independent Q8_1 scale buckets. Keeping a complete block on one lane
+// removes the per-element region/index branches from the old 4-elements-per-
+// lane mapping and exposes the same uniform byte walk as the reference.
+static __device__ __forceinline__ float ptq1_block_dot(
+    const unsigned char* __restrict__ q,
+    const block_q8_1_mmq* __restrict__ xq
+) {
+    int sumi[4] = {0, 0, 0, 0};
+
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        unsigned int v = q[m];
+        #pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const unsigned int w = v * 3;
+            const int trit = (int)(w >> 8) - 1;
+            v = w & 0xFF;
+            const int e = t * 16 + m;
+            sumi[e >> 5] += trit * (int)xq->qs[e];
+        }
+    }
+
+    #pragma unroll
+    for (int m = 0; m < 8; ++m) {
+        unsigned int v = q[16 + m];
+        #pragma unroll
+        for (int t = 0; t < 5; ++t) {
+            const unsigned int w = v * 3;
+            const int trit = (int)(w >> 8) - 1;
+            v = w & 0xFF;
+            const int e = 80 + t * 8 + m;
+            sumi[e >> 5] += trit * (int)xq->qs[e];
+        }
+    }
+
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        unsigned int v = q[24 + h];
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const unsigned int w = v * 3;
+            const int trit = (int)(w >> 8) - 1;
+            v = w & 0xFF;
+            const int e = 120 + t * 2 + h;
+            sumi[3] += trit * (int)xq->qs[e];
+        }
+    }
+
+    float acc = 0.0f;
+    #pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+        acc += (float)xq->ds4[2 * sub] * (float)sumi[sub];
+    }
+    return (float)(*(const _Float16*)(q + 26)) * acc;
+}
+
+// PTQ1 x Q8_1 decode GEMV. One lane owns one complete 128-weight group;
+// a wave processes up to 32 groups in parallel, then reduces group partials.
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_ptq1g128(
     const unsigned char* __restrict__ A,
@@ -41,17 +100,8 @@ extern "C" __global__ void gemv_ptq1g128(
     const int groups = K / 128;
     const unsigned char* row_ptr = A + (long long)row * groups * 28;
     float acc = 0.0f;
-    for (int g = 0; g < groups; ++g) {
-        const unsigned char* q = row_ptr + g * 28;
-        const float dw = (float)(*(const _Float16*)(q + 26));
-        const int e = lane * 4;
-        const int sub = lane >> 3;
-        const float dx = (float)Xq[g].ds4[2*sub];
-        const signed char* x4 = Xq[g].qs + e;
-        const int idot =
-            ptq1_trit(q, e+0)*(int)x4[0] + ptq1_trit(q, e+1)*(int)x4[1] +
-            ptq1_trit(q, e+2)*(int)x4[2] + ptq1_trit(q, e+3)*(int)x4[3];
-        acc += dw * dx * (float)idot;
+    for (int g = lane; g < groups; g += 32) {
+        acc += ptq1_block_dot(row_ptr + g * 28, Xq + g);
     }
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down(acc, off);
     if (lane == 0) y[row] = acc;
