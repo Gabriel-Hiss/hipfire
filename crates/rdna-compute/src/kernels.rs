@@ -6607,6 +6607,9 @@ pub const PROBE_WMMA_IU8_SRC: &str = include_str!("../../../kernels/src/probe_wm
 /// Probe: achievable read bandwidth. The decode ceiling rests on this number.
 pub const PROBE_DRAM_BW_SRC: &str = include_str!("../../../kernels/src/probe_dram_bw.hip");
 
+/// Probe: iu4 vs iu8 WMMA throughput on this part.
+pub const PROBE_WMMA_RATE_SRC: &str = include_str!("../../../kernels/src/probe_wmma_rate.hip");
+
 /// Batched PTQ1_0 prefill GEMM on the INT8 matrix unit
 /// (`v_wmma_i32_16x16x16_iu8`). Exact integer dot, same activations as the
 /// scalar prefill kernel; see the source header.

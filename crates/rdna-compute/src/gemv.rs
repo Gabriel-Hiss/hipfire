@@ -13987,6 +13987,36 @@ impl Gpu {
         result
     }
 
+    /// Probe: iu4 vs iu8 WMMA throughput. Channel-test only; see
+    /// `kernels/src/probe_wmma_rate.hip`.
+    pub fn probe_wmma_rate(&mut self, which: &str, out: &GpuTensor, seed: i32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "probe_wmma_rate",
+            kernels::PROBE_WMMA_RATE_SRC,
+            which,
+        )?;
+        let op = out.buf.as_ptr();
+        let mut sd = seed;
+        let mut params: Vec<*mut c_void> = vec![
+            &op as *const _ as *mut c_void,
+            &sd as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            which,
+            [1, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(op);
+                b.push_i32(sd);
+                b
+            },
+        )
+    }
+
     /// Probe: achievable read bandwidth. Channel-test only; see
     /// `kernels/src/probe_dram_bw.hip`.
     pub fn probe_dram_bw(&mut self, src: &GpuTensor, out: &GpuTensor, n4: usize) -> HipResult<()> {

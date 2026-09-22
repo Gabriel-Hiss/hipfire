@@ -393,5 +393,34 @@ fn main() {
         );
     }
 
+    // iu4 vs iu8 WMMA throughput. The ternary INT4 route only pays if iu4 is
+    // more than 2x iu8, because an 8-bit activation needs two iu4 MMAs to
+    // reproduce one iu8 dot exactly.
+    {
+        let out = gpu.alloc_tensor(&[8], DType::F32).expect("alloc rate out");
+        const REPS: usize = 200;
+        let mut rates = Vec::new();
+        for which in ["probe_wmma_iu8_rate", "probe_wmma_iu4_rate"] {
+            for _ in 0..3 {
+                gpu.probe_wmma_rate(which, &out, 3).unwrap();
+            }
+            gpu.hip.device_synchronize().unwrap();
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS {
+                gpu.probe_wmma_rate(which, &out, 3).unwrap();
+            }
+            gpu.hip.device_synchronize().unwrap();
+            let ms = t0.elapsed().as_secs_f64() / REPS as f64 * 1e3;
+            // 8 independent chains x 2048 iterations x 4096 MACs, one wave.
+            let macs = 8.0 * 2048.0 * 4096.0;
+            rates.push(macs / (ms * 1e-3));
+            println!("  {which}: {ms:.4} ms  ->  {:.2}e9 MMA-MAC/s per wave", macs / (ms * 1e-3) / 1e9);
+        }
+        println!(
+            "  iu4 / iu8 throughput ratio: {:.3}x",
+            rates[1] / rates[0]
+        );
+    }
+
     println!("PASS");
 }
