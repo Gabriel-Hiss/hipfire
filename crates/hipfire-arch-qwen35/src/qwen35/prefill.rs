@@ -1342,6 +1342,39 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     result
 }
 
+/// Batched plain GEMM for one projection, routing BF16 to the dedicated
+/// `gemm_bf16_xf32_batched` kernel.
+///
+/// BF16 has no entry in the gemm key registry: the only BF16 GEMM there is the
+/// gfx942 MFMA calibration-teacher path, and `plain_gemm_key_for`'s `_` arm
+/// would send a BF16 tensor to the Q8_0 batched kernel, which decodes noise at
+/// full speed with no HIP error. Prism's ternary checkpoints keep the DeltaNet
+/// gate projections (w_alpha/w_beta) as BF16, so this arm is what admits them
+/// to batched prefill. Every other dtype keeps the registry-routed path
+/// unchanged.
+fn run_proj_gemm(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    if w.gpu_dtype == DType::BF16 {
+        return gpu.gemm_bf16_xf32_batched(&w.buf, x, y, w.m, w.k, n);
+    }
+    run_plain_gemm_key(
+        gpu,
+        plain_gemm_key_for(w.gpu_dtype),
+        &w.buf,
+        w.gpu_dtype,
+        x,
+        y,
+        w.m,
+        w.k,
+        n,
+    )
+}
+
 /// Plain (unfused) batched-GEMM dispatcher key for a weight dtype.
 ///
 /// Q8 keeps the chunked kernel it already used, so this is behaviour-preserving
@@ -1354,6 +1387,12 @@ fn plain_gemm_key_for(dt: DType) -> hipfire_dispatch::types::KernelKey {
         DType::TQ2G128 => K::GemmTQ2G128Prefill,
         DType::PTQ1G128H => K::GemmPTQ1G128Prefill,
         DType::BQ1G128 => K::GemmBQ1G128Prefill,
+        // F32 must be explicit: the `_` arm below is GemmQ8_0BatchedChunked, and
+        // pointing a 4-byte-per-element tensor at a Q8_0 kernel decodes noise at
+        // full speed with no HIP error. `is_batchable_la` admits F32 for the
+        // DeltaNet gate projections (see `gate_proj_loads_as_f32`), so this arm
+        // is reachable and required.
+        DType::F32 => K::GemmF32Batched,
         _ => K::GemmQ8_0BatchedChunked,
     }
 }
@@ -1399,6 +1438,16 @@ pub(crate) fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32
+        // BF16 DeltaNet gate projections: Prism's ternary checkpoints store
+        // w_alpha/w_beta UNQUANTIZED as BF16, and no gfx11 arch has a BF16
+        // weight GEMM. The matcher routes BF16 through the dedicated
+        // `gemm_bf16_xf32_batched` kernel (see `run_proj_gemm`), so it is
+        // batchable on every arch that kernel compiles for. Without this arm a
+        // single BF16 tensor rejects the whole model via
+        // `qwen35_layer_batch_admissible` and prefill silently drops to the
+        // per-token loop — measured on Ternary-Bonsai-2-27B: 34 tok/s flat from
+        // 64 to 1024 prompt tokens.
+        | DType::BF16
     );
     if always_ok {
         return true;
@@ -4223,54 +4272,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
             n,
         )?;
     } else if is_q8 || is_lowbit {
-        // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
-        // (wqkv/wz/w_beta/w_alpha) → GemmFamily::run_key with the
-        // GemmQ8_0BatchedChunked dispatcher-entry key → identical
-        // gpu.gemm_q8_0_batched_chunked method, byte-for-byte.
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.wqkv.gpu_dtype),
-            &layer.wqkv.buf,
-            layer.wqkv.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.dn_qkv_batch,
-            layer.wqkv.m,
-            layer.wqkv.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.wz.gpu_dtype),
-            &layer.wz.buf,
-            layer.wz.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.dn_z_batch,
-            layer.wz.m,
-            layer.wz.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.w_beta.gpu_dtype),
-            &layer.w_beta.buf,
-            layer.w_beta.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.dn_beta_batch,
-            layer.w_beta.m,
-            layer.w_beta.k,
-            n,
-        )?;
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.w_alpha.gpu_dtype),
-            &layer.w_alpha.buf,
-            layer.w_alpha.gpu_dtype,
-            &pbs.x_rot_batch,
-            &pbs.dn_alpha_batch,
-            layer.w_alpha.m,
-            layer.w_alpha.k,
-            n,
-        )?;
+        // #397 Ship 5.2 slice1: four plain batched GEMMs
+        // (wqkv/wz/w_beta/w_alpha), each dispatched on its OWN dtype — Prism's
+        // ternary checkpoints mix PTQ1G128H for wqkv/wz with BF16 for the gate
+        // projections, and `run_proj_gemm` handles the BF16 arm.
+        run_proj_gemm(gpu, &layer.wqkv, &pbs.x_rot_batch, &pbs.dn_qkv_batch, n)?;
+        run_proj_gemm(gpu, &layer.wz, &pbs.x_rot_batch, &pbs.dn_z_batch, n)?;
+        run_proj_gemm(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
+        run_proj_gemm(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
     } else if is_mq3_lloyd {
         // 112 B/group Lloyd-MQ3 stride; X is already FWHT-rotated.
         run_fused_qkvza_key(

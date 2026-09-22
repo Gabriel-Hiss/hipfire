@@ -6592,6 +6592,13 @@ pub const GEMV_F16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_
 /// unlike re-quantizing to f16. arch_id 12 (Cohere2-MoE).
 pub const GEMV_BF16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_bf16_xf32.hip");
 
+/// Batched BF16-weight x F32-activation GEMM (Y[N x M] = X[N x K] @ W[M x K]^T).
+/// Batched sibling of `GEMV_BF16_XF32_SRC`, added so the unquantized BF16
+/// DeltaNet gate projections can enter batched prefill on arches with no BF16
+/// weight GEMM.
+pub const GEMM_BF16_XF32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bf16_xf32_batched.hip");
+
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
 pub const V4F_SILU_MUL_CLAMP_SRC: &str =

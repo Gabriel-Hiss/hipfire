@@ -13929,6 +13929,68 @@ impl Gpu {
             blob_builder,
         )
     }
+    /// Batched sibling of [`Self::gemv_bf16_xf32`]: `Y[N x M] = X[N x K] @ W[M x K]^T`
+    /// with BF16 weights widened losslessly to F32. Output layout matches
+    /// `gemm_ptq1g128_prefill` (`Y[n * M + row]`).
+    ///
+    /// Exists so the unquantized BF16 DeltaNet gate projections can enter
+    /// batched prefill on arches with no BF16 weight GEMM; see the kernel's
+    /// header comment for why widening at load is not equivalent.
+    pub fn gemm_bf16_xf32_batched(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_bf16_xf32_batched",
+            kernels::GEMM_BF16_XF32_BATCHED_SRC,
+            "gemm_bf16_xf32_batched",
+        )?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * k * 2 + n * k * 4 + n * m * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16_xf32_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_bf16_xf32_batched",
+            [m as u32, n.div_ceil(8) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
