@@ -1109,6 +1109,18 @@ pub static FIELDS: &[ConfigField] = &[
         "Adapt the DFlash block size to observed acceptance."
     ),
     field!(
+        "speculation.dflash_block",
+        "dflash_block",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 32 },
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_BLOCK"),
+        "DFlash speculation length K. 0 = the draft checkpoint's trained block size."
+    ),
+    field!(
         "speculation.dflash",
         "dflash_mode",
         Speculation,

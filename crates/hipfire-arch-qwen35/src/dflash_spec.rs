@@ -154,8 +154,24 @@ pub fn load_dflash_state(
     // DEFAULT window (below), so the artifact must be parsed before the
     // windowed-vs-Legacy decision.
     let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
-    let draft_config = DflashConfig::from_hfq(&draft_hfq)
+    let mut draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    // The trained block size is a draft property, not an optimum. Measured on
+    // Ternary-Bonsai-2-27B with `dflash_spec_demo --block-size`: expected tokens
+    // per window saturate (3.72 at K=4, 4.23 at K=8, 4.28 at K=16) while the
+    // verify cycle grows with K, so the wall-clock optimum is K=8, not the
+    // checkpoint's 16. Applied before `runtime_block_size()` so the scratch
+    // sizing and the speculator's block stay consistent.
+    {
+        let b = hipfire_runtime::config::get().dflash_block;
+        if b > 0 && (b as usize) != draft_config.block_size {
+            eprintln!(
+                "  DFlash block size override: {} -> {b} (checkpoint trained at {})",
+                draft_config.block_size, draft_config.block_size
+            );
+            draft_config.block_size = b as usize;
+        }
+    }
 
     // Windowed draft context:
     //   - Legacy DFlash (n−1 sliding + last full): layers 0..n−2 attend over

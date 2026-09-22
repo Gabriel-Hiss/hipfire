@@ -953,6 +953,10 @@ impl Carrier for LlamaCarrier {
                         dp,
                         &mut bundle,
                         ctx.max_seq,
+                        {
+                            let b = hipfire_runtime::config::get().dflash_block;
+                            (b > 0).then_some(b as usize)
+                        },
                     )
                     .map_err(|e| format!("DFlash generic speculator build failed: {e}"))?;
                     eprintln!(

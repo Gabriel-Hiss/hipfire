@@ -1040,10 +1040,26 @@ pub fn build_generic_dflash_speculator(
     draft_hfq_path: &str,
     target: &mut dyn SpecTarget,
     ctx_capacity: usize,
+    block_size_override: Option<usize>,
 ) -> Result<Box<dyn Speculator>, String> {
     let draft_hfq = HfqFile::open(Path::new(draft_hfq_path)).map_err(|e| format!("{e}"))?;
-    let config = DflashConfig::from_hfq(&draft_hfq)
+    let mut config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    // The trained block size is a draft property, not an optimum. Measured on
+    // Ternary-Bonsai-2-27B the wall-clock optimum is K=8, not the checkpoint's
+    // 16: expected tokens per window saturate (3.72 at K=4, 4.23 at K=8, 4.28
+    // at K=16) while the verify cycle grows with K. Overriding here changes both
+    // the scratch sizing and the speculator's block, so they stay consistent.
+    if let Some(b) = block_size_override {
+        let b = b.max(2);
+        if b != config.block_size {
+            eprintln!(
+                "  DFlash block size override: {} -> {b} (checkpoint trained at {})",
+                config.block_size, config.block_size
+            );
+        }
+        config.block_size = b;
+    }
     let weights = DflashWeights::load(gpu, &draft_hfq, &config).map_err(|e| format!("{e}"))?;
     let block_size = config.block_size;
     // L3: F16 drafts (dflash_convert) → has_mq=false → DflashScratch::new.

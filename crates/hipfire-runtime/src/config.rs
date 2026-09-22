@@ -80,6 +80,8 @@ pub struct RuntimeConfig {
     pub ngram_draft: bool,
     pub ngram_k: usize,
     pub ngram_min_count: u32,
+    /// DFlash speculation length K. 0 = the draft checkpoint's trained block.
+    pub dflash_block: u64,
     pub kv_mode: String,
     pub kv_adaptive: String,
     pub chat_template_file: Option<String>,
@@ -169,6 +171,9 @@ impl RuntimeConfig {
             ngram_min_count: value("HIPFIRE_NGRAM_MIN_COUNT")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2),
+            dflash_block: value("HIPFIRE_DFLASH_BLOCK")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             kv_mode: value("HIPFIRE_KV_MODE").unwrap_or_else(|| "auto".into()),
             kv_adaptive: value("HIPFIRE_KV_ADAPTIVE").unwrap_or_else(|| "off".into()),
             chat_template_file: value("HIPFIRE_CHAT_TEMPLATE_FILE")
