@@ -34,6 +34,14 @@ fn main() {
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     eprintln!("vocab={} layers={} dim={}", config.vocab_size, config.n_layers, config.dim);
+    eprintln!(
+        "  linear: key_heads={} value_heads={} key_hd={} value_hd={} norm_eps={}",
+        config.linear_num_key_heads,
+        config.linear_num_value_heads,
+        config.linear_key_head_dim,
+        config.linear_value_head_dim,
+        config.norm_eps
+    );
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);

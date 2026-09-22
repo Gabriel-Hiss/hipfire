@@ -1579,6 +1579,10 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
+    // DIAG: dump the embedding so a batched-vs-per-token divergence can be
+    // attributed to the embedding or to layer 0's internals.
+    dump_hidden_localize(gpu, &scratch.x, 1, pos, dim, 0, "emb_p");
+
     let pos_i32 = pos as i32;
     if gpu.replay.should_route_aql() {
         gpu.hip
@@ -2114,6 +2118,20 @@ fn forward_scratch_layers(
                         n_v_heads,
                         config.linear_value_head_dim,
                     )?,
+                }
+                // DIAG: dump the GDN output at layer 0 so a batched-vs-per-token
+                // divergence can be attributed to the recurrence or to the
+                // gated norm / wo / FFN that follow it.
+                if layer_idx == 0 {
+                    dump_hidden_localize(
+                        gpu,
+                        &s.dn_attn_out,
+                        1,
+                        pos,
+                        n_v_heads * config.linear_value_head_dim,
+                        0,
+                        "gdn_p",
+                    );
                 }
 
                 gpu.gated_norm_f32(

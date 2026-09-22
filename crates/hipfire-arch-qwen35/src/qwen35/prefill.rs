@@ -4040,6 +4040,9 @@ pub(crate) fn batch_chunk_embed_tokens(
                 dim_row_bytes,
             )?;
         }
+        // DIAG: dump the embedding so a batched-vs-per-token divergence can be
+        // attributed to the embedding or to layer 0's internals.
+        dump_hidden_localize(gpu, &pbs.x_batch, n, 0, dim, 0, "emb_b");
     }
 
     // ── 1a. Apply MaskEmbedOverride (MTP probe hook) ─────────────────────
@@ -4693,6 +4696,20 @@ pub(crate) fn batch_chunk_delta_net_attn(
                 config.linear_value_head_dim,
             )?,
         }
+    }
+    // DIAG: dump the GDN output at layer 0 so a batched-vs-per-token
+    // divergence can be attributed to the recurrence or to the gated norm /
+    // wo / FFN that follow it.
+    if delta_layer_idx == 0 {
+        dump_hidden_localize(
+            gpu,
+            &pbs.dn_attn_out_batch,
+            n,
+            0,
+            n_v_heads * config.linear_value_head_dim,
+            0,
+            "gdn_b",
+        );
     }
 
     // Batched gated output norm.
