@@ -2134,11 +2134,14 @@ fn is_dflash_lm_head_wmma_arch(gpu_arch: &str) -> bool {
 
 /// Pre-allocation predicate: whether a target lm_head quant_type is admitted
 /// for DFlash on `gpu_arch`. Always admits qt 3/6/13; admits legacy qt17 and
-/// V2 qt44/47/48/49/50 on the gfx11+gfx12 WMMA set only.
+/// V2 qt44/47/48/49/50 on the gfx11+gfx12 WMMA set only, plus Prism's ternary
+/// PTQ1 (qt=43), whose batched lm-head GEMM is `gemm_ptq1g128_wmma` — the same
+/// integer matrix-unit kernel the PTQ1 prefill uses, with a Prism-Hadamard
+/// rotation of the hidden state in front of it.
 fn dflash_lm_head_quant_supported(lm_qt: Option<u8>, gpu_arch: &str) -> bool {
     match lm_qt {
         Some(3 | 6 | 13) => true,
-        Some(17 | 44 | 47 | 48 | 49 | 50) => is_dflash_lm_head_wmma_arch(gpu_arch),
+        Some(17 | 43 | 44 | 47 | 48 | 49 | 50) => is_dflash_lm_head_wmma_arch(gpu_arch),
         _ => false,
     }
 }

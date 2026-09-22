@@ -277,6 +277,21 @@ fn dflash_enqueue_verify_lm_head(
                 b,
             )?;
         }
+        rdna_compute::DType::PTQ1G128H => {
+            // Prism ternary head: the batched GEMM is the same integer
+            // matrix-unit kernel the PTQ1 prefill uses, fed a Prism-Hadamard
+            // rotated hidden state (rotate_x_mq_batched_for routes PTQ1/TQ2 to
+            // rotate_x_prism_hadamard rather than the MQ FWHT).
+            assert!(
+                b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                "verify_scratch.rot undersized: b*k={} > max_n*hidden_k={}",
+                b * w_out.k,
+                verify_scratch.max_n * verify_scratch.hidden_k
+            );
+            let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+            llama::rotate_x_mq_batched_for(gpu, w_out, final_hidden, &rot, w_out.k, b)?;
+            gpu.gemm_ptq1g128_wmma(&w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b)?;
+        }
         rdna_compute::DType::MQ4G256 => {
             assert!(
                 b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
@@ -3972,6 +3987,25 @@ pub fn spec_step_dflash(
                 }
                 hipfire_runtime::llama::EmbeddingFormat::F32 => {
                     gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+                }
+                // Prism ternary/binary embeddings. The `_prism` lookups undo the
+                // checkpoint's Hadamard fold, which is the basis the layers start
+                // from — the same one the other formats return unrotated.
+                hipfire_runtime::llama::EmbeddingFormat::PTQ1G128H => {
+                    gpu.embedding_lookup_ptq1g128_prism(
+                        &target.weights.token_embd,
+                        &dst,
+                        tok as usize,
+                        h as usize,
+                    )?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::TQ2G128H => {
+                    gpu.embedding_lookup_tq2g128_prism(
+                        &target.weights.token_embd,
+                        &dst,
+                        tok as usize,
+                        h as usize,
+                    )?
                 }
                 _ => panic!("dflash: unsupported target embedding format for noise lookup"),
             }

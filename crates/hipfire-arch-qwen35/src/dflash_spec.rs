@@ -928,6 +928,12 @@ impl Speculator for DflashSpeculator {
             let cfg_b = self.df.block_size.max(2);
             let want = max_emit.max(2);
             let b = cfg_b.min(want);
+            if std::env::var("HIPFIRE_DFLASH_TRACE_B").is_ok() {
+                eprintln!(
+                    "[dflash] cfg_b={} max_emit={} -> b={}",
+                    cfg_b, max_emit, b
+                );
+            }
             if b < cfg_b || b != self.df.draft_config.block_size {
                 Some(b)
             } else {
