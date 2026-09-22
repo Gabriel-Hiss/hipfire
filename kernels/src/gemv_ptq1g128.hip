@@ -51,6 +51,7 @@ static __device__ __forceinline__ void ptq1_block_dot_rows(
     float* out
 ) {
     int sumi[PTQ1_ROW_TILE][4];
+    int sx[4] = {0, 0, 0, 0};
     unsigned int v[PTQ1_ROW_TILE];
     #pragma unroll
     for (int r = 0; r < PTQ1_ROW_TILE; ++r) {
@@ -67,11 +68,12 @@ static __device__ __forceinline__ void ptq1_block_dot_rows(
         for (int t = 0; t < 5; ++t) {
             const int e = t * 16 + m;
             const int x = (int)xq->qs[e];
+            sx[e >> 5] += x;
             #pragma unroll
             for (int r = 0; r < PTQ1_ROW_TILE; ++r) {
                 const unsigned int w = v[r] * 3;
                 v[r] = w & 0xFF;
-                sumi[r][e >> 5] += ((int)(w >> 8) - 1) * x;
+                sumi[r][e >> 5] += (int)(w >> 8) * x;
             }
         }
     }
@@ -85,11 +87,12 @@ static __device__ __forceinline__ void ptq1_block_dot_rows(
         for (int t = 0; t < 5; ++t) {
             const int e = 80 + t * 8 + m;
             const int x = (int)xq->qs[e];
+            sx[e >> 5] += x;
             #pragma unroll
             for (int r = 0; r < PTQ1_ROW_TILE; ++r) {
                 const unsigned int w = v[r] * 3;
                 v[r] = w & 0xFF;
-                sumi[r][e >> 5] += ((int)(w >> 8) - 1) * x;
+                sumi[r][e >> 5] += (int)(w >> 8) * x;
             }
         }
     }
@@ -103,11 +106,12 @@ static __device__ __forceinline__ void ptq1_block_dot_rows(
         for (int t = 0; t < 4; ++t) {
             const int e = 120 + t * 2 + h;
             const int x = (int)xq->qs[e];
+            sx[3] += x;
             #pragma unroll
             for (int r = 0; r < PTQ1_ROW_TILE; ++r) {
                 const unsigned int w = v[r] * 3;
                 v[r] = w & 0xFF;
-                sumi[r][3] += ((int)(w >> 8) - 1) * x;
+                sumi[r][3] += (int)(w >> 8) * x;
             }
         }
     }
@@ -117,7 +121,7 @@ static __device__ __forceinline__ void ptq1_block_dot_rows(
         float acc = 0.0f;
         #pragma unroll
         for (int sub = 0; sub < 4; ++sub) {
-            acc += (float)xq->ds4[2 * sub] * (float)sumi[r][sub];
+            acc += (float)xq->ds4[2 * sub] * (float)(sumi[r][sub] - sx[sub]);
         }
         out[r] = (float)(*(const _Float16*)(q[r] + 26)) * acc;
     }
