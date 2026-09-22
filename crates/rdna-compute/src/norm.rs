@@ -196,6 +196,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // This output is a GEMM source in the prefill and verify paths
+        // (x_norm_batch / x_rot_batch feed the PTQ1 projections), so any cached
+        // activation quantization keyed on it is stale now.
+        self.invalidate_x_caches_for(out_ptr);
         result
     }
 
@@ -585,6 +589,9 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // ffn_hidden_batch is the w_down GEMM source, so a cached activation
+        // quantization keyed on it is stale after this write.
+        self.invalidate_x_caches_for(out_ptr);
         result
     }
 

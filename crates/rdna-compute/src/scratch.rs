@@ -55,6 +55,15 @@ pub struct ScratchState {
     pub fp8_x_source_ptr: *mut c_void,
     pub q8_1_mmq_x_scratch: Option<DeviceBuffer>,
     pub q8_1_mmq_x_scratch_bytes: usize,
+    /// Source pointer the Q8_1 scratch currently holds, plus the geometry it
+    /// was converted with. `ensure_q8_1_mmq_x` used to re-quantize on every
+    /// call with no cache, so a run of projections sharing one activation
+    /// (wqkv and wz both read x_rot_batch) paid for the conversion twice. The
+    /// geometry is part of the key because the block layout depends on both K
+    /// and the batch.
+    pub q8_1_mmq_x_source_ptr: *mut c_void,
+    pub q8_1_mmq_x_source_batch: usize,
+    pub q8_1_mmq_x_source_k: usize,
     /// Partials buffer for the deterministic K-split GEMM (ksplit_det):
     /// [K_SPLITS][batch_size][M] fp32, grows-never-shrinks.
     pub ksplit_det_partials: Option<DeviceBuffer>,
@@ -911,9 +920,24 @@ impl ScratchState {
             &mut self.q8_1_mmq_x_scratch_bytes,
             needed,
         )?;
+        // Same rule as the fp16/fp8 caches: a reallocated buffer holds no valid
+        // conversion. (grow_scratch_buffer copies, but the copy is of the old
+        // contents at the old geometry, so the key is stale either way.)
+        self.q8_1_mmq_x_source_ptr = std::ptr::null_mut();
 
         let src_ptr = x.buf.as_ptr();
-        let must_convert = true;
+        // Cache on (source pointer, K, batch). The block layout is
+        // [K/128][batch], so the geometry is part of the key: the same pointer
+        // converted at a different shape is a different conversion.
+        // `invalidate_x_caches_for` must be called by anything that writes a
+        // buffer used as a GEMM source — same contract as the fp16/fp8 caches.
+        let must_convert = scratch_must_convert(
+            capture_mode,
+            replay.is_recording(),
+            self.q8_1_mmq_x_source_ptr,
+            src_ptr,
+        ) || self.q8_1_mmq_x_source_batch != batch_size
+            || self.q8_1_mmq_x_source_k != k;
         if must_convert {
             let out_ptr = self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
             let mut xp = src_ptr;
@@ -957,6 +981,9 @@ impl ScratchState {
                 t.finish(hip);
             }
             result?;
+            self.q8_1_mmq_x_source_ptr = src_ptr;
+            self.q8_1_mmq_x_source_batch = batch_size;
+            self.q8_1_mmq_x_source_k = k;
         }
 
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
@@ -974,6 +1001,9 @@ impl ScratchState {
         }
         if self.fp8_x_source_ptr == dst_ptr {
             self.fp8_x_source_ptr = std::ptr::null_mut();
+        }
+        if self.q8_1_mmq_x_source_ptr == dst_ptr {
+            self.q8_1_mmq_x_source_ptr = std::ptr::null_mut();
         }
     }
 
