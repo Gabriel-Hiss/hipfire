@@ -1,69 +1,67 @@
-# Amendment 13 — Ternary-Bonsai-2-27B PTQ1_0 gfx1100: the n-gram bench number is a cache artifact
+# Amendment 13 — Ternary-Bonsai-2-27B PTQ1_0 gfx1100: a tool-call prefix reuses in full, and tau on tool syntax is low
 
 **Date:** 2026-09-22
 **Lifecycle:** `historical`
 **Amends:** [`2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md`](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md) and amendments [1](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-1.md) through [12](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-12.md), all unchanged.
-**Disposition:** **measurement defect.** Records that `hipfire bench --spec ngram` reports an inflated median, with the per-request evidence. The DFlash numbers in amendment 12 are checked and clean.
+**Disposition:** **accepted measurement, and it settles the target for agentic traffic.** On a prompt shape with a stable prefix the LCP cache reuses essentially the whole prompt and cuts prefill ~7x. Tau on tool-call syntax is low, so speculation contributes little there and TTFT is what matters.
 
-## What was seen
+## Fixture
 
-`HIPFIRE_NGRAM_DRAFT_K=16 HIPFIRE_NGRAM_MIN_COUNT=1` on the bench's default
-prompt gave tau=11.70 and 88-107 tok/s across three runs, against AR 29.20. That
-is 3.0-3.7x, and tau=11.70 with K=16 implies 74% per-token acceptance — on a
-prose prompt, for a model-free bigram drafter. Suspicious on its face.
+New committed session fixture: [`benchmarks/prompts/session_tool_call.json`](../../benchmarks/prompts/session_tool_call.json).
+Turn 1 is a fixed system block (six tool schemas plus rules); turns 2-5 are
+agentic-coding requests against a `src/pool.rs` thread pool. Every later turn
+re-renders turn 1 verbatim, which is what the `session_coding.json` fixture
+lacks: its turn 1 is short and its eight turns are independent questions, so at
+most a few hundred tokens were ever reusable.
 
-## What it is
+| item | value |
+|---|---|
+| harness | `serve_harness.py --mode session --session benchmarks/prompts/session_tool_call.json --model C:/tmp/bonsai-2-27b.ptq1 --speculation dflash --draft qwen35-27b-dflash-mq4.hfq --kv q8 --thinking off --sampling greedy --max-tokens 96` |
+| model md5 | `8abae179f984e2461cbf0fece6a8606f` |
+| daemon md5 | `d16936d0b456d237fc27b13e683598f9` |
 
-Per-request tau from one bench invocation (`--runs 3 --warmups 2`):
+## Result
 
-```
-req 1 (warmup):  tau=0.00   tok/s=25.3   (10 tok, 9 windows)
-req 2 (run 1):   tau=0.02   tok/s=29.7   (128 tok, 125 windows)
-req 3 (run 2):   tau=11.70  tok/s=106.8  (128 tok, 10 windows)
-req 4 (run 3):   tau=11.70  tok/s=106.5  (128 tok, 10 windows)
-```
+| turn | ctx | cached | prefill | tau | gen |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 317 | 0 | 1023 ms | 3.33 | 26 |
+| 2 | 371 | 343 | 140 ms | 0.87 | 28 |
+| 3 | 431 | 399 | 142 ms | 1.33 | 28 |
+| 4 | 485 | 459 | 151 ms | 0.67 | 15 |
+| 5 | 535 | 500 | 199 ms | 1.80 | 28 |
 
-**The true number is request 2: tau=0.02, 29.7 tok/s — identical to AR.** The
-bench submits the same prompt on every run, and the n-gram drafter's bigram
-cache survives across requests within the daemon, so from the third request on
-the drafter proposes the model's own previous output and it is accepted
-verbatim. The reported median is the median of the two cache-hit runs.
+`cached == ctx - 28` on every turn after the first: the whole prefix is reused
+and only the new user turn is prefilled. Prefill falls from 1023 ms cold to
+140-199 ms, about **7x**. The run was clean (`runaway=0 empty=0 attractor=0
+retrieval_miss=0`) and the model emitted real tool syntax
+(`<tool_call><function=read_file>...`), so the shape is representative.
 
-`hipfire run` on the same prompt with the same env gives tau=0.02 and text
-byte-identical to AR, which is the same measurement made once.
+Contrast amendment 12's `session_coding` run, where `cached` stalled at 256 for
+five of eight turns and prefill stayed at 775-2853 ms. Same mechanism, same
+binary; the difference is whether consecutive turns share a prefix. **The cache's
+value is a property of the traffic shape, not of the engine.**
 
-This is the failure `AGENTS.md` names directly: *"Tight stddev on a spec-decode
-bench is SUSPICIOUS, not reassuring ... Always eyeball the decoded output when
-tau comes back unusually high — single-token attractor failures pass every
-statistical gate as fake wins."* Here it is not an attractor but a drafter cache,
-and the tell is the same: a number too good for the drafter that produced it.
+## Tau on tool-call syntax is low
 
-## The DFlash numbers are clean
+0.67-3.33 across five turns, against 10.55 on the copy-heavy fixture. Tool-call
+syntax is generated, not copied, so a drafter has little to match. For agentic
+traffic this inverts the priority: output is short (15-28 tokens here), so decode
+tok/s barely matters and **TTFT dominates the wall clock**. The prefix cache is
+the lever that moves it, and the speculation machinery is close to irrelevant.
 
-Same per-request check on the DFlash path:
+Caveat: five short turns is a small sample, and the per-turn decode numbers
+(5.9-15.2 tok/s) include warmup. The prefill and `cached` rows are the load-bearing
+ones here; the decode rows are not.
 
-```
-req 1: tau=4.00  tok/s=28.3  (10 tok, 2 windows)
-req 2: tau=5.05  tok/s=51.6  (128 tok, 21 windows)
-req 3: tau=5.05  tok/s=50.9  (128 tok, 21 windows)
-```
+## Combined with amendment 12
 
-tau is stable at 5.05 across requests, so amendment 12's **27.90 AR vs 51.60
-DFlash (1.77x)** stands. A neural draft conditions on the actual hidden state
-per request, so it has no cross-request replay to exploit.
+For this model, in agentic serving:
 
-## What this means for the SSD work
+| lever | measured effect |
+|---|---|
+| stable prompt prefix (LCP cache) | prefill 1023 -> 140 ms, ~7x |
+| greedy instead of temp 1.0/top_p 0.95 | tau ~2x, decode ~+30% |
+| speculative decoding | tau 0.67-3.33 on tool syntax; little |
+| K above 16 | loses (cycle +45% for +11% tau) |
 
-Any drafter whose cache is keyed on tokens rather than on target state (n-gram,
-trie, and the SSD outcome cache the reference implementation adds) can replay
-across requests. **A bench that reuses one prompt cannot measure those drafters.**
-The `--spec ngram` row must be read from request 2 of a fresh daemon, or from a
-per-request tau log, not from the reported median.
-
-For the SSD replication this is load-bearing: the whole point of the outcome
-cache is that a hit returns a speculation without drafting, so a bench that
-averages over hits and misses measures the cache's warm-up curve, not the
-algorithm. The measurement must report `p_hit` and the tok/s conditioned on it,
-which is what the SSSD brief's metric list asks for.
-
-These rows are measurement, not admission.
+The first two are free and are the ones that matter. Neither is a kernel change.
