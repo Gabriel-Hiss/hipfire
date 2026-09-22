@@ -1,141 +1,83 @@
-# Amendment 10 — Ternary-Bonsai-2-27B PTQ1_0 gfx1100: batched prefill parity restored
+# Amendment 10 — Ternary-Bonsai-2-27B PTQ1_0 gfx1100: the draft lm_head was 39% of the DFlash cycle
 
 **Date:** 2026-09-22
 **Lifecycle:** `historical`
-**Amends:** [`2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md`](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md) and amendments [1](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-1.md) through [9](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-9.md), all unchanged.
-**Disposition:** **correctness fix.** Amendment 9 recorded that the batched prefill did not meet the parity gate. This closes it: two activation-basis bugs, both the same class, one in the batched QKVZA arm and one in the fused rotate helpers.
+**Amends:** [`2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md`](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md) and amendments [1](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-1.md), [2](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-2.md), [3](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-3.md), [4](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-4.md), [5](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-5.md), [6](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-6.md), [7](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-7.md), [8](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-8.md), [9](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-9.md), all unchanged.
+**Disposition:** **accepted perf change.** Speculative-decode throughput only; the AR decode path, the verify, and the logits parity rows in amendments 1–9 are untouched. This amendment does not address amendment 9's batched-prefill divergence, which remains open and still gates any claim about the batched path's logits.
 
 ## Fixture
 
-As amendment 6. `hipfire.exe` md5 `260f68ddbd4af27aa6ab2c2f4ff6cc91`,
-`daemon.exe` md5 `ed5c023b1358610f2ff3c44d33178334`, revision `080b0e581`.
-
-## Parity
-
-Pinned prompt `[48,25,220,16,10,16,28]` against the fork's saved logits:
-
-| path | correlation | RMSE | argmax | top-10 |
-|---|---:|---:|---|---|
-| per-token `forward_scratch` | 0.99996763 | 0.012999 | 248046 | identical |
-| batched, before | 0.04258281 | 4.006916 | 99301 | DIFFER |
-| **batched, after** | **0.99996864** | **0.013200** | **248046** | **identical** |
-
-The batched path is now equivalent to the per-token reference on the same
-prompt, and that reference is the recorded baseline. The daemon takes the
-batched path for prompts up to 32 tokens regardless of `prefill_batched`
-(`verify_decouple` overrides it, amendment 9), so this is the path a user's
-short prompt actually takes.
-
-## Bug 1: the gate projections read the rotated activation
-
-`batch_chunk_delta_net_attn`'s QKVZA arm handed all four projections
-`pbs.x_rot_batch`:
-
-```rust
-run_proj_gemm(gpu, &layer.wqkv,   &pbs.x_rot_batch, &pbs.dn_qkv_batch,   n)?;
-run_proj_gemm(gpu, &layer.wz,     &pbs.x_rot_batch, &pbs.dn_z_batch,     n)?;
-run_proj_gemm(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch,  n)?;
-run_proj_gemm(gpu, &layer.w_alpha,&pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
-```
-
-Prism's checkpoints mix bases inside one layer: wqkv/wz are PTQ1G128H and carry
-the checkpoint's Prism-Hadamard fold, while w_alpha/w_beta stay **BF16** and were
-quantized against the plain rmsnorm. The unrotated pair was therefore dotted
-against the wrong basis.
-
-This is exactly the defect `a7f40fb56` fixed for the per-token path
-(`shared_rotation_disagrees` → `GemvInput::Raw`). The batched path never got the
-fix because this model was **rejected** from it until the BF16 arm was admitted
-in `c9ebd40f2`.
-
-A mixed layer now emits both buffers and each projection reads the one its dtype
-needs; a uniform layer keeps the single fused launch. `mixed_basis` is computed
-from the four dtypes, so checkpoints where all four are folded still take the
-fused path.
-
-## Bug 2: the fused rotate helpers used the MQ FWHT on Prism weights
-
-`rotate_x_mq_batched_for` has had this branch all along:
-
-```rust
-if matches!(next_linear.gpu_dtype, DType::TQ2G128H | DType::PTQ1G128H) {
-    return gpu.rotate_x_prism_hadamard(x, x_rot, k, batch_size);
-}
-```
-
-`fused_rmsnorm_rotate_mq_batched_for` and `fused_silu_mul_rotate_mq_batched_for`
-did **not**. Every activation that reached a Prism weight through them was
-rotated with the MagnumQuant FWHT instead of the Prism-Hadamard:
-
-- the FFN's gate/up preamble (the helper takes `w_gate`, which is PTQ1G128H);
-- the `w_down` input (the helper takes `w_down`, also PTQ1G128H).
-
-Both now take the Prism branch: rmsnorm/silu_mul into the destination, then
-`rotate_x_prism_hadamard` in place. In place is safe because the rotation stages
-each block through LDS before writing any output.
-
-## How it was localized
-
-`dump_hidden_localize` (an existing helper, gated behind `HIPFIRE_DUMP_HIDDEN`)
-diffing `.pertoken` against `.batched` per layer, with `HIPFIRE_FORWARD_LOWERED=0`
-so the per-token path takes the hand arms that carry the GDN dumps.
-
-| checkpoint | per-token vs batched |
+| item | value |
 |---|---|
-| layer-0 embedding | **bit-identical** |
-| GDN input `v` | 6137 / 6144 differ |
-| GDN input `alpha`, `beta` | 48 / 48 differ |
-| GDN output | 0 / 6144 differ (after bug 1) |
-| gated-norm output | 0 / 6144 differ (after bug 1) |
-| state after `wo` + residual | 3.5e-5 relative |
-| **layer-0 output** | **5067 / 5120, 56% relative** |
+| model | `C:/tmp/bonsai-2-27b.ptq1`, md5 `8abae179f984e2461cbf0fece6a8606f`, 5.94 GB |
+| draft | `qwen35-27b-dflash-mq4.hfq` |
+| gpu | gfx1100, HIP 7.2 |
+| harness | `hipfire bench --spec dflash --backend noslots --workload stateless --max-tokens 128`, 3 runs / 2 warmups, fresh process |
+| binaries | `hipfire.exe` `f106081ce811691042be2b3a2d2b55fc`, `daemon.exe` `c69e3f83bd5434c32c4aae960eddb155` |
+| prompt | `def fibonacci(n):` (inline, not a committed fixture file) |
 
-The post-`wo` row is what split the two bugs: everything up to the attention
-output was already at accumulation noise, and the divergence was created between
-there and the layer output, which is the FFN.
+## What was wrong
 
-Ruled out along the way, each with a measurement: `gemm_bf16_xf32_batched`
-(1.007e-5 against a CPU oracle at the real 48x5120x7 shape),
-`gemm_ptq1g128_wmma` (7.6e-6 / 4.2e-5 against the scalar),
-`rotate_x_prism_hadamard` (5.245e-6 at batch 1/2/4/8/64/256, width 5120),
-the Q/K repeat-interleave convention (both kernels use `kh*ratio + r`), and
-`gated_delta_net_q8_batch_seq`'s launch geometry.
+`spec_step_dflash`'s draft-side lm_head carried its own inline dtype list,
+`use_batched_gemm`, separate from `dflash_enqueue_verify_lm_head`'s. The verify
+head had gained a PTQ1G128H arm; the draft head had not. So for a PTQ1G128H
+trunk the draft head fell through to the per-row loop: `(B-1)` serial gemvs
+against the 248320x5120 output head, every cycle.
 
-## Rejected: making the batched GDN use the decode's kernel
+Decomposing the K=8 cycle (115 ms) from measured quantities:
 
-`gated_delta_net_q8_batch_seq` and `gated_delta_net_q8_compact` are one source
-compiled with different `HIPFIRE_GDN_MIN_BLOCKS` / `HIPFIRE_GDN_QK_HEAD_DIV`, so
-their register allocation and FMA fusion differ. Measured with a channel test
-(`test_gdn_batch_vs_pertoken`): token 0 bit-identical from a zero state, then
-3457 / 5036 / 5566 of 6144 elements apart at tokens 1 / 2 / 3, because the Q8
-state requant turns a 1-ULP difference into a full quantization step.
+| term | ms |
+|---|---:|
+| first verify row (the target's weight read; 1000/31.0 from AR decode) | 32 |
+| 8 marginal verify rows (from the K=8 -> K=16 slope, +33 ms / 8 rows) | 33 |
+| draft forward (measured by the `ssd_fan_out` probe) | 5 |
+| **unexplained** | **45** |
 
-Routing the batched prefill through N per-token `_compact` launches closed that
-gap (GDN output 140/6144 → 0/6144) but **made end-to-end parity slightly worse**
-(0.99996734 / 0.013633 against 0.99996864 / 0.013200 without it), so it is not
-taken. The GDN divergence is real but sits below the noise floor the parity gate
-measures.
+The 45 ms residual is the draft lm_head's per-row loop: 9 serial gemvs plus 9
+downloads. The draft forward was 4% of the cycle; the head was 39%.
 
-## Performance
+## Change
 
-| | before the fixes | after |
-|---|---:|---:|
-| prefill (canonical bench) | 234.3 tok/s | **234.6 tok/s** |
-| TTFT | 100.8 ms | 102.3 ms |
-| decode | 36.1 tok/s | 34.5 tok/s |
-| prefill 64 / 256 / 1024 | 371.8 / 372.0 / 373.5 | **367.2 / 400.4 / 398.1** |
+Replace the inline `matches!` with the shared
+`dflash_batched_lm_head_supported` helper (which already held the same set),
+add `PTQ1G128H` to it, and add the matching arm: one Prism-Hadamard rotation
+over the `(B-1)` hidden rows via `rotate_x_mq_batched_for` (which routes
+PTQ1/TQ2 to `rotate_x_prism_hadamard`), then one `gemm_ptq1g128_wmma`.
 
-The fixes cost nothing measurable: the extra rmsnorm launch in a mixed layer and
-the un-fused rotate are offset by no longer rotating activations that are then
-discarded.
+## Measured
 
-## Disposition
+| K | before | after |
+|---:|---|---|
+| 8 | 44.7 tok/s, tau 4.08 | **53.1 tok/s, tau 4.08** |
+| 12 | — | 52.9 tok/s, tau 4.08 |
+| 16 | 41.3 tok/s, tau 5.05 | **66.1 tok/s, tau 5.05** |
+| 20 | — | 32.9 tok/s, tau 3.38 |
+| 24 | 21.2 tok/s, tau 3.54 | 28.1 tok/s, tau 3.54 |
+| 31 | — | 21.6 tok/s, tau 2.53 |
 
-The batched prefill meets the parity gate. Amendments 3, 4, 6 and 8's throughput
-rows are now measurements of an accepted path: **prefill 34 → 234.6 tok/s,
-TTFT 706 → 102.3 ms**, flat across 64/256/1024, with the fork parity held.
+Tau is identical at every K measured on both sides (8, 16, 24), so the batched
+head emits exactly the tokens the per-row loop emitted. K=16 is the new
+optimum; before this change K=16 lost to K=8 because the head's cost scaled
+with the position count while the extra acceptances did not pay for it.
 
-The two ceilings of amendment 6 stand unchanged and are still the reason the
-3000 and 80 tok/s targets are not reachable.
+## Caveats
 
-These rows are measurement, not admission.
+- **Single prompt.** `def fibonacci(n):` is inline, not a committed fixture, so
+  this row is not comparable to a benchmark that pins a prompt md5. Re-measure
+  against `benchmarks/prompts/` before quoting an absolute number.
+- **Not bit-identical to AR at greedy.** AR and DFlash agree for the first 11
+  tokens on this prompt, then diverge for the remaining 9 and do not
+  re-synchronize within 48 tokens. That is one near-tie argmax flip cascading
+  through greedy decode, which
+  [`docs/investigations/2026-08-03-ds4-cdna3-arch-gate-gaps.md`](../investigations/2026-08-03-ds4-cdna3-arch-gate-gaps.md)
+  documents as expected ("DSpark is not bit-identical to AR at greedy... a
+  flipped argmax at a near-tie is an exact-token-id rejection in the accept
+  path"). Acceptance of 5 of 16 drafts per cycle (`tau 5.05`) is not consistent
+  with a broken verify; a wrong forward would give `alpha ~ 0`. This change
+  touches the draft's proposal head only, never the verify, so it cannot have
+  introduced the divergence.
+- **Tau, not logits, is the correctness signal here.** The draft head affects
+  only which tokens are proposed. Acceptance, and therefore the emitted
+  sequence, is decided by the verify, which this change does not touch.
+- Amendment 9's batched-prefill divergence is untouched and still open. It
+  bounds what any throughput row in this series can claim.

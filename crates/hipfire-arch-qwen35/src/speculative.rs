@@ -248,6 +248,7 @@ fn dflash_batched_lm_head_supported(dtype: rdna_compute::DType) -> bool {
             | rdna_compute::DType::MQ3G256
             | rdna_compute::DType::HFQ6G256
             | rdna_compute::DType::MQ6G256
+            | rdna_compute::DType::PTQ1G128H
     )
 }
 
@@ -4193,20 +4194,7 @@ pub fn spec_step_dflash(
         // for later rejection acceptance. The greedy GPU-argmax path is kept
         // intact for temp == 0 so we don't regress that case.
         let w_out = &target.weights.output;
-        let use_batched_gemm = matches!(
-            w_out.gpu_dtype,
-            rdna_compute::DType::Q8_0
-                | rdna_compute::DType::HFQ4G256
-                | rdna_compute::DType::MQ4G256
-                | rdna_compute::DType::MQ4G256V2
-                | rdna_compute::DType::MQ6G256V2
-                | rdna_compute::DType::MQ5G256V2
-                | rdna_compute::DType::MQ3G256V2
-                | rdna_compute::DType::MQ2G256V2
-                | rdna_compute::DType::MQ3G256
-                | rdna_compute::DType::HFQ6G256
-                | rdna_compute::DType::MQ6G256,
-        );
+        let use_batched_gemm = dflash_batched_lm_head_supported(w_out.gpu_dtype);
         if use_batched_gemm {
             // Unified batched path: one GEMM over B-1 rows, GPU-side argmax,
             // download just (B-1) × 4 bytes of indices.
@@ -4236,6 +4224,27 @@ pub fn spec_step_dflash(
                         &w_out.buf,
                         w_out.gpu_dtype,
                         &hidden_rows,
+                        &logits_batch,
+                        w_out.m,
+                        w_out.k,
+                        batch,
+                    )?;
+                }
+                rdna_compute::DType::PTQ1G128H => {
+                    // Prism ternary head. Same integer matrix-unit kernel the
+                    // PTQ1 prefill uses, fed a Prism-Hadamard rotated hidden
+                    // state; `rotate_x_mq_batched_for` routes PTQ1/TQ2 to
+                    // rotate_x_prism_hadamard rather than the MQ FWHT. Mirrors
+                    // `dflash_enqueue_verify_lm_head`'s PTQ1 arm.
+                    assert!(
+                        batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                        "verify_scratch.rot undersized for PTQ1 draft lm_head"
+                    );
+                    let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                    llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
+                    gpu.gemm_ptq1g128_wmma(
+                        &w_out.buf,
+                        &rotated,
                         &logits_batch,
                         w_out.m,
                         w_out.k,
