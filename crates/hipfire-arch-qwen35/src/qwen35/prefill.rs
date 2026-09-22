@@ -135,7 +135,7 @@ fn dispatch_batched_gemm_epilogue(
                 let scratch = pbs.x_rot_batch.sub_offset(0, n * m);
                 run_plain_gemm_key(
                     gpu,
-                    plain_gemm_key_for(w.gpu_dtype),
+                    plain_gemm_key_for(w.gpu_dtype, gpu.arch_caps.has_wmma()),
                     &w.buf,
                     w.gpu_dtype,
                     input,
@@ -227,7 +227,7 @@ fn dispatch_batched_gemm_epilogue(
             } else if is_q8 || is_lowbit {
                 return run_plain_gemm_key(
                     gpu,
-                    plain_gemm_key_for(w.gpu_dtype),
+                    plain_gemm_key_for(w.gpu_dtype, gpu.arch_caps.has_wmma()),
                     &w.buf,
                     w.gpu_dtype,
                     input,
@@ -1364,7 +1364,7 @@ fn run_proj_gemm(
     }
     run_plain_gemm_key(
         gpu,
-        plain_gemm_key_for(w.gpu_dtype),
+        plain_gemm_key_for(w.gpu_dtype, gpu.arch_caps.has_wmma()),
         &w.buf,
         w.gpu_dtype,
         x,
@@ -1381,11 +1381,23 @@ fn run_proj_gemm(
 /// for every existing model; the low-bit formats route to their tiled prefill
 /// GEMMs. They share the Q8 call sites deliberately: none of the three has a
 /// fused qkvza/gate_up/qkv kernel, so all three want the same unfused strategy.
-fn plain_gemm_key_for(dt: DType) -> hipfire_dispatch::types::KernelKey {
+fn plain_gemm_key_for(dt: DType, has_wmma: bool) -> hipfire_dispatch::types::KernelKey {
     use hipfire_dispatch::types::KernelKey as K;
     match dt {
         DType::TQ2G128 => K::GemmTQ2G128Prefill,
-        DType::PTQ1G128H => K::GemmPTQ1G128Prefill,
+        // PTQ1_0 prefill goes through the INT8 matrix unit where one exists:
+        // measured 7.09x at the kernel level (1.40e12 -> 9.96e12 MAC/s,
+        // 5120x5120x64), and the scalar prefill GEMM is ~96% of prefill wall
+        // time, so the kernel choice IS the prefill number. The two keys share
+        // the Q8_1 activation contract and the `Y[N x M]` output layout, and the
+        // channel test pins them to 7.6e-6 on 257x512x17.
+        DType::PTQ1G128H => {
+            if has_wmma {
+                K::GemmPTQ1G128Wmma
+            } else {
+                K::GemmPTQ1G128Prefill
+            }
+        }
         DType::BQ1G128 => K::GemmBQ1G128Prefill,
         // F32 must be explicit: the `_` arm below is GemmQ8_0BatchedChunked, and
         // pointing a 4-byte-per-element tensor at a Q8_0 kernel decodes noise at
@@ -4852,7 +4864,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     } else if ffn_is_q8 || ffn_is_lowbit {
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_gate.gpu_dtype),
+            plain_gemm_key_for(layer.w_gate.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.w_gate.buf,
             layer.w_gate.gpu_dtype,
             &pbs.x_rot_batch,
@@ -4863,7 +4875,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_up.gpu_dtype),
+            plain_gemm_key_for(layer.w_up.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.w_up.buf,
             layer.w_up.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5171,7 +5183,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     } else if (qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype {
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wq.gpu_dtype),
+            plain_gemm_key_for(layer.wq.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wq.buf,
             layer.wq.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5182,7 +5194,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wk.gpu_dtype),
+            plain_gemm_key_for(layer.wk.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wk.buf,
             layer.wk.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5193,7 +5205,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wv.gpu_dtype),
+            plain_gemm_key_for(layer.wv.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wv.buf,
             layer.wv.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5540,7 +5552,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     } else if fa_ffn_is_q8 || fa_ffn_is_lowbit {
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_gate.gpu_dtype),
+            plain_gemm_key_for(layer.w_gate.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.w_gate.buf,
             layer.w_gate.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5551,7 +5563,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_up.gpu_dtype),
+            plain_gemm_key_for(layer.w_up.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.w_up.buf,
             layer.w_up.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5949,7 +5961,7 @@ fn batch_chunk_delta_net_moe(
         // (wqkv/wz/w_beta/w_alpha), sibling DeltaNet QKVZA path.
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wqkv.gpu_dtype),
+            plain_gemm_key_for(layer.wqkv.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wqkv.buf,
             layer.wqkv.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5960,7 +5972,7 @@ fn batch_chunk_delta_net_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wz.gpu_dtype),
+            plain_gemm_key_for(layer.wz.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wz.buf,
             layer.wz.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5971,7 +5983,7 @@ fn batch_chunk_delta_net_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_beta.gpu_dtype),
+            plain_gemm_key_for(layer.w_beta.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.w_beta.buf,
             layer.w_beta.gpu_dtype,
             &pbs.x_rot_batch,
@@ -5982,7 +5994,7 @@ fn batch_chunk_delta_net_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.w_alpha.gpu_dtype),
+            plain_gemm_key_for(layer.w_alpha.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.w_alpha.buf,
             layer.w_alpha.gpu_dtype,
             &pbs.x_rot_batch,
@@ -6414,7 +6426,7 @@ fn batch_chunk_delta_net_moe(
         let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.m);
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
+            plain_gemm_key_for(layer.wo.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wo.buf,
             layer.wo.gpu_dtype,
             dn_wo_input,
@@ -6700,7 +6712,7 @@ fn batch_chunk_full_attn_moe(
     } else if (qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype {
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wq.gpu_dtype),
+            plain_gemm_key_for(layer.wq.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wq.buf,
             layer.wq.gpu_dtype,
             &pbs.x_rot_batch,
@@ -6711,7 +6723,7 @@ fn batch_chunk_full_attn_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wk.gpu_dtype),
+            plain_gemm_key_for(layer.wk.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wk.buf,
             layer.wk.gpu_dtype,
             &pbs.x_rot_batch,
@@ -6722,7 +6734,7 @@ fn batch_chunk_full_attn_moe(
         )?;
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wv.gpu_dtype),
+            plain_gemm_key_for(layer.wv.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wv.buf,
             layer.wv.gpu_dtype,
             &pbs.x_rot_batch,
@@ -6981,7 +6993,7 @@ fn batch_chunk_full_attn_moe(
         let scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.m);
         run_plain_gemm_key(
             gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
+            plain_gemm_key_for(layer.wo.gpu_dtype, gpu.arch_caps.has_wmma()),
             &layer.wo.buf,
             layer.wo.gpu_dtype,
             fa_wo_input,
@@ -8509,11 +8521,38 @@ mod tests {
                 !is_batchable_la(DType::HFQ2G256, arch),
                 "HFQ2G256 must fall back"
             );
+            // BF16 is no longer in this list. Prism's ternary checkpoints keep
+            // w_alpha/w_beta unquantized as BF16, and a single BF16 tensor used
+            // to reject the whole model via qwen35_layer_batch_admissible,
+            // dropping prefill to the per-token loop (measured on
+            // Ternary-Bonsai-2-27B: 34 tok/s flat from 64 to 1024 prompt
+            // tokens). It is now routed through gemm_bf16_xf32_batched by
+            // run_proj_gemm, so it is batchable wherever that kernel compiles.
             assert!(
-                !is_batchable_la(DType::BF16, arch),
-                "BF16 must fall back until the batched BF16 dispatch family is wired"
+                is_batchable_la(DType::BF16, arch),
+                "BF16 gate projections must be admitted to batched prefill"
             );
         }
+    }
+
+    /// The BF16 admission is only safe because `run_proj_gemm` intercepts BF16
+    /// before `plain_gemm_key_for` — whose `_` arm would hand a 2-byte-per-
+    /// element tensor to the Q8_0 batched kernel, which decodes noise at full
+    /// speed with no HIP error.
+    #[test]
+    fn bf16_never_reaches_plain_gemm_key_for() {
+        use hipfire_dispatch::types::KernelKey as K;
+        // The Q8_0 fallback is what BF16 must never land on.
+        assert_eq!(plain_gemm_key_for(DType::Q8_0, true), K::GemmQ8_0BatchedChunked);
+        // And PTQ1 picks the matrix-unit GEMM wherever WMMA exists.
+        assert_eq!(
+            plain_gemm_key_for(DType::PTQ1G128H, true),
+            K::GemmPTQ1G128Wmma
+        );
+        assert_eq!(
+            plain_gemm_key_for(DType::PTQ1G128H, false),
+            K::GemmPTQ1G128Prefill
+        );
     }
 
     // ── Qwen3.5 MoE dispatch predicates ──────────────────────────
