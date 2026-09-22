@@ -2078,6 +2078,14 @@ fn forward_scratch_layers(
                     gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
                 }
 
+                // DIAG: GDN inputs at layer 0, to split the divergence into
+                // "upstream of the recurrence" vs "inside it".
+                if layer_idx == 0 {
+                    dump_hidden_localize(gpu, &s.dn_v, 1, pos, v_dim, 0, "v_p");
+                    dump_hidden_localize(gpu, &s.dn_alpha, 1, pos, n_v_heads, 0, "alpha_p");
+                    dump_hidden_localize(gpu, &s.dn_beta, 1, pos, n_v_heads, 0, "beta_p");
+                }
+
                 match dn_state.quant {
                     StateQuant::FP32 => gpu.gated_delta_net_f32(
                         &s.dn_q,
@@ -2143,6 +2151,17 @@ fn forward_scratch_layers(
                     config.linear_value_head_dim,
                     config.norm_eps,
                 )?;
+                if layer_idx == 0 {
+                    dump_hidden_localize(
+                        gpu,
+                        &s.dn_normed,
+                        1,
+                        pos,
+                        n_v_heads * config.linear_value_head_dim,
+                        0,
+                        "dnorm_p",
+                    );
+                }
                 {
                     let wr = layer.wo.dispatch_ref();
                     execute_steps(
@@ -2156,6 +2175,9 @@ fn forward_scratch_layers(
                         }],
                     )
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
+                if layer_idx == 0 {
+                    dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, 0, "wo_p");
                 }
 
                 // ── FFN ──
@@ -2488,6 +2510,17 @@ fn forward_scratch_layers(
                     config.linear_value_head_dim,
                     config.norm_eps,
                 )?;
+                if layer_idx == 0 {
+                    dump_hidden_localize(
+                        gpu,
+                        &s.dn_normed,
+                        1,
+                        pos,
+                        n_v_heads * config.linear_value_head_dim,
+                        0,
+                        "dnorm_p",
+                    );
+                }
                 {
                     let wr = layer.wo.dispatch_ref();
                     execute_steps(
@@ -2501,6 +2534,9 @@ fn forward_scratch_layers(
                         }],
                     )
                     .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                }
+                if layer_idx == 0 {
+                    dump_hidden_localize(gpu, &s.x, 1, pos, config.dim, 0, "wo_p");
                 }
 
                 // ── MoE FFN ──

@@ -4208,11 +4208,45 @@ pub(crate) fn batch_chunk_delta_net_attn(
         DType::TQ2G128 | DType::PTQ1G128H | DType::BQ1G128
     );
 
+    // Prism's ternary checkpoints mix rotated and unrotated projections inside
+    // ONE layer: wqkv/wz are PTQ1G128H (carry the checkpoint's Prism-Hadamard
+    // fold) while w_alpha/w_beta stay BF16 (quantized against the plain
+    // rmsnorm). Each needs the activation in its own basis, so a mixed layer
+    // must emit BOTH buffers; a uniform layer keeps the single fused launch.
+    let mixed_basis = {
+        let rot =
+            |dt: DType| matches!(dt, DType::PTQ1G128H | DType::TQ2G128H | DType::BQ1G128);
+        let d = [
+            layer.wqkv.gpu_dtype,
+            layer.wz.gpu_dtype,
+            layer.w_beta.gpu_dtype,
+            layer.w_alpha.gpu_dtype,
+        ];
+        d.iter().any(|&dt| rot(dt)) && d.iter().any(|&dt| !rot(dt))
+    };
+
     // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
     // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
     // we reuse x_rot_batch as the "normed, unrotated" output
     // so the subsequent GEMM can read it the same way.
-    if is_mq {
+    if mixed_basis {
+        gpu.rmsnorm_batched(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            &pbs.x_norm_batch,
+            n,
+            dim,
+            config.norm_eps,
+        )?;
+        rotate_x_mq_batched_for(
+            gpu,
+            &layer.wqkv,
+            &pbs.x_norm_batch,
+            &pbs.x_rot_batch,
+            dim,
+            n,
+        )?;
+    } else if is_mq {
         // AWQ-aware: next linear is LA's fused wqkv.
         fused_rmsnorm_rotate_mq_batched_for(
             gpu,
@@ -4291,10 +4325,52 @@ pub(crate) fn batch_chunk_delta_net_attn(
         // (wqkv/wz/w_beta/w_alpha), each dispatched on its OWN dtype — Prism's
         // ternary checkpoints mix PTQ1G128H for wqkv/wz with BF16 for the gate
         // projections, and `run_proj_gemm` handles the BF16 arm.
-        run_proj_gemm(gpu, &layer.wqkv, &pbs.x_rot_batch, &pbs.dn_qkv_batch, n)?;
-        run_proj_gemm(gpu, &layer.wz, &pbs.x_rot_batch, &pbs.dn_z_batch, n)?;
-        run_proj_gemm(gpu, &layer.w_beta, &pbs.x_rot_batch, &pbs.dn_beta_batch, n)?;
-        run_proj_gemm(gpu, &layer.w_alpha, &pbs.x_rot_batch, &pbs.dn_alpha_batch, n)?;
+        //
+        // Dispatching on dtype is not enough: each projection must also read the
+        // activation in ITS OWN basis. PTQ1G128H/TQ2G128H/BQ1G128 carry the
+        // checkpoint's Prism-Hadamard fold and consume the rotated buffer; the
+        // unrotated dtypes (BF16 here) were quantized against the plain rmsnorm
+        // output and must consume `x_norm_batch`. Feeding all four the rotated
+        // activation computes the gate projections against the wrong basis and
+        // corrupts the layer. This is the same defect fixed for the per-token
+        // path in a7f40fb56 (`shared_rotation_disagrees`); the batched path
+        // never got the fix because Ternary-Bonsai-2-27B was rejected from it
+        // until the BF16 arm was admitted. Measured: alpha/beta wrong in 48/48
+        // elements at layer 0, the GDN output in 140/6144, and 64 layers
+        // amplify that into correlation 0.043 against the fork where the
+        // per-token path gives 0.99996763.
+        let rotated_basis = |dt: DType| {
+            matches!(dt, DType::PTQ1G128H | DType::TQ2G128H | DType::BQ1G128)
+        };
+        let x_for = |dt: DType| -> &GpuTensor {
+            if rotated_basis(dt) {
+                &pbs.x_rot_batch
+            } else {
+                &pbs.x_norm_batch
+            }
+        };
+        run_proj_gemm(
+            gpu,
+            &layer.wqkv,
+            x_for(layer.wqkv.gpu_dtype),
+            &pbs.dn_qkv_batch,
+            n,
+        )?;
+        run_proj_gemm(gpu, &layer.wz, x_for(layer.wz.gpu_dtype), &pbs.dn_z_batch, n)?;
+        run_proj_gemm(
+            gpu,
+            &layer.w_beta,
+            x_for(layer.w_beta.gpu_dtype),
+            &pbs.dn_beta_batch,
+            n,
+        )?;
+        run_proj_gemm(
+            gpu,
+            &layer.w_alpha,
+            x_for(layer.w_alpha.gpu_dtype),
+            &pbs.dn_alpha_batch,
+            n,
+        )?;
     } else if is_mq3_lloyd {
         // 112 B/group Lloyd-MQ3 stride; X is already FWHT-rotated.
         run_fused_qkvza_key(
@@ -4533,6 +4609,14 @@ pub(crate) fn batch_chunk_delta_net_attn(
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
     }
 
+    // DIAG: GDN inputs at layer 0, to split the divergence into "upstream of
+    // the recurrence" vs "inside it".
+    if delta_layer_idx == 0 {
+        dump_hidden_localize(gpu, &pbs.dn_v_batch, n, 0, v_dim, 0, "v_b");
+        dump_hidden_localize(gpu, &pbs.dn_alpha_batch, n, 0, n_v_heads, 0, "alpha_b");
+        dump_hidden_localize(gpu, &pbs.dn_beta_batch, n, 0, n_v_heads, 0, "beta_b");
+    }
+
     // Gated Delta Net — tree variant reads per-token S from
     // s_tape[parent] (or pre-block s_q8_init at root); linear
     // variant advances dn_state.s_matrices in place.
@@ -4724,6 +4808,18 @@ pub(crate) fn batch_chunk_delta_net_attn(
         n,
     )?;
 
+    if delta_layer_idx == 0 {
+        dump_hidden_localize(
+            gpu,
+            &pbs.dn_normed_batch,
+            n,
+            0,
+            n_v_heads * config.linear_value_head_dim,
+            0,
+            "dnorm_b",
+        );
+    }
+
     // Batched wo + residual/partial.
     //
     // For MQ weights, the decode path's weight_gemv_residual
@@ -4770,6 +4866,9 @@ pub(crate) fn batch_chunk_delta_net_attn(
         q8_wmma_arch,
         arch_has_wmma,
     )?;
+    if delta_layer_idx == 0 {
+        dump_hidden_localize(gpu, &pbs.x_batch, n, 0, dim, 0, "wo_b");
+    }
 
     Ok(())
 }
