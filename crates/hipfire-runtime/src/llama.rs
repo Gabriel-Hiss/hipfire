@@ -983,6 +983,19 @@ pub fn fused_rmsnorm_rotate_mq_batched_for(
     eps: f32,
     batch_size: usize,
 ) -> HipResult<()> {
+    if matches!(next_linear.gpu_dtype, DType::TQ2G128H | DType::PTQ1G128H) {
+        // Prism-folded weights carry the checkpoint's normalized Sylvester-Walsh
+        // -Hadamard fold, NOT the MagnumQuant FWHT. Rotating them with the FWHT
+        // computes the projection in the wrong basis. `rotate_x_mq_batched_for`
+        // already routes these dtypes to `rotate_x_prism_hadamard`; the two
+        // fused variants did not, so every activation that reached a Prism
+        // weight through them was rotated with the wrong transform.
+        //
+        // The rotation stages each block through LDS before writing, so rotating
+        // in place is safe.
+        gpu.rmsnorm_batched(x, norm_weight, x_rot, batch_size, k, eps)?;
+        return gpu.rotate_x_prism_hadamard(x_rot, x_rot, k, batch_size);
+    }
     if let Some(awq) = next_linear.awq_scale.as_ref() {
         gpu.fused_rmsnorm_rotate_mq_awq_batched(x, norm_weight, awq, x_rot, k, eps, batch_size)
     } else {
@@ -1229,6 +1242,14 @@ pub fn fused_silu_mul_rotate_mq_batched_for(
     k: usize,
     batch_size: usize,
 ) -> HipResult<()> {
+    if matches!(down_proj_weight.gpu_dtype, DType::TQ2G128H | DType::PTQ1G128H) {
+        // Same basis problem as `fused_rmsnorm_rotate_mq_batched_for`: a
+        // Prism-folded w_down needs the Prism-Hadamard, not the MQ FWHT. The
+        // rotation stages each block through LDS before writing, so rotating in
+        // place is safe.
+        gpu.silu_mul_f32(gate, up, x_rot)?;
+        return gpu.rotate_x_prism_hadamard(x_rot, x_rot, k, batch_size);
+    }
     if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
         gpu.fused_silu_mul_rotate_mq_awq_batched(gate, up, awq, x_rot, k, batch_size)
     } else {
