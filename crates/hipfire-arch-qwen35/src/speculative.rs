@@ -5437,6 +5437,22 @@ fn run_dflash_draft_for_logits(
             hipfire_runtime::llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
+            hipfire_runtime::llama::EmbeddingFormat::PTQ1G128H => {
+                gpu.embedding_lookup_ptq1g128_prism(
+                    &target.weights.token_embd,
+                    &dst,
+                    tok as usize,
+                    h,
+                )?
+            }
+            hipfire_runtime::llama::EmbeddingFormat::TQ2G128H => {
+                gpu.embedding_lookup_tq2g128_prism(
+                    &target.weights.token_embd,
+                    &dst,
+                    tok as usize,
+                    h,
+                )?
+            }
             _ => panic!("ddtree draft: unsupported target embedding format"),
         }
     }
@@ -5643,9 +5659,33 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::PTQ1G128H => {
+            // Prism ternary head. Mirrors `dflash_enqueue_verify_lm_head`'s
+            // PTQ1 arm: the batched GEMM is the same integer matrix-unit
+            // kernel the PTQ1 prefill uses, fed a Prism-Hadamard rotated
+            // hidden state (`rotate_x_mq_batched_for` routes PTQ1/TQ2 to
+            // rotate_x_prism_hadamard rather than the MQ FWHT).
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_ptq1g128_wmma(
+                &w_out.buf,
+                &rotated,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ4G256V2/MQ6G256V2/MQ5G256V2/MQ3G256V2/MQ2G256V2/MQ3G256/HFQ6G256/MQ6G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ4G256V2/MQ6G256V2/MQ5G256V2/MQ3G256V2/MQ2G256V2/MQ3G256/HFQ6G256/MQ6G256/PTQ1G128H)",
         )),
     };
     if let Err(e) = gemm_result {
@@ -5810,6 +5850,22 @@ fn run_dflash_draft_for_topk_gpu(
             }
             hipfire_runtime::llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+            }
+            hipfire_runtime::llama::EmbeddingFormat::PTQ1G128H => {
+                gpu.embedding_lookup_ptq1g128_prism(
+                    &target.weights.token_embd,
+                    &dst,
+                    tok as usize,
+                    h,
+                )?
+            }
+            hipfire_runtime::llama::EmbeddingFormat::TQ2G128H => {
+                gpu.embedding_lookup_tq2g128_prism(
+                    &target.weights.token_embd,
+                    &dst,
+                    tok as usize,
+                    h,
+                )?
             }
             _ => panic!("ddtree draft: unsupported target embedding format"),
         }
@@ -6036,9 +6092,33 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::PTQ1G128H => {
+            // Prism ternary head. Mirrors `dflash_enqueue_verify_lm_head`'s
+            // PTQ1 arm: the batched GEMM is the same integer matrix-unit
+            // kernel the PTQ1 prefill uses, fed a Prism-Hadamard rotated
+            // hidden state (`rotate_x_mq_batched_for` routes PTQ1/TQ2 to
+            // rotate_x_prism_hadamard rather than the MQ FWHT).
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_ptq1g128_wmma(
+                &w_out.buf,
+                &rotated,
+                &logits_batch,
+                w_out.m,
+                w_out.k,
+                batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ4G256V2/MQ6G256V2/MQ5G256V2/MQ3G256V2/MQ2G256V2/MQ3G256/HFQ6G256/MQ6G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ4G256V2/MQ6G256V2/MQ5G256V2/MQ3G256V2/MQ2G256V2/MQ3G256/HFQ6G256/MQ6G256/PTQ1G128H)",
         )),
     };
     if let Err(e) = gemm_result {
