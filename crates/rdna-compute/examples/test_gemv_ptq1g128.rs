@@ -166,5 +166,165 @@ fn main() {
     let scalar_delta=gotb.iter().zip(&scalar_all).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
     println!("PTQ1 prefill vs scalar max = {scalar_delta:.3e}");
     assert!(scalar_delta<2e-4,"PTQ1 prefill mismatch");
+    // Hypothesis: every passing WMMA test above used ONE dw for all rows (the
+    // mix test a single scale, the identity/pair tests 1.0), so a per-row dw
+    // indexing bug would be invisible in all of them. Vary dw per row with
+    // everything else controlled, and pair it with an equal-dw control.
+    {
+        const DM: usize = 16;
+        const DK: usize = 128;
+        const DN: usize = 16;
+        for &(name, vary_dw) in &[("dw equal   ", false), ("dw per-row ", true)] {
+            let mut pk = Vec::new();
+            for r in 0..DM {
+                let mut trits = [0i8; 128];
+                for (e, t) in trits.iter_mut().enumerate() {
+                    *t = match e % 3 {
+                        0 => 1,
+                        1 => -1,
+                        _ => 0,
+                    };
+                }
+                let d = if vary_dw { 0.1 + r as f32 * 0.05 } else { 0.5 };
+                pk.extend_from_slice(&pack_block(&trits, d));
+            }
+            let a = gpu.upload_raw(&pk, &[pk.len()]).expect("upload dw a");
+            let x: Vec<f32> = (0..DN * DK)
+                .map(|_| (next() as f32 / u32::MAX as f32) * 2.0 - 1.0)
+                .collect();
+            let dx = gpu.upload_f32(&x, &[DN * DK]).expect("upload dw x");
+            let yw = gpu.alloc_tensor(&[DN * DM], DType::F32).expect("alloc dw yw");
+            let ys = gpu.alloc_tensor(&[DN * DM], DType::F32).expect("alloc dw ys");
+            gpu.gemm_ptq1g128_wmma(&a, &dx, &yw, DM, DK, DN).expect("dw wmma");
+            gpu.gemm_ptq1g128_prefill(&a, &dx, &ys, DM, DK, DN).expect("dw scalar");
+            gpu.hip.device_synchronize().expect("sync dw");
+            let gw = gpu.download_f32(&yw).expect("dl dw wmma");
+            let gs = gpu.download_f32(&ys).expect("dl dw scalar");
+            let d = gw
+                .iter()
+                .zip(&gs)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!("  {name}: wmma-vs-scalar max = {d:.3e}");
+            if vary_dw && d >= 2e-4 {
+                // C[m][n] = dw[m] * (column-only factor), so W/S per output row
+                // reveals which row's dw the kernel actually applied.
+                println!("    out_row : W[0]      S[0]      ratio   expected dw");
+                for m in 0..DM {
+                    let w = gw[m];
+                    let s = gs[m];
+                    let ratio = if s.abs() > 1e-9 { w / s } else { f32::NAN };
+                    println!(
+                        "      {m:2}    : {w:8.4}  {s:8.4}  {ratio:6.3}   {:.3}",
+                        0.1 + m as f32 * 0.05
+                    );
+                }
+            }
+        }
+    }
+
+    // End-to-end WMMA vs scalar at realistic shapes, with random trits and
+    // random per-row/per-group scales -- the configuration that exposed the
+    // output-column dw bug.
+    for &(name, m, k, n) in &[
+        ("wmma small", 16usize, 128usize, 16usize),
+        ("wmma wide ", 257, 512, 17),
+    ] {
+        let mut pk = Vec::with_capacity(m * (k / 128) * 28);
+        for _r in 0..m {
+            for _g in 0..k / 128 {
+                let d = 0.05 + (next() % 100) as f32 / 100.0;
+                let mut trits = [0i8; 128];
+                for t in &mut trits {
+                    *t = (next() % 3) as i8 - 1;
+                }
+                pk.extend_from_slice(&pack_block(&trits, d));
+            }
+        }
+        let a = gpu.upload_raw(&pk, &[pk.len()]).expect("upload e2e a");
+        let x: Vec<f32> = (0..n * k)
+            .map(|_| (next() as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            .collect();
+        let dx = gpu.upload_f32(&x, &[n * k]).expect("upload e2e x");
+        let yw = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc e2e yw");
+        let ys = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc e2e ys");
+        gpu.gemm_ptq1g128_wmma(&a, &dx, &yw, m, k, n)
+            .expect("e2e wmma");
+        gpu.gemm_ptq1g128_prefill(&a, &dx, &ys, m, k, n)
+            .expect("e2e scalar");
+        gpu.hip.device_synchronize().expect("sync e2e");
+        let gw = gpu.download_f32(&yw).expect("dl e2e wmma");
+        let gs = gpu.download_f32(&ys).expect("dl e2e scalar");
+        let d = gw
+            .iter()
+            .zip(&gs)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("  {name} {m}x{k}x{n}: wmma-vs-scalar max = {d:.3e}");
+        assert!(d < 2e-4, "{name} end-to-end mismatch {d:.3e}");
+    }
+
+    // Kernel-level timing at a realistic prefill shape. If the WMMA only
+    // replaces the multiply, and the multiply is not the bottleneck, the
+    // kernel-level speedup will be ~1x even though the matrix unit is 33x
+    // faster than the vector integer multiply.
+    {
+        const BM: usize = 5120;
+        const BK: usize = 5120;
+        const BN: usize = 64;
+        let mut pk = Vec::with_capacity(BM * (BK / 128) * 28);
+        for _r in 0..BM {
+            for _g in 0..BK / 128 {
+                let mut trits = [0i8; 128];
+                for t in &mut trits {
+                    *t = (next() % 3) as i8 - 1;
+                }
+                pk.extend_from_slice(&pack_block(&trits, 0.5));
+            }
+        }
+        let a = gpu.upload_raw(&pk, &[pk.len()]).expect("upload bench a");
+        let x: Vec<f32> = (0..BN * BK)
+            .map(|_| (next() as f32 / u32::MAX as f32) * 2.0 - 1.0)
+            .collect();
+        let dx = gpu.upload_f32(&x, &[BN * BK]).expect("upload bench x");
+        let yw = gpu.alloc_tensor(&[BN * BM], DType::F32).expect("alloc bench yw");
+        let ys = gpu.alloc_tensor(&[BN * BM], DType::F32).expect("alloc bench ys");
+        const ITERS: usize = 20;
+        for _ in 0..3 {
+            gpu.gemm_ptq1g128_wmma(&a, &dx, &yw, BM, BK, BN).unwrap();
+            gpu.gemm_ptq1g128_prefill(&a, &dx, &ys, BM, BK, BN).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            gpu.gemm_ptq1g128_wmma(&a, &dx, &yw, BM, BK, BN).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let tw = t0.elapsed().as_secs_f64() / ITERS as f64;
+        let t1 = std::time::Instant::now();
+        for _ in 0..ITERS {
+            gpu.gemm_ptq1g128_prefill(&a, &dx, &ys, BM, BK, BN).unwrap();
+        }
+        gpu.hip.device_synchronize().unwrap();
+        let ts = t1.elapsed().as_secs_f64() / ITERS as f64;
+        let macs = (BM * BK * BN) as f64;
+        let gwb = gpu.download_f32(&yw).expect("dl bench wmma");
+        let gsb = gpu.download_f32(&ys).expect("dl bench scalar");
+        let dmax = gwb
+            .iter()
+            .zip(&gsb)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("  bench-shape correctness: wmma-vs-scalar max = {dmax:.3e}");
+        println!(
+            "  kernel {BM}x{BK}x{BN}: scalar {:.3} ms ({:.2}e12 MAC/s)  wmma {:.3} ms ({:.2}e12 MAC/s)  speedup {:.2}x",
+            ts * 1e3,
+            macs / ts / 1e12,
+            tw * 1e3,
+            macs / tw / 1e12,
+            ts / tw
+        );
+    }
+
     println!("PASS");
 }

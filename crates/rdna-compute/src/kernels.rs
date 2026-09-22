@@ -6604,6 +6604,12 @@ pub const GEMM_BF16_XF32_BATCHED_SRC: &str =
 /// it; production dispatch does not reference this source.
 pub const PROBE_WMMA_IU8_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu8.hip");
 
+/// Batched PTQ1_0 prefill GEMM on the INT8 matrix unit
+/// (`v_wmma_i32_16x16x16_iu8`). Exact integer dot, same activations as the
+/// scalar prefill kernel; see the source header.
+pub const GEMM_PTQ1G128_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma.hip");
+
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
 pub const V4F_SILU_MUL_CLAMP_SRC: &str =
