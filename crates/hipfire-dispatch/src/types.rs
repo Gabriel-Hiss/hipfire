@@ -313,6 +313,10 @@ pub enum KernelKey {
     GemmTQ2G128Prefill,
     /// Binary sibling of `GemmTQ2G128Prefill`.
     GemmPTQ1G128Prefill,
+    /// PTQ1_0 prefill through the INT8 matrix unit
+    /// (`v_wmma_i32_16x16x16_iu8`). Integer-exact, same Q8_1 activations as
+    /// `GemmPTQ1G128Prefill`; preferred wherever WMMA exists.
+    GemmPTQ1G128Wmma,
     GemmBQ1G128Prefill,
     GemmHfq4G256,
     GemmHfq4G128,
