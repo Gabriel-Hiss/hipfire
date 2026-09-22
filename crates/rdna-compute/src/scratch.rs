@@ -61,6 +61,18 @@ pub struct ScratchState {
     /// (wqkv and wz both read x_rot_batch) paid for the conversion twice. The
     /// geometry is part of the key because the block layout depends on both K
     /// and the batch.
+    ///
+    /// This cache CANNOT hit while a recorder is armed: `scratch_must_convert`
+    /// returns true whenever `capture_mode` or `is_recording` is set, so the
+    /// conversion node always lands in the captured graph / tape. Measured
+    /// with `HIPFIRE_Q81_CACHE_TRACE=1` on Ternary-Bonsai-2-27B PTQ1G128H:
+    /// **0 hits / 5500+ misses** in a 32-token dflash run, because the verify
+    /// path is graph-captured end to end. The redundant conversion between
+    /// wqkv and wz is therefore still paid on every cycle. Removing it needs
+    /// the conversion FUSED into whatever writes the source (the rotation or
+    /// rmsnorm kernel), so the graph contains one node instead of two, not a
+    /// cache lookup that capture mode will bypass. See amendment 11 of the
+    /// ternary-bonsai perf-checkpoint series.
     pub q8_1_mmq_x_source_ptr: *mut c_void,
     pub q8_1_mmq_x_source_batch: usize,
     pub q8_1_mmq_x_source_k: usize,
