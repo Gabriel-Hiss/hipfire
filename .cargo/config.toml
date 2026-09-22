@@ -25,5 +25,12 @@ fmt = ["use-scripts-fmt-changed-sh-instead-of-cargo-fmt"]
 # Windows gives the main thread a 1 MB stack unless the linker says otherwise,
 # which is not enough for the CLI's startup path (hipfire --version
 # stack-overflows). Reserve 32 MB. No effect on other targets.
+#
+# /Brepro: without it link.exe stamps the PE header with the wall-clock time of
+# the link, so the binary md5 changes on every rebuild of identical source. The
+# repo's bench convention asks for the binary md5s alongside any number, and
+# they are unverifiable as fixture identifiers without this. /Brepro replaces
+# the timestamp with a content hash. Measured: three no-op `cargo build
+# --release` runs of one tree gave three different md5s before, one after.
 [target.'cfg(windows)']
-rustflags = ["-C", "link-args=/STACK:33554432"]
+rustflags = ["-C", "link-args=/STACK:33554432 /Brepro"]
