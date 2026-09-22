@@ -1,83 +1,109 @@
-# Amendment 10 — Ternary-Bonsai-2-27B PTQ1_0 gfx1100: the draft lm_head was 39% of the DFlash cycle
+# Amendment 10 — Ternary-Bonsai-2-27B PTQ1_0 gfx1100: the draft lm_head change is a tie, and the dflash cycle is K-independent
 
 **Date:** 2026-09-22
 **Lifecycle:** `historical`
-**Amends:** [`2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md`](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md) and amendments [1](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-1.md), [2](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-2.md), [3](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-3.md), [4](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-4.md), [5](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-5.md), [6](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-6.md), [7](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-7.md), [8](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-8.md), [9](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-9.md), all unchanged.
-**Disposition:** **accepted perf change.** Speculative-decode throughput only; the AR decode path, the verify, and the logits parity rows in amendments 1–9 are untouched. This amendment does not address amendment 9's batched-prefill divergence, which remains open and still gates any claim about the batched path's logits.
+**Amends:** [`2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md`](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite.md) and amendments [1](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-1.md) through [9](2026-09-22-ternary-bonsai-ptq1-gfx1100-decode-rewrite-amendment-9.md), all unchanged.
+**Disposition:** **measurement correction, plus one structural finding.** The apparent lm_head win in this amendment's first revision was machine drift. A controlled interleaved A/B shows a tie. The K-independence of the dflash cycle is the real result, and it bounds every target in the SSD/SSSD line.
 
 ## Fixture
 
 | item | value |
 |---|---|
 | model | `C:/tmp/bonsai-2-27b.ptq1`, md5 `8abae179f984e2461cbf0fece6a8606f`, 5.94 GB |
-| draft | `qwen35-27b-dflash-mq4.hfq` |
-| gpu | gfx1100, HIP 7.2 |
-| harness | `hipfire bench --spec dflash --backend noslots --workload stateless --max-tokens 128`, 3 runs / 2 warmups, fresh process |
-| binaries | `hipfire.exe` `f106081ce811691042be2b3a2d2b55fc`, `daemon.exe` `c69e3f83bd5434c32c4aae960eddb155` |
-| prompt | `def fibonacci(n):` (inline, not a committed fixture file) |
+| draft | `qwen35-27b-dflash-mq4.hfq`, trained block size 16 |
+| gpu | gfx1100, HIP 7.2, 17.2 GB VRAM |
+| harness | `hipfire bench --spec dflash --backend noslots --workload stateless --max-tokens 128`, fresh process |
+| prompt | `def fibonacci(n):` (inline, **not** a committed fixture file; no prompt md5 to compare against) |
+| binaries | `old` `b208bc1cbc457f63ad3293d5b7730fc2`, `new` `b345e2fc4b56651d6b6d01b736a539ec` (both archived under `C:/tmp/ab/`) |
 
-## What was wrong
+`HIPFIRE_MTP_VERIFY_DECOUPLE` and `HIPFIRE_PREFILL_BATCHED` MUST be unset.
+Leaving `HIPFIRE_PREFILL_BATCHED=0` set in a shell makes the verify fall back
+to the per-token loop and moves the whole measurement: prefill 150 -> 26 tok/s,
+K=8 dflash 54 -> 11.5 tok/s, AR decode unchanged at 25.9 tok/s. A first pass at
+this A/B was run with both variables still exported from an earlier per-token
+test and produced "old == new" for the wrong reason.
 
-`spec_step_dflash`'s draft-side lm_head carried its own inline dtype list,
-`use_batched_gemm`, separate from `dflash_enqueue_verify_lm_head`'s. The verify
-head had gained a PTQ1G128H arm; the draft head had not. So for a PTQ1G128H
-trunk the draft head fell through to the per-row loop: `(B-1)` serial gemvs
-against the 248320x5120 output head, every cycle.
+## Correction: the lm_head change is a tie
 
-Decomposing the K=8 cycle (115 ms) from measured quantities:
+The draft-side lm_head in `spec_step_dflash` carried its own inline dtype list,
+separate from the verify-side one, and never got the PTQ1G128H arm. It now uses
+the shared `dflash_batched_lm_head_supported` helper with PTQ1G128H added, and
+one `gemm_ptq1g128_wmma` replaces `(B-1)` serial gemvs.
 
-| term | ms |
-|---|---:|
-| first verify row (the target's weight read; 1000/31.0 from AR decode) | 32 |
-| 8 marginal verify rows (from the K=8 -> K=16 slope, +33 ms / 8 rows) | 33 |
-| draft forward (measured by the `ssd_fan_out` probe) | 5 |
-| **unexplained** | **45** |
+Measured as an interleaved A/B, two binaries, alternating, 2 runs / 1 warmup
+each, 128 tokens:
 
-The 45 ms residual is the draft lm_head's per-row loop: 9 serial gemvs plus 9
-downloads. The draft forward was 4% of the cycle; the head was 39%.
-
-## Change
-
-Replace the inline `matches!` with the shared
-`dflash_batched_lm_head_supported` helper (which already held the same set),
-add `PTQ1G128H` to it, and add the matching arm: one Prism-Hadamard rotation
-over the `(B-1)` hidden rows via `rotate_x_mq_batched_for` (which routes
-PTQ1/TQ2 to `rotate_x_prism_hadamard`), then one `gemm_ptq1g128_wmma`.
-
-## Measured
-
-| K | before | after |
+| K | old | new |
 |---:|---|---|
-| 8 | 44.7 tok/s, tau 4.08 | **53.1 tok/s, tau 4.08** |
-| 12 | — | 52.9 tok/s, tau 4.08 |
-| 16 | 41.3 tok/s, tau 5.05 | **66.1 tok/s, tau 5.05** |
-| 20 | — | 32.9 tok/s, tau 3.38 |
-| 24 | 21.2 tok/s, tau 3.54 | 28.1 tok/s, tau 3.54 |
-| 31 | — | 21.6 tok/s, tau 2.53 |
+| 8 | 54.3, 52.5 tok/s | 54.1, 55.6 tok/s |
+| 16 | 65.0, 65.2 tok/s | 67.7, 64.5 tok/s |
 
-Tau is identical at every K measured on both sides (8, 16, 24), so the batched
-head emits exactly the tokens the per-row loop emitted. K=16 is the new
-optimum; before this change K=16 lost to K=8 because the head's cost scaled
-with the position count while the extra acceptances did not pay for it.
+**Tie at both K.** An earlier sequential before/after pair in this same session
+reported K=8 44.7 -> 53.1 and K=16 41.3 -> 66.1. Those "before" rows were taken
+in a slower machine state: the same unmodified binary now measures 54.3 at K=8
+where it measured 44.7 then. The delta was drift, not the change.
 
-## Caveats
+The change is kept anyway, as a maintainability fix: two dtype lists that must
+agree are one list now, and that divergence is what produced the per-row
+fallback in the first place. It is not a perf claim.
 
-- **Single prompt.** `def fibonacci(n):` is inline, not a committed fixture, so
-  this row is not comparable to a benchmark that pins a prompt md5. Re-measure
-  against `benchmarks/prompts/` before quoting an absolute number.
-- **Not bit-identical to AR at greedy.** AR and DFlash agree for the first 11
-  tokens on this prompt, then diverge for the remaining 9 and do not
-  re-synchronize within 48 tokens. That is one near-tie argmax flip cascading
-  through greedy decode, which
+## Structural finding: the dflash cycle does not scale with K
+
+Same fixture, single binary, 3 runs / 2 warmups:
+
+| K | tau | tok/s | windows | ms/cycle | tok/cycle |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 0.92 | 21.5 | 66 | 90.2 | 1.94 |
+| 4 | 2.26 | 34.6 | 39 | 94.9 | 3.28 |
+| 8 | 4.08 | 56.3 | 25 | 90.9 | 5.12 |
+| 16 | 5.05 | 66.2 | 21 | 92.1 | 6.10 |
+
+**The cycle is ~90 ms at every K from 2 to 16.** The marginal cost of the
+speculation rows is below the measurement floor; the cycle is a fixed cost.
+
+Two consequences:
+
+1. **The batched GEMMs amortize.** If they re-read the weights per row, the
+   cycle would grow with K. It does not, so the verify's `forward_prefill_batch`
+   and both lm_head GEMMs share one weight read across rows. Any theory that
+   blames per-row weight re-reads is refuted by this table.
+2. **Raising K is free until tau saturates.** K=16 is the optimum because the
+   draft's trained block is 16; past it tau falls (K=20 -> 3.38, K=31 -> 2.53)
+   while the cycle stays ~90 ms.
+
+## What this bounds
+
+AR decode on this model is 25.9-31 tok/s (32-39 ms per token). The dflash cycle
+is 90 ms. So ~50-55 ms per cycle is dflash-specific fixed overhead beyond the
+target's own forward, and it does not shrink with K.
+
+Every throughput target in the SSD/SSSD line is `E(K, alpha) / T_verify`:
+
+| target | needs | measured |
+|---|---|---|
+| SSD K=7-8 -> 120-180 tok/s | T_verify ~43 ms at tau 5.1 | 91 ms at K=8, tau 4.08 |
+| n-gram + SSD K=16 -> 200-350 | T_verify ~30 ms at tau 6.1 | 92 ms at K=16, tau 5.05 |
+
+**The speculation side is already at its ceiling for this draft: tau 5.05 at
+K=16 is the draft's limit, and K=16 is free.** Reaching any of those targets
+requires cutting the ~90 ms cycle, not adding speculation machinery. A megaspec,
+an outcome cache, or a branch trie all operate on a term that is already ~0.
+
+## Not established
+
+- **Where the ~50-55 ms of dflash-specific overhead goes.** The cycle is 90 ms;
+  the target's own forward is 32-39 ms; the draft forward is ~5.25 ms (measured
+  by the `ssd_fan_out` probe in amendment 11's predecessor). The rest is
+  unidentified. `HIPFIRE_PROFILE=1` and `HIPFIRE_HOST_TIMING=1` produce no
+  output on this path: the PTQ1G128H kernels are not wired to
+  `crate::profile::begin_timer`. Instrumenting that is the prerequisite for any
+  further cycle work, and it was not done here.
+- **Whether AR and DFlash are bit-identical at greedy on this model.** They are
+  not: on this prompt they agree for 11 tokens, then diverge and do not
+  re-synchronize within 48. That is consistent with one near-tie argmax flip
+  cascading through greedy decode, which
   [`docs/investigations/2026-08-03-ds4-cdna3-arch-gate-gaps.md`](../investigations/2026-08-03-ds4-cdna3-arch-gate-gaps.md)
-  documents as expected ("DSpark is not bit-identical to AR at greedy... a
-  flipped argmax at a near-tie is an exact-token-id rejection in the accept
-  path"). Acceptance of 5 of 16 drafts per cycle (`tau 5.05`) is not consistent
-  with a broken verify; a wrong forward would give `alpha ~ 0`. This change
-  touches the draft's proposal head only, never the verify, so it cannot have
-  introduced the divergence.
-- **Tau, not logits, is the correctness signal here.** The draft head affects
-  only which tokens are proposed. Acceptance, and therefore the emitted
-  sequence, is decided by the verify, which this change does not touch.
-- Amendment 9's batched-prefill divergence is untouched and still open. It
-  bounds what any throughput row in this series can claim.
+  documents as expected. Acceptance of 5 of 16 drafts per cycle is not
+  consistent with a broken verify. No logits comparison was run to settle it.
+- **Amendment 9's batched-prefill divergence** is untouched and still open. It
+  gates any logits claim on the batched path, which includes the verify.
