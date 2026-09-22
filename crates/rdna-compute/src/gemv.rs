@@ -6159,6 +6159,12 @@ impl Gpu {
         }
     }
 
+    /// Rows per workgroup in `kernels/src/gemv_ptq1g128.hip`'s
+    /// `gemv_ptq1g128` (`PTQ1_ROW_TILE`). Must match the kernel's define: the
+    /// grid below is `ceil(M / this)`, and the kernel reads it as
+    /// `blockIdx.x * PTQ1_ROW_TILE`.
+    const GEMV_PTQ1G128_ROW_TILE: usize = 2;
+
     pub fn gemv_ptq1g128(
         &mut self,
         a_raw: &GpuTensor,
@@ -6186,7 +6192,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_ptq1g128", bytes);
         let result = self.launch_maybe_blob(
             "gemv_ptq1g128",
-            [m as u32, 1, 1],
+            [m.div_ceil(Self::GEMV_PTQ1G128_ROW_TILE) as u32, 1, 1],
             [32, 1, 1],
             0,
             &mut params,
