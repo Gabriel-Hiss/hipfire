@@ -1121,6 +1121,20 @@ pub static FIELDS: &[ConfigField] = &[
         "DFlash speculation length K. 0 = the draft checkpoint's trained block size."
     ),
     field!(
+        "speculation.ssd_fan_out",
+        "ssd_fan_out",
+        Speculation,
+        ModelLoad,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 32 },
+        true,
+        false,
+        Some("HIPFIRE_SSD_FAN_OUT"),
+        "SSD megaspec fan-out: pre-draft one block per predicted verification \
+         outcome so a cache hit returns a speculation without drafting. \
+         0 = plain speculative decoding."
+    ),
+    field!(
         "speculation.dflash",
         "dflash_mode",
         Speculation,

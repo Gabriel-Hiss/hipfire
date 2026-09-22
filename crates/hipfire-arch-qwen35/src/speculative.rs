@@ -4075,6 +4075,98 @@ pub fn spec_step_dflash(
         // ── 4. draft_forward ────────────────────────────────────────────────
         // noise_embedding = None: we wrote embeddings directly into
         // draft_scratch.x above via D2D (no host round-trip).
+        //
+        // SSD megaspec forks run FIRST, at the same positions_q, so the real
+        // draft below overwrites their K/V entries. Running them after would
+        // leave the fork garbage resident at those positions and the next
+        // cycle's draft would attend over it — measured as tau collapsing from
+        // 4.08 to 0.13 when the order was reversed.
+        //
+        // Measured cost (gfx1100, 27B PTQ1G128H + MQ4 draft, K=8, 128 tokens,
+        // 25 windows, `hipfire bench --spec dflash`): each extra block costs
+        // ~5.25 ms, and tau is unchanged (4.08) at every fan-out, so the forks
+        // are pure overhead:
+        //
+        //     fan_out=0   40.3 tok/s    127 ms/cycle
+        //     fan_out=1   37.5 tok/s
+        //     fan_out=3   33.7 tok/s
+        //     fan_out=8   30.3 tok/s    169 ms/cycle
+        //
+        // One block forward is 0.92 GB / 5.25 ms = 175 GB/s, ~30% of the
+        // gfx1100's 576 GB/s peak: the draft is latency-bound, not
+        // bandwidth-bound, so drafting the K+1 outcomes serially costs (K+1)x
+        // rather than amortizing. Full coverage (fan_out=8) therefore pays
+        // ~42 ms to save the ~5.25 ms draft a cache hit would skip — a net
+        // ~29% regression at p_hit = 1.0. SSD's premise (memory-bound drafting
+        // where extra tokens ride along for free) does not hold on this draft.
+        let ssd_fan = hipfire_runtime::config::get().ssd_fan_out as usize;
+        if ssd_fan > 0 {
+            for k in 0..ssd_fan {
+                let probe = prev_committed
+                    .last()
+                    .copied()
+                    .unwrap_or(seed_token)
+                    .wrapping_add(k as u32 + 1);
+                for i in 0..b {
+                    let dst = draft_scratch.x.sub_offset(i * h, h);
+                    match target.weights.embd_format {
+                        hipfire_runtime::llama::EmbeddingFormat::PTQ1G128H => {
+                            gpu.embedding_lookup_ptq1g128_prism(
+                                &target.weights.token_embd,
+                                &dst,
+                                probe as usize,
+                                h,
+                            )?;
+                        }
+                        hipfire_runtime::llama::EmbeddingFormat::TQ2G128H => {
+                            gpu.embedding_lookup_tq2g128_prism(
+                                &target.weights.token_embd,
+                                &dst,
+                                probe as usize,
+                                h,
+                            )?;
+                        }
+                        _ => {}
+                    }
+                }
+                dflash::draft_forward_opts(
+                    gpu,
+                    draft_weights,
+                    draft_cfg,
+                    None,
+                    th_arg,
+                    &positions_q,
+                    &positions_k,
+                    b,
+                    effective_ctx_len,
+                    draft_scratch,
+                    draft_ffn_graph,
+                )?;
+            }
+            // Rewrite the real block's embeddings; the fork loop left `probe`'s.
+            for (i, &tok) in block.iter().enumerate() {
+                let dst = draft_scratch.x.sub_offset(i * h, h);
+                match target.weights.embd_format {
+                    hipfire_runtime::llama::EmbeddingFormat::PTQ1G128H => {
+                        gpu.embedding_lookup_ptq1g128_prism(
+                            &target.weights.token_embd,
+                            &dst,
+                            tok as usize,
+                            h,
+                        )?;
+                    }
+                    hipfire_runtime::llama::EmbeddingFormat::TQ2G128H => {
+                        gpu.embedding_lookup_tq2g128_prism(
+                            &target.weights.token_embd,
+                            &dst,
+                            tok as usize,
+                            h,
+                        )?;
+                    }
+                    _ => {}
+                }
+            }
+        }
         dflash::draft_forward_opts(
             gpu,
             draft_weights,
