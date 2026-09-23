@@ -13966,7 +13966,11 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_wmma", bytes);
         let result = self.launch_maybe_blob(
             "gemm_ptq1g128_wmma",
-            [m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1],
+            [
+                m.div_ceil(16) as u32,
+                n.div_ceil(if self.arch == "gfx1100" { 32 } else { 16 }) as u32,
+                1,
+            ],
             [32, 1, 1],
             0,
             &mut params,

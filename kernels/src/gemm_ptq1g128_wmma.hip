@@ -37,11 +37,16 @@
 // low 4 bits selecting the A row and the B column; C[j] lands at
 // C[2*j + (tid>>4)][tid & 15].
 //
-// Grid:  [ceil(M/16), ceil(N/16)]
-// Block: [32] (wave32, one wave per workgroup)
-// LDS:   0 -- the trit decode is register-resident and redundant across the two
-//        lane halves, mirroring gemm_q8_0_wmma's recipe.
+// Grid:  [ceil(M/16), ceil(N/(16*PTQ1_BATCH_TILES))]
+// Block: [32] (wave32, one wave per workgroup).
 typedef int __attribute__((ext_vector_type(4))) i8x16;
+// gfx1100 benefits from sharing one ternary decode across two token tiles.
+// Keep the original single-tile path on unmeasured architectures.
+#if defined(__gfx1100__)
+#define PTQ1_BATCH_TILES 2
+#else
+#define PTQ1_BATCH_TILES 1
+#endif
 typedef int __attribute__((ext_vector_type(8))) i32x8;
 
 #define QK8_1 32
@@ -80,21 +85,22 @@ extern "C" __global__ void gemm_ptq1g128_wmma(
     int M, int K, int N
 ) {
     const int row_start = blockIdx.x * 16;
-    const int col_start = blockIdx.y * 16;
+    const int col_start = blockIdx.y * (16 * PTQ1_BATCH_TILES);
     const int tid = threadIdx.x;
     if (row_start >= M || col_start >= N) return;
 
     const int my_row = row_start + (tid & 15);
     const int safe_row = (my_row < M) ? my_row : (M - 1);
-    const int my_col = col_start + (tid & 15);
-    const int safe_col = (my_col < N) ? my_col : 0;
 
     const int groups = K / 128;
     const unsigned char* row_base = A + (long long)safe_row * groups * 28;
 
-    float acc[8];
+    float acc[PTQ1_BATCH_TILES][8];
     #pragma unroll
-    for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+    for (int bt = 0; bt < PTQ1_BATCH_TILES; ++bt) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) acc[bt][j] = 0.0f;
+    }
 
     for (int g = 0; g < groups; ++g) {
         const unsigned char* q = row_base + g * 28;
@@ -116,13 +122,7 @@ extern "C" __global__ void gemm_ptq1g128_wmma(
             __builtin_memcpy(&h, &bits, 2);
             dwrow[j] = (float)h;
         }
-        // Pre-decode the whole 128-trit group ONCE, branchless.
-        //
-        // The per-element `ptq1_tile_trit` costs up to four conditional
-        // multiplies plus two branches per trit, because extracting digit t of a
-        // byte needs t multiplies. Walking each byte's digits in order instead
-        // costs exactly one multiply per trit with no branches: the base-3
-        // recurrence already produces all five digits as it advances.
+        // Walk each packed byte's base-3 digits once for the eight WMMA fragments.
         signed char trits[128];
         #pragma unroll
         for (int m = 0; m < 16; ++m) {
@@ -154,38 +154,48 @@ extern "C" __global__ void gemm_ptq1g128_wmma(
                 trits[120 + d * 2 + h] = (signed char)((int)(w >> 8) - 1);
             }
         }
-        const signed char* xq = (Xq + (long long)g * N + safe_col)->qs;
-        // The 16 consecutive activation bytes for a sub-block ARE the B fragment
-        // (byte b of word w is element w*4+b). Loading them as one i8x16 beats
-        // assembling the four words byte by byte: that cost ~40 ALU ops per
-        // fragment against 320 WMMA ops per block, and it was the larger half of
-        // the packing, since the activation needs no decode at all.
-        const i8x16* xq_v = (const i8x16*)xq;
+        // Reuse the decoded ternary row across token tiles on gfx1100.
+        const block_q8_1_mmq* xq[PTQ1_BATCH_TILES];
+        #pragma unroll
+        for (int bt = 0; bt < PTQ1_BATCH_TILES; ++bt) {
+            const int col = col_start + bt * 16 + (tid & 15);
+            xq[bt] = Xq + (long long)g * N + (col < N ? col : 0);
+        }
 
         #pragma unroll
         for (int s = 0; s < 4; ++s) {
-            const float dx = (float)(Xq + (long long)g * N + safe_col)->ds4[2 * s];
+            float dx[PTQ1_BATCH_TILES];
+            #pragma unroll
+            for (int bt = 0; bt < PTQ1_BATCH_TILES; ++bt) dx[bt] = (float)xq[bt]->ds4[2 * s];
             #pragma unroll
             for (int half = 0; half < 2; ++half) {
                 const int t = s * 2 + half;
                 i8x16 av;
                 PTQ1_PACK16(av, trits[t * 16 + w * 4 + b]);
-                const i8x16 bv = xq_v[t];
-                i32x8 part = {0, 0, 0, 0, 0, 0, 0, 0};
-                part = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
-                    true, av, true, bv, part, false);
                 #pragma unroll
-                for (int j = 0; j < 8; ++j) acc[j] += (dwrow[j] * dx) * (float)part[j];
+                for (int bt = 0; bt < PTQ1_BATCH_TILES; ++bt) {
+                    const i8x16 bv = ((const i8x16*)xq[bt]->qs)[t];
+                    i32x8 part = {0, 0, 0, 0, 0, 0, 0, 0};
+                    part = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                        true, av, true, bv, part, false);
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        acc[bt][j] += (dwrow[j] * dx[bt]) * (float)part[j];
+                }
             }
         }
     }
 
-    if (my_col >= N) return;
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int out_row = row_start + 2 * j + (tid >> 4);
-        if (out_row < M) {
-            Y[(long long)my_col * M + out_row] = acc[j];
+    for (int bt = 0; bt < PTQ1_BATCH_TILES; ++bt) {
+        const int my_col = col_start + bt * 16 + (tid & 15);
+        if (my_col >= N) continue;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int out_row = row_start + 2 * j + (tid >> 4);
+            if (out_row < M) {
+                Y[(long long)my_col * M + out_row] = acc[bt][j];
+            }
         }
     }
 }
