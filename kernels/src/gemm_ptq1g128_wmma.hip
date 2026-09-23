@@ -42,10 +42,12 @@
 typedef int __attribute__((ext_vector_type(4))) i8x16;
 // gfx1100 benefits from sharing one ternary decode across two token tiles.
 // Keep the original single-tile path on unmeasured architectures.
+#ifndef PTQ1_BATCH_TILES
 #if defined(__gfx1100__)
 #define PTQ1_BATCH_TILES 2
 #else
 #define PTQ1_BATCH_TILES 1
+#endif
 #endif
 typedef int __attribute__((ext_vector_type(8))) i32x8;
 
@@ -77,8 +79,11 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "bad Q8_1 layout");
         }                                                        \
     } while (0)
 
+#ifndef PTQ1_WMMA_NAME
+#define PTQ1_WMMA_NAME gemm_ptq1g128_wmma
+#endif
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_ptq1g128_wmma(
+extern "C" __global__ void PTQ1_WMMA_NAME(
     const unsigned char* __restrict__ A,   // [M, K/128 * 28] packed PTQ1_0
     const block_q8_1_mmq* __restrict__ Xq, // [K/128 group][N]
     float* __restrict__ Y,                 // [N, M] row-major

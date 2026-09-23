@@ -13944,11 +13944,18 @@ impl Gpu {
         assert_eq!(k % 128, 0, "PTQ1G128 WMMA prefill requires K%128==0");
         self.bind_thread()?;
         let xp = self.ensure_q8_1_mmq_x(x, n, k)?;
-        self.ensure_kernel(
-            "gemm_ptq1g128_wmma",
-            kernels::GEMM_PTQ1G128_WMMA_SRC,
-            "gemm_ptq1g128_wmma",
-        )?;
+        let short_verify = self.arch == "gfx1100" && n <= 16;
+        let kernel_name = if short_verify {
+            "gemm_ptq1g128_wmma_b1"
+        } else {
+            "gemm_ptq1g128_wmma"
+        };
+        let kernel_src = if short_verify {
+            kernels::GEMM_PTQ1G128_WMMA_B1_SRC
+        } else {
+            kernels::GEMM_PTQ1G128_WMMA_SRC
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let ap = a_raw.buf.as_ptr();
         let yp = y.buf.as_ptr();
         let mi = m as i32;
@@ -13965,10 +13972,10 @@ impl Gpu {
         let bytes = crate::profile::gemm_ptq1g128_bytes(m, k, n);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_wmma", bytes);
         let result = self.launch_maybe_blob(
-            "gemm_ptq1g128_wmma",
+            kernel_name,
             [
                 m.div_ceil(16) as u32,
-                n.div_ceil(if self.arch == "gfx1100" { 32 } else { 16 }) as u32,
+                n.div_ceil(if self.arch == "gfx1100" && !short_verify { 32 } else { 16 }) as u32,
                 1,
             ],
             [32, 1, 1],
