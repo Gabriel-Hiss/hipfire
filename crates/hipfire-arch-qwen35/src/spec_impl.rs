@@ -21,7 +21,7 @@ use crate::qwen35;
 use crate::speculative::{
     apply_topp_trunc, download_hidden_block, sample_categorical,
     scatter_hidden_block_to_interleaved, verify_dflash_block, xorshift_next_unit, DeltaNetSnapshot,
-    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
+    GdnTape, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -56,14 +56,15 @@ fn argmax(logits: &[f32]) -> u32 {
 }
 
 /// Qwen3.5 target-verify scratch for a model-free speculator. Owns the
-/// per-position lm_head/argmax buffers (`VerifyScratch`), the pre-verify
-/// recurrent+EF snapshot (`DeltaNetSnapshot`), and a `num_extract = 0` hidden
-/// ring (zero buffers — it only satisfies `verify_dflash_block`'s required
-/// `&mut` arg; nothing is written or read).
+/// per-position lm_head/argmax buffers, the recurrent+EF snapshot, and a
+/// hidden ring. The gfx1100 PTQ1 path also records GDN innovations during
+/// verify so partial acceptance does not rerun all target projections.
 pub struct Qwen35SpecScratch {
     verify_scratch: VerifyScratch,
     hidden_rb: HiddenStateRingBuffer,
     target_snap: DeltaNetSnapshot,
+    gdn_tape: Option<GdnTape>,
+    tape_valid: bool,
 }
 
 impl SpecScratch for Qwen35SpecScratch {
@@ -76,6 +77,8 @@ impl SpecScratch for Qwen35SpecScratch {
             verify_scratch,
             hidden_rb,
             target_snap,
+            gdn_tape,
+            tape_valid: _,
         } = *self;
         verify_scratch.free_gpu(gpu);
         // `HiddenStateRingBuffer` has no `free_gpu`; free its buffers directly
@@ -87,6 +90,9 @@ impl SpecScratch for Qwen35SpecScratch {
             let _ = gpu.free_tensor(t);
         }
         target_snap.free_gpu(gpu);
+        if let Some(tape) = gdn_tape {
+            tape.free_gpu(gpu);
+        }
     }
 }
 
@@ -150,10 +156,23 @@ impl SpecTarget for ModelSlot {
         let target_snap = DeltaNetSnapshot::new_for(gpu, &self.dn_state)
             .map_err(|e| format!("Qwen35SpecScratch DeltaNetSnapshot: {e}"))?;
         // EF residual is folded into DeltaNetSnapshot (empty when EF off).
+        let gdn_tape = if num_extract == 0
+            && self.weights.output.gpu_dtype == DType::PTQ1G128H
+            && gpu.arch == "gfx1100"
+        {
+            Some(
+                GdnTape::new_for_config(gpu, &self.config, block_size)
+                    .map_err(|e| format!("Qwen35SpecScratch GdnTape: {e}"))?,
+            )
+        } else {
+            None
+        };
         Ok(Box::new(Qwen35SpecScratch {
             verify_scratch,
             hidden_rb,
             target_snap,
+            gdn_tape,
+            tape_valid: false,
         }))
     }
 
@@ -228,13 +247,22 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
+        s.tape_valid = s.gdn_tape.is_some()
+            && qwen35::prefill_batch_pbs_eligible(
+                &self.weights,
+                &self.config,
+                &self.dn_state,
+                block.len(),
+                gpu.arch.as_str(),
+                true,
+            );
         let out = verify_dflash_block(
             gpu,
             self,
             block,
             position,
             &mut s.hidden_rb,
-            None,  // gdn_tape: rewind by replay in commit_prefix, no tape
+            s.gdn_tape.as_mut().filter(|_| s.tape_valid),
             false, // greedy: GPU argmax, no full-logit D2H
             &s.verify_scratch,
         )
@@ -262,6 +290,15 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
+        s.tape_valid = s.gdn_tape.is_some()
+            && qwen35::prefill_batch_pbs_eligible(
+                &self.weights,
+                &self.config,
+                &self.dn_state,
+                block.len(),
+                gpu.arch.as_str(),
+                true,
+            );
         // Sampled verify. Run the verify forward with want_full_logits=FALSE: it
         // leaves the per-position logits in `verify_scratch.logits` (GPU) and
         // costs only a discarded GPU argmax — NOT the B×vocab logit D2H. Then do
@@ -278,7 +315,7 @@ impl SpecTarget for ModelSlot {
             block,
             position,
             &mut s.hidden_rb,
-            None,  // gdn_tape: rewind by replay in commit_prefix, no tape
+            s.gdn_tape.as_mut().filter(|_| s.tape_valid),
             false, // logits stay on-GPU in verify_scratch.logits; no full D2H
             &s.verify_scratch,
         )
@@ -344,11 +381,9 @@ impl SpecTarget for ModelSlot {
         if accept_len >= draft_len {
             return Ok(());
         }
-        // Partial: rewind recurrent + s_ef to pre-verify, then replay the
-        // committed prefix with the SAME batched forward the verify used (GDN
-        // numerics must match the accepted argmax). The stale FullAttention KV at
-        // [position+accept+1 .. position+block.len()) is overwritten by the next
-        // verify before it can be read as context.
+        // Partial: rewind recurrent state and replay the captured GDN inputs
+        // when the verify used the batched path. The stale FullAttention KV
+        // suffix is overwritten by the next verify.
         let s = scratch
             .as_any_mut()
             .downcast_mut::<Qwen35SpecScratch>()
@@ -356,21 +391,35 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .restore_to(&mut self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
-        qwen35::forward_prefill_batch(
-            gpu,
-            &self.weights,
-            &self.config,
-            &block[..accept_len + 1],
-            position,
-            &mut self.kv_cache,
-            &mut self.dn_state,
-            &self.scratch,
-            None,
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| e.to_string())?;
+        if s.tape_valid {
+            s.gdn_tape
+                .as_ref()
+                .unwrap()
+                .replay_gdn(
+                    gpu,
+                    &self.weights,
+                    &self.config,
+                    &mut self.dn_state,
+                    accept_len + 1,
+                )
+                .map_err(|e| e.to_string())?;
+        } else {
+            qwen35::forward_prefill_batch(
+                gpu,
+                &self.weights,
+                &self.config,
+                &block[..accept_len + 1],
+                position,
+                &mut self.kv_cache,
+                &mut self.dn_state,
+                &self.scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 
@@ -428,6 +477,7 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
+        s.tape_valid = false;
         let out = verify_dflash_block(
             gpu,
             self,
@@ -487,6 +537,7 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
+        s.tape_valid = false;
         // Sampled verify: leave the per-position logits on-GPU in
         // verify_scratch.logits (want_full_logits=false), softmax+nucleus on-device,
         // then draw categorically on the host — mirroring verify_block_sampled.
