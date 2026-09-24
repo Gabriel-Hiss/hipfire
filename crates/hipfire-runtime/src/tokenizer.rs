@@ -19,12 +19,12 @@ use std::sync::OnceLock;
 /// instead of on the whole prompt, restoring the canonical O(N) shape
 /// with bounded per-chunk constants.
 ///
-/// Lookahead `\s+(?!\S)` is omitted from the canonical pattern; the
-/// `regex` crate doesn't support lookaround and the surviving `\s+`
-/// branch matches the same byte spans. Order of alternation preserves
-/// the priority the reference encoders use, so chunking boundaries
-/// match HF tokenizers' Split-then-ByteLevel pipeline byte-for-byte
-/// (verified against locked niah_4k token md5).
+/// The canonical pattern ends in `\s+(?!\S)|\s+`. The `regex` crate has no
+/// lookaround, so the pattern here ends in `\s+` alone and
+/// [`gpt2_pretok_chunks`] restores the lookahead: a whitespace run followed
+/// by a non-whitespace character gives its last character to the next chunk,
+/// which is how `"    if"` becomes `"   "` + `" if"` in HF tokenizers and
+/// llama.cpp rather than `"    "` + `"if"`.
 const GPT2_PRETOK_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
 
 fn gpt2_pretok_re() -> &'static Regex {
@@ -32,6 +32,34 @@ fn gpt2_pretok_re() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(GPT2_PRETOK_PATTERN)
             .expect("GPT2_PRETOK_PATTERN must compile — pattern is a const")
+    })
+}
+
+/// Pre-tokenize `text` into chunks with the semantics of the canonical
+/// pattern, including its `\s+(?!\S)` alternative.
+///
+/// In the canonical pattern a whitespace-only match that does not end in a
+/// newline can only come from `\s+(?!\S)` or `\s+`; the regex's maximal run
+/// is followed either by end of text (the lookahead holds, the run stays
+/// whole) or by a non-whitespace character, in which case `\s+(?!\S)`
+/// backtracks by one character and the freed character starts the next
+/// match. A one-character run falls through to `\s+` unchanged.
+fn gpt2_pretok_chunks(text: &str) -> impl Iterator<Item = &str> {
+    let re = gpt2_pretok_re();
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        let m = re.find_at(text, pos)?;
+        let start = m.start();
+        let mut end = m.end();
+        let chunk = &text[start..end];
+        if end < text.len() && !chunk.ends_with(['\r', '\n']) && chunk.chars().all(char::is_whitespace) {
+            let mut chars = chunk.char_indices();
+            if let (Some(_), Some((last, _))) = (chars.next(), chars.next_back()) {
+                end = start + last;
+            }
+        }
+        pos = end;
+        Some(&text[start..end])
     })
 }
 
@@ -318,6 +346,46 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
 }
 
 
+/// GGUF `tokenizer.ggml.token_type` values (llama.cpp `llama_token_type`).
+const GGUF_TOKEN_TYPE_NORMAL: i64 = 1;
+const GGUF_TOKEN_TYPE_UNKNOWN: i64 = 2;
+const GGUF_TOKEN_TYPE_CONTROL: i64 = 3;
+const GGUF_TOKEN_TYPE_USER_DEFINED: i64 = 4;
+
+/// Tokens matched verbatim in the input before BPE, sorted longest-first for
+/// greedy matching.
+///
+/// With `tokenizer.ggml.token_type` present these are the UNKNOWN, CONTROL
+/// and USER_DEFINED tokens, the set llama.cpp partitions on. Without it, the
+/// `<|...|>` / `<...>` shape is the fallback; that heuristic also catches
+/// ordinary vocab entries such as `<()>`, which then never reach BPE and
+/// split source code differently from the reference tokenizer.
+fn gguf_special_tokens(vocab: &[String], token_types: Option<&[i64]>) -> Vec<(String, u32)> {
+    let mut special_tokens: Vec<(String, u32)> = match token_types {
+        Some(types) if types.len() == vocab.len() => vocab
+            .iter()
+            .zip(types)
+            .enumerate()
+            .filter(|(_, (_, t))| {
+                matches!(**t, GGUF_TOKEN_TYPE_UNKNOWN | GGUF_TOKEN_TYPE_CONTROL | GGUF_TOKEN_TYPE_USER_DEFINED)
+            })
+            .map(|(i, (tok, _))| (tok.clone(), i as u32))
+            .collect(),
+        _ => vocab
+            .iter()
+            .enumerate()
+            .filter(|(_, tok)| {
+                (tok.starts_with("<|") && tok.ends_with("|>"))
+                    || (tok.starts_with('<') && tok.ends_with('>') && tok.len() > 3 && !tok.contains(' '))
+            })
+            .map(|(i, tok)| (tok.clone(), i as u32))
+            .collect(),
+    };
+    special_tokens.retain(|(tok, _)| !tok.is_empty());
+    special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    special_tokens
+}
+
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -388,20 +456,20 @@ impl Tokenizer {
             _ => true,
         };
 
-        // Build special tokens list: vocab entries matching <|...|> or </...> patterns
-        let mut special_tokens: Vec<(String, u32)> = Vec::new();
-        for (i, tok) in vocab.iter().enumerate() {
-            if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<")
-                    && tok.ends_with(">")
-                    && tok.len() > 3
-                    && !tok.contains(' '))
-            {
-                special_tokens.push((tok.clone(), i as u32));
-            }
-        }
-        // Sort longest-first for greedy matching
-        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let token_types: Option<Vec<i64>> = match gguf.meta("tokenizer.ggml.token_type") {
+            Some(MetaValue::Array(arr)) => Some(
+                arr.iter()
+                    .map(|v| match v {
+                        MetaValue::I32(t) => *t as i64,
+                        MetaValue::U32(t) => *t as i64,
+                        MetaValue::I64(t) => *t,
+                        _ => GGUF_TOKEN_TYPE_NORMAL,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        };
+        let special_tokens = gguf_special_tokens(&vocab, token_types.as_deref());
 
         // Resolve merges to token ids; reject inconsistent vocab/merges (#203).
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
@@ -724,18 +792,11 @@ impl Tokenizer {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        let mut special_tokens: Vec<(String, u32)> = Vec::new();
-        for (i, tok) in vocab.iter().enumerate() {
-            if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<")
-                    && tok.ends_with(">")
-                    && tok.len() > 3
-                    && !tok.contains(' '))
-            {
-                special_tokens.push((tok.clone(), i as u32));
-            }
-        }
-        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let token_types: Option<Vec<i64>> = meta
+            .get("tokenizer.ggml.token_type")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().map(|t| t.as_i64().unwrap_or(GGUF_TOKEN_TYPE_NORMAL)).collect());
+        let special_tokens = gguf_special_tokens(&vocab, token_types.as_deref());
 
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
         let byte_to_id = if is_gpt2_bpe {
@@ -1033,14 +1094,14 @@ impl Tokenizer {
         // → tokens, so `len/4` is a sane lower bound that avoids early
         // reallocs without wasting memory on short inputs.
         let mut result: Vec<u32> = Vec::with_capacity(text.len() / 4 + 1);
-        for m in gpt2_pretok_re().find_iter(text) {
-            self.encode_gpt2_chunk(m.as_str().as_bytes(), &mut result);
+        for chunk in gpt2_pretok_chunks(text) {
+            self.encode_gpt2_chunk(chunk.as_bytes(), &mut result);
         }
         result
     }
 
     /// BPE-encode a single pre-tokenized chunk (byte slice from
-    /// `gpt2_pretok_re().find_iter`) and append the resulting token ids
+    /// `gpt2_pretok_chunks`) and append the resulting token ids
     /// to `out`. Splitting this out of `encode_gpt2_bpe` lets the regex
     /// driver feed many small chunks through the same PQ machinery
     /// without re-allocating the heap/linked-list state across the full
@@ -1729,6 +1790,54 @@ fn needs_trailing_ws_strip(s: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod pretok_tests {
+    use super::*;
+
+    fn chunks(text: &str) -> Vec<&str> {
+        gpt2_pretok_chunks(text).collect()
+    }
+
+    /// The canonical `\s+(?!\S)` alternative: a whitespace run before a word
+    /// or symbol gives its last character to that word, so an indented
+    /// Python line tokenizes the way HF tokenizers and llama.cpp tokenize it.
+    #[test]
+    fn whitespace_run_yields_last_char_to_next_chunk() {
+        assert_eq!(chunks("\n    if x:"), ["\n", "   ", " if", " x", ":"]);
+        assert_eq!(chunks("a  b"), ["a", " ", " b"]);
+        assert_eq!(chunks("\treturn"), ["\treturn"]);
+        assert_eq!(chunks("x    \"\"\""), ["x", "   ", " \"\"\""]);
+    }
+
+    /// A digit cannot absorb a leading space, so the freed space stands
+    /// alone; a trailing run and a single space are left whole.
+    #[test]
+    fn whitespace_run_edges() {
+        assert_eq!(chunks("x   1"), ["x", "  ", " ", "1"]);
+        assert_eq!(chunks("x   "), ["x", "   "]);
+        assert_eq!(chunks("a b"), ["a", " b"]);
+        assert_eq!(chunks("a  \n  b"), ["a", "  \n", " ", " b"]);
+    }
+
+    /// GGUF token types decide which tokens are matched verbatim. `<()>` is
+    /// an ordinary vocab entry in Qwen's tokenizer and must reach BPE even
+    /// though it has the `<...>` shape the fallback heuristic keys on.
+    #[test]
+    fn special_tokens_follow_gguf_token_types() {
+        let vocab: Vec<String> = ["<()>", "<|im_start|>", "<think>", "x"].iter().map(|s| s.to_string()).collect();
+        let types = [
+            GGUF_TOKEN_TYPE_NORMAL,
+            GGUF_TOKEN_TYPE_CONTROL,
+            GGUF_TOKEN_TYPE_USER_DEFINED,
+            GGUF_TOKEN_TYPE_NORMAL,
+        ];
+        let typed = gguf_special_tokens(&vocab, Some(&types));
+        assert_eq!(typed, [("<|im_start|>".to_string(), 1), ("<think>".to_string(), 2)]);
+        let heuristic = gguf_special_tokens(&vocab, None);
+        assert!(heuristic.iter().any(|(t, _)| t == "<()>"));
+    }
 }
 
 #[cfg(test)]
