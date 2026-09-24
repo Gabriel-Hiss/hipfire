@@ -4970,6 +4970,36 @@ fn op_code(op: &OpBinding) -> u32 {
     op.weights.first().map(|w| w.0).unwrap_or(u32::MAX)
 }
 
+/// PTQ1 (Prism-Hadamard ternary) decode fusions: each GEMV input is produced
+/// by one launch that fuses its elementwise producer with the Prism rotation
+/// and the Q8_1 quantization, projections sharing an input run as one
+/// multi-segment GEMV, and residual adds move into the GEMV epilogue. The
+/// fused chain is bit-identical to the unfused one (`test_ptq1_fused_decode`).
+/// The Q8_1 activation lives in `s.x_rot`, which the unfused chain used for
+/// the same value in f32. `HIPFIRE_PTQ1_FUSED=0` restores the unfused chain.
+fn ptq1_fused_decode(gpu: &Gpu, ws: &[&WeightTensor]) -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_PTQ1_FUSED").as_deref() != Ok("0")
+    });
+    *ENABLED
+        && gpu.prism_hadamard_block_size() == 1024
+        && ws.iter().all(|w| w.gpu_dtype == DType::PTQ1G128H && w.k % 1024 == 0)
+}
+
+/// Plain GEMV of a projection that is not Prism-folded, reading the
+/// un-rotated normalized activation (Bonsai's BF16 alpha/beta).
+fn gemv_plain_input(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    w: &WeightTensor,
+    input: &GpuTensor,
+    out: &GpuTensor,
+) -> HipResult<()> {
+    let wr = w.dispatch_ref();
+    execute_steps(gpu, ctx, &[Step::Gemv { w: &wr, input: GemvInput::Raw(input), out }])
+        .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
 impl<'a> ForwardBindings for Qwen35Bindings<'a> {
     fn run_proj(
         &mut self,
@@ -4993,6 +5023,21 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                             &s.fa_k,
                             &s.fa_v,
                         )
+                    } else if ptq1_fused_decode(gpu, &[&l.wq, &l.wk, &l.wv]) {
+                        gpu.ptq1_rmsnorm_rotate_q8(&s.x, &l.attn_norm, Some(&s.tmp), &s.x_rot, l.wq.k, config.norm_eps)
+                            .and_then(|()| {
+                                gpu.gemv_ptq1g128_multi(
+                                    &s.x_rot,
+                                    &[
+                                        (&l.wq.buf, &s.fa_q_full, l.wq.m),
+                                        (&l.wk.buf, &s.fa_k, l.wk.m),
+                                        (&l.wv.buf, &s.fa_v, l.wv.m),
+                                    ],
+                                    l.wq.k,
+                                    false,
+                                    None,
+                                )
+                            })
                     } else {
                         qkv_via_execute_steps(
                             gpu,
@@ -5069,7 +5114,36 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         ));
                     }
                 };
-                if self.precomputed_attn_x_rot {
+                if !self.precomputed_attn_x_rot && ptq1_fused_decode(gpu, &[wqkv, wz]) {
+                    (|| {
+                        gpu.ptq1_rmsnorm_rotate_q8(&s.x, attn_norm, Some(&s.tmp), &s.x_rot, wqkv.k, config.norm_eps)?;
+                        let segs = [(&wqkv.buf, &s.dn_qkv, wqkv.m), (&wz.buf, &s.dn_z, wz.m)];
+                        // Bonsai's beta/alpha are un-rotated BF16 over the
+                        // same normalized input: fold them into the launch.
+                        let bf16_pair = (w_beta.gpu_dtype == DType::BF16
+                            && w_alpha.gpu_dtype == DType::BF16
+                            && w_beta.m == w_alpha.m
+                            && w_beta.k == wqkv.k
+                            && w_alpha.k == wqkv.k)
+                            .then(|| rdna_compute::gemv::Ptq1Bf16Pair {
+                                w: [&w_beta.buf, &w_alpha.buf],
+                                y: [&s.dn_beta, &s.dn_alpha],
+                                m: w_beta.m,
+                                x: &s.tmp,
+                            });
+                        gpu.gemv_ptq1g128_multi(&s.x_rot, &segs, wqkv.k, false, bf16_pair.as_ref())?;
+                        if bf16_pair.is_none() {
+                            for (w, out) in [(w_beta, &s.dn_beta), (w_alpha, &s.dn_alpha)] {
+                                if ptq1_fused_decode(gpu, &[w]) {
+                                    gpu.gemv_ptq1g128_multi(&s.x_rot, &[(&w.buf, out, w.m)], w.k, false, None)?;
+                                } else {
+                                    gemv_plain_input(gpu, ctx, w, &s.tmp, out)?;
+                                }
+                            }
+                        }
+                        Ok(())
+                    })()
+                } else if self.precomputed_attn_x_rot {
                     qkvza_from_prerotated_mq(
                         gpu,
                         wqkv,
@@ -5141,39 +5215,43 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     )
                 }
             }
-            q35_op::PROJ_GATE_UP => match self.layer {
-                LayerWeights::DeltaNet(l) => gate_up_via_execute_steps(
-                    gpu,
-                    ctx,
-                    &l.w_gate,
-                    &l.w_up,
-                    &l.ffn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.gate_ffn,
-                    &s.up,
-                    config.norm_eps,
-                ),
-                LayerWeights::FullAttn(l) => gate_up_via_execute_steps(
-                    gpu,
-                    ctx,
-                    &l.w_gate,
-                    &l.w_up,
-                    &l.ffn_norm,
-                    &s.x,
-                    &s.tmp,
-                    &s.x_rot,
-                    &s.gate_ffn,
-                    &s.up,
-                    config.norm_eps,
-                ),
-                _ => {
-                    return Err(DispatchError::Hip(
-                        "PROJ_GATE_UP on MoE/unknown layer".into(),
-                    ));
+            q35_op::PROJ_GATE_UP => {
+                let (w_gate, w_up, ffn_norm) = match self.layer {
+                    LayerWeights::DeltaNet(l) => (&l.w_gate, &l.w_up, &l.ffn_norm),
+                    LayerWeights::FullAttn(l) => (&l.w_gate, &l.w_up, &l.ffn_norm),
+                    _ => {
+                        return Err(DispatchError::Hip(
+                            "PROJ_GATE_UP on MoE/unknown layer".into(),
+                        ));
+                    }
+                };
+                if ptq1_fused_decode(gpu, &[w_gate, w_up]) {
+                    gpu.ptq1_rmsnorm_rotate_q8(&s.x, ffn_norm, Some(&s.tmp), &s.x_rot, w_gate.k, config.norm_eps)
+                        .and_then(|()| {
+                            gpu.gemv_ptq1g128_multi(
+                                &s.x_rot,
+                                &[(&w_gate.buf, &s.gate_ffn, w_gate.m), (&w_up.buf, &s.up, w_up.m)],
+                                w_gate.k,
+                                false,
+                                None,
+                            )
+                        })
+                } else {
+                    gate_up_via_execute_steps(
+                        gpu,
+                        ctx,
+                        w_gate,
+                        w_up,
+                        ffn_norm,
+                        &s.x,
+                        &s.tmp,
+                        &s.x_rot,
+                        &s.gate_ffn,
+                        &s.up,
+                        config.norm_eps,
+                    )
                 }
-            },
+            }
             other => return Err(DispatchError::Hip(format!("unknown PROJ opcode {other}"))),
         };
         res.map_err(|e| DispatchError::Hip(e.to_string()))
@@ -5188,6 +5266,20 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         let s = self.s;
         let res: HipResult<()> = (|| match op_code(op) {
             q35_op::RESID_WO => {
+                // The fused producer (gated norm for DeltaNet, sigmoid gate for
+                // full attention) already left the Q8_1 activation in x_rot.
+                let fused_wo = match self.layer {
+                    LayerWeights::DeltaNet(l) => (ptq1_fused_decode(gpu, &[&l.wo])
+                        && self.config.linear_value_head_dim == 128)
+                        .then_some(&l.wo),
+                    LayerWeights::FullAttn(l) if !self.fa_output_prerotated => {
+                        ptq1_fused_decode(gpu, &[&l.wo]).then_some(&l.wo)
+                    }
+                    _ => None,
+                };
+                if let Some(wo) = fused_wo {
+                    return gpu.gemv_ptq1g128_multi(&s.x_rot, &[(&wo.buf, &s.x, wo.m)], wo.k, true, None);
+                }
                 let (wo, input) = match self.layer {
                     LayerWeights::FullAttn(l) => {
                         let input = if self.fa_output_prerotated {
@@ -5251,6 +5343,10 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     LayerWeights::FullAttn(l) => &l.w_down,
                     _ => return Err(HipError::new(0, "RESID_DOWN_SWIGLU on MoE layer")),
                 };
+                if ptq1_fused_decode(gpu, &[w_down]) {
+                    gpu.ptq1_silu_mul_rotate_q8(&s.gate_ffn, &s.up, &s.x_rot, w_down.k)?;
+                    return gpu.gemv_ptq1g128_multi(&s.x_rot, &[(&w_down.buf, &s.x, w_down.m)], w_down.k, true, None);
+                }
                 hipfire_runtime::llama::weight_gemv_swiglu_residual(
                     gpu,
                     w_down,
@@ -5282,7 +5378,17 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 ));
             }
         };
-        if gated_norm_mq_rotate_enabled(gpu, config, self.n_v_heads, wo) {
+        if ptq1_fused_decode(gpu, &[wo]) && config.linear_value_head_dim == 128 {
+            gpu.ptq1_gated_norm_rotate_q8(
+                &s.dn_attn_out,
+                &s.dn_z,
+                norm_weight,
+                &s.x_rot,
+                self.n_v_heads,
+                config.linear_value_head_dim,
+                config.norm_eps,
+            )
+        } else if gated_norm_mq_rotate_enabled(gpu, config, self.n_v_heads, wo) {
             gpu.gated_norm_rotate_mq_gfx1100(
                 &s.dn_attn_out,
                 &s.dn_z,
@@ -5397,7 +5503,11 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     self.pos,
                 )?;
                 if !fused_epilogue {
-                    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                    if ptq1_fused_decode(gpu, &[wo]) {
+                        gpu.ptq1_sigmoid_mul_rotate_q8(&s.fa_attn_out, &s.fa_gate, &s.x_rot, wo.k)?;
+                    } else {
+                        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+                    }
                 }
                 self.fa_output_prerotated = fused_epilogue;
                 Ok(())
@@ -6141,6 +6251,11 @@ fn forward_scratch_layers_lowered(
     }
 
     // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
+    if ptq1_fused_decode(gpu, &[&weights.output]) {
+        let w = &weights.output;
+        gpu.ptq1_rmsnorm_rotate_q8(&s.x, &weights.output_norm, Some(&s.tmp), &s.x_rot, w.k, config.norm_eps)?;
+        return gpu.gemv_ptq1g128_multi(&s.x_rot, &[(&w.buf, &s.logits, w.m)], w.k, false, None);
+    }
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
     {
         let ctx = DispatchCtx::new(gpu);
