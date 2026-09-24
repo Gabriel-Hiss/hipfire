@@ -3713,8 +3713,12 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
-        // Graph-safe: use max_tiles so the grid is position-independent.
-        // The tile kernel exits early for tiles beyond actual seq_len.
+        // Graph-safe: the grid is position-independent. The tile kernel loops
+        // over tiles y, y + grid.y, ... below seq_len, so the grid is capped
+        // instead of spanning max_seq: at a 32K max_seq the full 1024-tile
+        // grid cost ~11 us per launch in early-exit workgroups on gfx1100
+        // against ~2 us for the few tiles a short context needs, while 64
+        // looping workgroups per head still keep every CU busy at long context.
         let max_tiles = (max_seq + tile_size - 1) / tile_size;
         // For profiling / non-graph code paths, the actual tile count:
         let actual_tiles = (seq_len_hint + tile_size - 1) / tile_size;
@@ -3722,12 +3726,14 @@ impl Gpu {
         // hipGraph's capture_mode. Its replay updates pos_buf but cannot grow a
         // recorded grid when seq_len crosses a tile boundary, so the
         // recording pass must capture the same max_tiles superset as hipGraph.
+        const Q8_TILE_GRID_CAP: usize = 64;
         let launch_tiles = replay_stable_tile_count(
             actual_tiles,
             max_tiles,
             self.graphs.capture_mode,
             self.replay.is_recording(),
-        );
+        )
+        .min(Q8_TILE_GRID_CAP);
 
         // ── Tile kernel ──
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()

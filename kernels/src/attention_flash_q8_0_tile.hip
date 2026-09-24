@@ -4,7 +4,8 @@
 
 // Flash attention tile kernel — sequential dot product + 2-pass softmax.
 //
-// Grid: [n_heads, n_tiles, 1]. Block: [32, 1, 1] (one WAVE32).
+// Grid: [n_heads, launch_tiles, 1]; workgroup y loops over tiles y, y+gridDim.y.
+// Block: [32, 1, 1] (one WAVE32).
 // LDS: tile_size floats for scores + head_dim floats for Q.
 //   head_dim=128 → (128+128)*4 = 1024 B.
 //   head_dim=256 → (128+256)*4 = 1536 B.
@@ -83,8 +84,7 @@ __device__ __forceinline__ float hipfire_attention_reduce_max_xor(float value) {
 }
 #endif
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void attention_flash_q8_0_tile(
+static __device__ __forceinline__ void attention_flash_q8_0_tile_one(
     const float* __restrict__ q,         // [n_heads, head_dim]
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -96,7 +96,8 @@ __global__ void attention_flash_q8_0_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int window                           // sliding-window span; <= 0 = full causal
+    int window,                          // sliding-window span; <= 0 = full causal
+    int tile_id
 ) {
     const int seq_len = pos_buf[0] + 1;
     // Sliding-window lower bound: keys at t < win_lo are outside the window
@@ -104,7 +105,6 @@ __global__ void attention_flash_q8_0_tile(
     const int win_lo = (window > 0) ? (seq_len - window) : 0;
     const int h = blockIdx.x;
     if (h >= n_heads) return;
-    const int tile_id = blockIdx.y;
     const int tile_start = tile_id * tile_size;
     const int tile_end = min(tile_start + tile_size, seq_len);
     if (tile_start >= seq_len) return;
@@ -388,5 +388,33 @@ __global__ void attention_flash_q8_0_tile(
         p[2 + d_base + 1] = out1;
         p[2 + d_base + 2] = out2;
         p[2 + d_base + 3] = out3;
+    }
+}
+
+// Grid: [n_heads, launch_tiles, 1]. Workgroup y handles tiles y, y + gridDim.y,
+// ... below seq_len, so the grid no longer has to span max_seq: a decode at
+// short context launched with the max_seq-sized grid spent most of the
+// launch dispatching workgroups that exit at once. Each tile's partial is
+// computed exactly as before; only which workgroup computes it changes.
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_q8_0_tile(
+    const float* __restrict__ q,         // [n_heads, head_dim]
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,        // [n_heads, max_tiles, 2 + head_dim]
+    const int* __restrict__ pos_buf,     // pos_buf[0] = last position
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn,
+    int tile_size,
+    int window                           // sliding-window span; <= 0 = full causal
+) {
+    const int seq_len = pos_buf[0] + 1;
+    for (int tile_id = blockIdx.y; tile_id * tile_size < seq_len; tile_id += gridDim.y) {
+        attention_flash_q8_0_tile_one(q, k_cache, v_cache, partials, pos_buf, n_heads, n_kv_heads,
+                                      head_dim, max_seq, scale_attn, tile_size, window, tile_id);
+        __syncthreads();
     }
 }
