@@ -4707,6 +4707,10 @@ pub const GEMV_TQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_tq2g1
 pub const ROTATE_X_PRISM_HADAMARD_SRC: &str =
     include_str!("../../../kernels/src/rotate_x_prism_hadamard.hip");
 
+/// PTQ1 decode producers fused with the Prism rotation and Q8_1 quantization
+/// (rmsnorm / silu_mul / sigmoid_mul / gated_norm -> H -> Q8_1).
+pub const PTQ1_ROTATE_Q8_SRC: &str = include_str!("../../../kernels/src/ptq1_rotate_q8.hip");
+
 /// TQ2-G128 embedding-row decode (Bonsai latent table): one row of packed
 /// ternary blocks to F32, consumed by the inverse Prism-Hadamard rotation.
 pub const EMBEDDING_LOOKUP_TQ2G128_SRC: &str =
