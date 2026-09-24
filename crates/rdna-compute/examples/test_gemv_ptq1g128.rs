@@ -326,52 +326,69 @@ fn main() {
         );
     }
 
-    // Achieved DRAM bandwidth of the decode GEMV, at an M large enough that the
-    // per-launch activation quantization (~10-20 us) is a small fraction of the
-    // kernel time. This is the number the decode ceiling rests on.
-    {
-        const GM: usize = 131072;
-        const GK: usize = 5120;
-        let groups = GK / 128;
-        let mut pk = vec![0u8; GM * groups * 28];
-        for r in 0..GM {
-            for g in 0..groups {
-                let mut trits = [0i8; 128];
-                for t in &mut trits {
-                    *t = (next() % 3) as i8 - 1;
-                }
-                let blk = pack_block(&trits, 0.5);
-                pk[(r * groups + g) * 28..(r * groups + g) * 28 + 28].copy_from_slice(&blk);
+    // Achieved DRAM bandwidth of the decode GEMV at the model's real shapes
+    // (Ternary-Bonsai-2-27B: 5120 hidden, 17408 FFN, 10240 qkv, 6144 z/out,
+    // 248320 lm_head), plus a 131072-row shape large enough that the
+    // per-launch activation quantization is a small fraction of the time.
+    // The model streams 5.6 GB per token, so no weight is ever resident in the
+    // 64 MB Infinity Cache; the loop cycles through enough copies (>= 512 MB)
+    // that a small shape cannot be served from it either.
+    for &(gm, gk) in &[
+        (131072usize, 5120usize),
+        (17408, 5120),
+        (5120, 17408),
+        (10240, 5120),
+        (6144, 5120),
+        (5120, 6144),
+        (248320, 5120),
+    ] {
+        let groups = gk / 128;
+        let mut pk = vec![0u8; gm * groups * 28];
+        for blk in pk.chunks_exact_mut(28) {
+            let mut trits = [0i8; 128];
+            for t in &mut trits {
+                *t = (next() % 3) as i8 - 1;
             }
+            blk.copy_from_slice(&pack_block(&trits, 0.5));
         }
-        let a = gpu.upload_raw(&pk, &[pk.len()]).expect("upload bw a");
-        let x: Vec<f32> = (0..GK)
+        let copies = (512usize << 20).div_ceil(pk.len()).max(1);
+        let a: Vec<_> = (0..copies)
+            .map(|_| gpu.upload_raw(&pk, &[pk.len()]).expect("upload bw a"))
+            .collect();
+        let x: Vec<f32> = (0..gk)
             .map(|_| (next() as f32 / u32::MAX as f32) * 2.0 - 1.0)
             .collect();
-        let dx = gpu.upload_f32(&x, &[GK]).expect("upload bw x");
-        let y1 = gpu.alloc_tensor(&[GM], DType::F32).expect("alloc bw y");
+        let dx = gpu.upload_f32(&x, &[gk]).expect("upload bw x");
+        let y1 = gpu.alloc_tensor(&[gm], DType::F32).expect("alloc bw y");
         const GI: usize = 20;
-        for _ in 0..3 {
-            gpu.gemv_ptq1g128(&a, &dx, &y1, GM, GK).unwrap();
+        for c in 0..3 {
+            gpu.gemv_ptq1g128(&a[c % copies], &dx, &y1, gm, gk).unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t0 = std::time::Instant::now();
-        for _ in 0..GI {
-            gpu.gemv_ptq1g128(&a, &dx, &y1, GM, GK).unwrap();
+        for c in 0..GI {
+            gpu.gemv_ptq1g128(&a[c % copies], &dx, &y1, gm, gk).unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let ms = t0.elapsed().as_secs_f64() / GI as f64 * 1e3;
-        let wbytes = (GM * groups * 28) as f64;
+        let wbytes = (gm * groups * 28) as f64;
         println!(
-            "  decode gemv bw {GM}x{GK}: {ms:.3} ms for {:.1} MB weights = {:.1} GB/s",
+            "  decode gemv bw {gm}x{gk}: {ms:.3} ms for {:.1} MB weights = {:.1} GB/s",
             wbytes / 1e6,
             wbytes / (ms * 1e-3) / 1e9
         );
-
-        // Reference: what this card can actually read, on the same allocation
-        // size. The decode ceiling is stated as a fraction of this, not of the
-        // spec sheet.
-        let n4 = (wbytes as usize / 16) * 16 / 16;
+        for t in a {
+            gpu.free_tensor(t).unwrap();
+        }
+        gpu.free_tensor(dx).unwrap();
+        gpu.free_tensor(y1).unwrap();
+    }
+    {
+        // Reference: what this card can actually read. 1 GiB is 16x the
+        // Infinity Cache, so this is DRAM, not MALL. The decode ceiling is
+        // stated as a fraction of this, not of the spec sheet.
+        const GI: usize = 20;
+        let n4 = (1usize << 30) / 16;
         let src: Vec<f32> = vec![0.0f32; n4 * 4];
         let dsrc = gpu.upload_f32(&src, &[n4 * 4]).expect("upload bw src");
         let dout = gpu.alloc_tensor(&[4], DType::F32).expect("alloc bw out");
