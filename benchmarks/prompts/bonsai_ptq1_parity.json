@@ -1,0 +1,7 @@
+{
+  "merge_sort_raw": "def merge_sort(values):\n    \"\"\"Sort a list with merge sort and return a new list.\"\"\"",
+  "chat_lru": "<|im_start|>user\nWrite a Python LRU cache class with get and put methods, O(1) each.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "rust_raw": "// Rust: parse a CSV line into fields, handling quoted commas.\nfn parse_csv_line(line: &str) -> Vec<String> {\n",
+  "chat_bug": "<|im_start|>user\nFind the bug:\n```js\nfunction sum(a){let s=0;for(let i=0;i<=a.length;i++)s+=a[i];return s}\n```<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+  "chat_ts": "<|im_start|>user\nImplement a debounce<T extends (...args: any[]) => void>(fn: T, ms: number) in TypeScript with a cancel method.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+}
