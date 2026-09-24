@@ -8,6 +8,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static GFX942_ROTATE_LIVE_VALIDATED: AtomicBool = AtomicBool::new(false);
 
+/// Two BF16 projections folded into a `gemv_ptq1g128_multi` launch: `w[i]`
+/// is `[m, K]` raw bf16, `y[i]` receives `m` f32 outputs, `x` is the
+/// un-rotated f32 input they share.
+pub struct Ptq1Bf16Pair<'a> {
+    pub w: [&'a GpuTensor; 2],
+    pub y: [&'a GpuTensor; 2],
+    pub m: usize,
+    pub x: &'a GpuTensor,
+}
+
 fn gfx942_rotate_live_validation_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX942_ROTATE_VALIDATE_LIVE")
         .ok()
@@ -2092,6 +2102,11 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs
         self.scratch
             .ensure_mq_signs_128(&self.hip, &mut self.pool, self.device_id)
+    }
+
+    /// Block width of the configured Prism Hadamard contract (0 when none).
+    pub fn prism_hadamard_block_size(&self) -> usize {
+        self.scratch.prism_hadamard_block_size
     }
 
     pub fn configure_prism_hadamard(
@@ -6160,10 +6175,10 @@ impl Gpu {
     }
 
     /// Rows per workgroup in `kernels/src/gemv_ptq1g128.hip`'s
-    /// `gemv_ptq1g128` (`PTQ1_ROW_TILE`). Must match the kernel's define: the
+    /// `gemv_ptq1g128` (`PTQ1_WG_ROWS`). Must match the kernel's define: the
     /// grid below is `ceil(M / this)`, and the kernel reads it as
-    /// `blockIdx.x * PTQ1_ROW_TILE`.
-    const GEMV_PTQ1G128_ROW_TILE: usize = 2;
+    /// `blockIdx.x * PTQ1_WG_ROWS`.
+    const GEMV_PTQ1G128_ROW_TILE: usize = 4;
 
     pub fn gemv_ptq1g128(
         &mut self,
@@ -6206,6 +6221,262 @@ impl Gpu {
                 blob
             },
         );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Q8_1 bytes a PTQ1 decode activation of width `k` occupies: the size a
+    /// caller-owned `xq` buffer for the `ptq1_*_rotate_q8` producers needs.
+    pub fn ptq1_xq_bytes(k: usize) -> usize {
+        k.div_ceil(128) * 144
+    }
+
+    /// Device pointer of the Prism sign vector for width `k`, after checking
+    /// the 1024 block the fused producers are compiled for.
+    fn ptq1_prism_signs(&self, k: usize) -> HipResult<*mut c_void> {
+        let block = self.scratch.prism_hadamard_block_size;
+        if block != 1024 || k % 1024 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("PTQ1 fused rotation needs 1024-wide Prism blocks: K={k}, block={block}"),
+            ));
+        }
+        self.scratch
+            .prism_hadamard_signs
+            .get(&k)
+            .map(|t| t.buf.as_ptr())
+            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("no Prism signs for K={k}")))
+    }
+
+    /// `rmsnorm_f32 -> rotate_x_prism_hadamard -> quantize_q8_1_mmq_ds4` in
+    /// one launch, bit-identical to the chain. `plain` receives the
+    /// un-rotated normalized vector when a non-Prism projection also reads it.
+    pub fn ptq1_rmsnorm_rotate_q8(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        plain: Option<&GpuTensor>,
+        xq: &GpuTensor,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let sp = self.ptq1_prism_signs(k)?;
+        self.ensure_kernel("ptq1_rmsnorm_rotate_q8", kernels::PTQ1_ROTATE_Q8_SRC, "ptq1_rmsnorm_rotate_q8")?;
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let pp = plain.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let yp = xq.buf.as_ptr();
+        let ni = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob("ptq1_rmsnorm_rotate_q8", [(k / 1024) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(xp);
+            blob.push_ptr(wp);
+            blob.push_ptr(sp);
+            blob.push_ptr(pp);
+            blob.push_ptr(yp);
+            blob.push_i32(ni);
+            blob.push_f32(eps);
+            blob
+        })
+    }
+
+    /// `silu_mul_f32 -> rotate -> Q8_1`, bit-identical to the chain.
+    pub fn ptq1_silu_mul_rotate_q8(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        xq: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ptq1_pair_rotate_q8("ptq1_silu_mul_rotate_q8", gate, up, xq, k)
+    }
+
+    /// `sigmoid_mul_f32 (x *= sigmoid(gate)) -> rotate -> Q8_1`, bit-identical
+    /// to the chain; `x` itself is left unmodified.
+    pub fn ptq1_sigmoid_mul_rotate_q8(
+        &mut self,
+        x: &GpuTensor,
+        gate: &GpuTensor,
+        xq: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.ptq1_pair_rotate_q8("ptq1_sigmoid_mul_rotate_q8", x, gate, xq, k)
+    }
+
+    fn ptq1_pair_rotate_q8(
+        &mut self,
+        name: &'static str,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        xq: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let sp = self.ptq1_prism_signs(k)?;
+        self.ensure_kernel(name, kernels::PTQ1_ROTATE_Q8_SRC, name)?;
+        let ap = a.buf.as_ptr();
+        let bp = b.buf.as_ptr();
+        let yp = xq.buf.as_ptr();
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(name, [(k / 1024) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(ap);
+            blob.push_ptr(bp);
+            blob.push_ptr(sp);
+            blob.push_ptr(yp);
+            blob
+        })
+    }
+
+    /// `gated_norm_f32 -> rotate -> Q8_1` for `n_heads * head_dim` values,
+    /// bit-identical to the chain.
+    pub fn ptq1_gated_norm_rotate_q8(
+        &mut self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        xq: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        assert_eq!(head_dim, 128, "ptq1_gated_norm_rotate_q8 maps one 128-wide head per wave");
+        let k = n_heads * head_dim;
+        self.bind_thread()?;
+        let sp = self.ptq1_prism_signs(k)?;
+        const NAME: &str = "ptq1_gated_norm_rotate_q8";
+        self.ensure_kernel(NAME, kernels::PTQ1_ROTATE_Q8_SRC, NAME)?;
+        let xp = x.buf.as_ptr();
+        let zp = z.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let yp = xq.buf.as_ptr();
+        let hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &zp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &eps as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(NAME, [(k / 1024) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(xp);
+            blob.push_ptr(zp);
+            blob.push_ptr(wp);
+            blob.push_ptr(sp);
+            blob.push_ptr(yp);
+            blob.push_i32(hd);
+            blob.push_f32(eps);
+            blob
+        })
+    }
+
+    /// Up to three PTQ1 GEMVs over one pre-quantized activation `xq` (from a
+    /// `ptq1_*_rotate_q8` producer) in a single launch. `segs` are
+    /// `(weights, out, rows)`; with `residual`, each row adds into `out`.
+    /// `bf16` appends two BF16 GEMVs over an un-rotated f32 input to the same
+    /// launch, bit-identical to `gemv_bf16_xf32`.
+    pub fn gemv_ptq1g128_multi(
+        &mut self,
+        xq: &GpuTensor,
+        segs: &[(&GpuTensor, &GpuTensor, usize)],
+        k: usize,
+        residual: bool,
+        bf16: Option<&Ptq1Bf16Pair<'_>>,
+    ) -> HipResult<()> {
+        assert!(
+            (1..=3).contains(&segs.len()) && k % 128 == 0,
+            "gemv_ptq1g128_multi takes 1..=3 segments and K%128==0"
+        );
+        self.bind_thread()?;
+        const NAME: &str = "gemv_ptq1g128_multi";
+        self.ensure_kernel(NAME, kernels::GEMV_PTQ1G128_SRC, NAME)?;
+        let mut a = [std::ptr::null_mut(); 3];
+        let mut y = [std::ptr::null_mut(); 3];
+        let mut m = [0i32; 3];
+        let mut blocks = 0usize;
+        for (i, (w, out, rows)) in segs.iter().enumerate() {
+            a[i] = w.buf.as_ptr();
+            y[i] = out.buf.as_ptr();
+            m[i] = *rows as i32;
+            blocks += rows.div_ceil(Self::GEMV_PTQ1G128_ROW_TILE);
+        }
+        let (bw, by, bm, bx) = match bf16 {
+            Some(p) => (
+                [p.w[0].buf.as_ptr(), p.w[1].buf.as_ptr()],
+                [p.y[0].buf.as_ptr(), p.y[1].buf.as_ptr()],
+                p.m as i32,
+                p.x.buf.as_ptr(),
+            ),
+            None => ([std::ptr::null_mut(); 2], [std::ptr::null_mut(); 2], 0, std::ptr::null_mut()),
+        };
+        blocks += 2 * bm as usize;
+        let xp = xq.buf.as_ptr();
+        let ki = k as i32;
+        let ri = i32::from(residual);
+        let mut params: Vec<*mut c_void> = vec![
+            &a[0] as *const _ as *mut c_void,
+            &y[0] as *const _ as *mut c_void,
+            &m[0] as *const _ as *mut c_void,
+            &a[1] as *const _ as *mut c_void,
+            &y[1] as *const _ as *mut c_void,
+            &m[1] as *const _ as *mut c_void,
+            &a[2] as *const _ as *mut c_void,
+            &y[2] as *const _ as *mut c_void,
+            &m[2] as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &ri as *const _ as *mut c_void,
+            &bw[0] as *const _ as *mut c_void,
+            &by[0] as *const _ as *mut c_void,
+            &bw[1] as *const _ as *mut c_void,
+            &by[1] as *const _ as *mut c_void,
+            &bm as *const _ as *mut c_void,
+            &bx as *const _ as *mut c_void,
+        ];
+        let bytes: usize = segs
+            .iter()
+            .map(|(_, _, rows)| crate::profile::gemv_ptq1g128_bytes(*rows, k))
+            .sum::<usize>()
+            + 2 * bm as usize * k * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", NAME, bytes);
+        let result = self.launch_maybe_blob(NAME, [blocks as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            for i in 0..3 {
+                blob.push_ptr(a[i]);
+                blob.push_ptr(y[i]);
+                blob.push_i32(m[i]);
+            }
+            blob.push_ptr(xp);
+            blob.push_i32(ki);
+            blob.push_i32(ri);
+            for i in 0..2 {
+                blob.push_ptr(bw[i]);
+                blob.push_ptr(by[i]);
+            }
+            blob.push_i32(bm);
+            blob.push_ptr(bx);
+            blob
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
