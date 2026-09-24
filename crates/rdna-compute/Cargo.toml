@@ -552,6 +552,10 @@ name = "test_gemv_ptq1g128"
 required-features = ["lab"]
 
 [[example]]
+name = "test_ptq1_fused_decode"
+required-features = ["lab", "deltanet"]
+
+[[example]]
 name = "test_gfx12_ds4_prefill_native"
 required-features = ["lab"]
 
