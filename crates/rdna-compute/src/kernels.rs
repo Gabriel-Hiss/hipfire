@@ -5278,6 +5278,11 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_SRC: &str =
 pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma.hip");
 
+/// gfx11 head_dim-256 flash prefill: a wave pair per 16 queries, each wave
+/// half of head_dim, four pairs sharing each K/V tile. See the source header.
+pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_PAIR_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_prefill_wmma_pair.hip");
+
 /// RDNA4 sister of ATTENTION_Q8_0_FLASH_PREFILL_WMMA_SRC. gfx12 splits
 /// each 16-wide contraction into two 8-element half-wave operands and uses
 /// the gfx12-specific WMMA builtin/output mapping.

@@ -2759,10 +2759,86 @@ impl Gpu {
         head_dim: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.flash_prefill_pair_applies(head_dim, n_heads, n_kv_heads) {
+            return self.attention_q8_0_flash_prefill_wmma_pair(
+                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, batch_size,
+            );
+        }
         self.attention_q8_0_flash_prefill_wmma_slots(
             q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, batch_size, None,
             None, None, None,
         )
+    }
+
+    /// Whether [`Self::attention_q8_0_flash_prefill_wmma`] takes the wave-pair
+    /// kernel: gfx11 (not gfx12), head_dim 256, f16 Q (no
+    /// `HIPFIRE_FLASH_PREFILL_SPLITQ`), a whole GQA ratio.
+    /// `HIPFIRE_FLASH_PREFILL_PAIR=0` keeps the one-wave kernel.
+    fn flash_prefill_pair_applies(&self, head_dim: usize, n_heads: usize, n_kv_heads: usize) -> bool {
+        static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_PAIR").as_deref() != Ok("0")
+                && hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_SPLITQ").as_deref() != Ok("1")
+        });
+        *ENABLED
+            && self.arch_caps.has_wmma_w32()
+            && !self.arch_caps.has_wmma_w32_gfx12()
+            && head_dim == 256
+            && n_kv_heads > 0
+            && n_heads % n_kv_heads == 0
+    }
+
+    /// gfx11 head_dim-256 Q8_0 flash prefill with a wave pair per 16 queries;
+    /// see `kernels/src/attention_q8_0_flash_prefill_wmma_pair.hip`. Same
+    /// inputs and output as [`Self::attention_q8_0_flash_prefill_wmma`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_prefill_wmma_pair(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const NAME: &str = "attention_q8_0_flash_prefill_wmma_pair";
+        self.ensure_kernel(NAME, kernels::ATTENTION_Q8_0_FLASH_PREFILL_WMMA_PAIR_SRC, NAME)?;
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let vp = v_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let bs = batch_size as i32;
+        let sc = 1.0f32 / 16.0; // 1 / sqrt(256)
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+        ];
+        let grid = [batch_size.div_ceil(64) as u32, n_heads as u32, 1];
+        self.launch_maybe_blob(NAME, grid, [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp);
+            b.push_ptr(kp);
+            b.push_ptr(vp);
+            b.push_ptr(op);
+            b.push_ptr(pp);
+            b.push_i32(nh);
+            b.push_i32(nkv);
+            b.push_i32(bs);
+            b.push_f32(sc);
+            b
+        })
     }
 
     /// Multi-slot variant of `attention_q8_0_flash_prefill_wmma`.
