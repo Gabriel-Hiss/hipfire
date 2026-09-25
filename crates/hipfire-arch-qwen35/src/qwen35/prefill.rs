@@ -5648,8 +5648,14 @@ pub(crate) fn batch_chunk_full_attn_attn(
     } else if batch_semantics.is_independent() {
         unreachable!("independent variant must carry active_mask");
     } else {
+        // One timer over the whole step: its kernels have no timers of their
+        // own, so without this attention is missing from prefill profiles.
+        let timer = rdna_compute::profile::begin_timer(&gpu.hip, "attention", "prefill_attend_step", 0);
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
             .map_err(|e| HipError::new(0, &e.to_string()))?;
+        if let Some(t) = timer {
+            t.finish(&gpu.hip);
+        }
     }
 
     if ptq1_prefill_fused(gpu, n, &[&layer.wo]) {
