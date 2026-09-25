@@ -14216,15 +14216,32 @@ impl Gpu {
         self.bind_thread()?;
         let xp = self.ensure_q8_1_mmq_x(x, n, k)?;
         let short_verify = self.arch == "gfx1100" && n <= 16;
-        let kernel_name = if short_verify {
-            "gemm_ptq1g128_wmma_b1"
+        // The 64x64 workgroup tile beats the 16x32 wave tile from 64 tokens
+        // up (1.3-1.9x measured on gfx1100) and loses below, where most of
+        // its tile is padding. It uses the gfx11 WMMA builtin.
+        let tiled = self.arch.starts_with("gfx11") && n > 32;
+        let (kernel_name, kernel_src, grid) = if tiled {
+            (
+                "gemm_ptq1g128_wmma_t64",
+                kernels::GEMM_PTQ1G128_WMMA_T64_SRC,
+                [m.div_ceil(64) as u32, n.div_ceil(64) as u32, 1],
+            )
+        } else if short_verify {
+            (
+                "gemm_ptq1g128_wmma_b1",
+                kernels::GEMM_PTQ1G128_WMMA_B1_SRC,
+                [m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1],
+            )
         } else {
-            "gemm_ptq1g128_wmma"
-        };
-        let kernel_src = if short_verify {
-            kernels::GEMM_PTQ1G128_WMMA_B1_SRC
-        } else {
-            kernels::GEMM_PTQ1G128_WMMA_SRC
+            (
+                "gemm_ptq1g128_wmma",
+                kernels::GEMM_PTQ1G128_WMMA_SRC,
+                [
+                    m.div_ceil(16) as u32,
+                    n.div_ceil(if self.arch == "gfx1100" { 32 } else { 16 }) as u32,
+                    1,
+                ],
+            )
         };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let ap = a_raw.buf.as_ptr();
@@ -14244,12 +14261,8 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_wmma", bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
-            [
-                m.div_ceil(16) as u32,
-                n.div_ceil(if self.arch == "gfx1100" && !short_verify { 32 } else { 16 }) as u32,
-                1,
-            ],
-            [32, 1, 1],
+            grid,
+            [if tiled { 128 } else { 32 }, 1, 1],
             0,
             &mut params,
             || {

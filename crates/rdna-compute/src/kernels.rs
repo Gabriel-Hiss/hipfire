@@ -6626,6 +6626,10 @@ pub const GEMM_PTQ1G128_WMMA_B1_SRC: &str = concat!(
     "#define PTQ1_WMMA_NAME gemm_ptq1g128_wmma_b1\n",
     include_str!("../../../kernels/src/gemm_ptq1g128_wmma.hip")
 );
+/// 64-row x 64-token workgroup-tiled PTQ1_0 prefill GEMM (gfx11 iu8 WMMA);
+/// shares one decoded weight slab across 4 waves. See the source header.
+pub const GEMM_PTQ1G128_WMMA_T64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip");
 
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).

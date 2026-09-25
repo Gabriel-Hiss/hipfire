@@ -226,9 +226,13 @@ fn main() {
     // End-to-end WMMA vs scalar at realistic shapes, with random trits and
     // random per-row/per-group scales -- the configuration that exposed the
     // output-column dw bug.
+    // N > 32 takes the 64x64 workgroup tile; M and N off the tile grid cover
+    // its row and token edges.
     for &(name, m, k, n) in &[
         ("wmma small", 16usize, 128usize, 16usize),
         ("wmma wide ", 257, 512, 17),
+        ("wmma t64  ", 257, 512, 97),
+        ("wmma t64 w", 1030, 5120, 200),
     ] {
         let mut pk = Vec::with_capacity(m * (k / 128) * 28);
         for _r in 0..m {
