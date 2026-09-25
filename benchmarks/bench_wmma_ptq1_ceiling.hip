@@ -2,57 +2,53 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Ceiling probe for the PTQ1_0 x Q8_1 prefill GEMM on RDNA3 (gfx11 wave32).
+// Ceiling probe for the PTQ1_0 prefill GEMM on RDNA3 (gfx11 wave32).
 // Compile: hipcc -O3 --offload-arch=gfx1100 -o bench_wmma_ptq1_ceiling benchmarks/bench_wmma_ptq1_ceiling.hip
-// Run:     bench_wmma_ptq1_ceiling [runs=7]
+// Run:     bench_wmma_ptq1_ceiling
 //
-// Two register-only kernels, same launch shape as the production tile
-// (128-thread workgroups, each wave a 2x2 grid of 16x16 WMMA tiles):
-//   wmma      - eight independent v_wmma_i32_16x16x16_iu8 chains: the
-//               instruction's sustained rate.
-//   format    - per 128-weight group, what the Q8_1 format obliges: two K16
-//               WMMAs per 32-wide activation sub-block into a fresh int32
-//               fragment, int->float and one FMA by that sub-block's scale per
-//               element, one FMA by the weight scale per group. No trit decode,
-//               no LDS, no memory traffic. Any kernel that keeps the per-32
-//               activation scales does at least this work per WMMA; on RDNA3
-//               the WMMA issues on the VALU, so this float work serializes with
-//               it instead of hiding behind it.
-// Prints the median over `runs` launches of each, in MAC/s.
+// Three register-only kernels at the production launch shape (128-thread
+// workgroups, each wave a 2x2 grid of 16x16 WMMA tiles):
+//   wmma       eight independent v_wmma_i32_16x16x16_iu8 chains per wave.
+//   format32   the WMMAs plus what one activation scale per 32 values costs:
+//              per 32-wide sub-block an int->float conversion and an FMA per
+//              element, per 128-weight group an FMA by the weight scale (the
+//              fork's Q8_1).
+//   format128  the same with one activation scale per 128: the group's eight
+//              WMMAs chain in int32, one conversion and FMA per group.
+// No trit decode, no LDS, no memory traffic. On RDNA3 the WMMA issues on the
+// VALU, so the float work serializes with it. Each probe launches
+// back-to-back for 1.5 s before the last ~1 s is timed: the rate a 2 s
+// prefill sustains under the board's power limit, not the first-launch boost.
+// Each kernel stays far below the ~2 s Windows TDR limit.
 
 #include <hip/hip_runtime.h>
-
-#include <algorithm>
+#include <chrono>
 #include <cstdio>
-#include <cstdlib>
-#include <vector>
-
 typedef int v8i __attribute__((ext_vector_type(8)));
 typedef int v4i __attribute__((ext_vector_type(4)));
 
-__global__ __launch_bounds__(128, 2) void probe_wmma(int iters, int* out) {
+__global__ __launch_bounds__(128, 2) void p_wmma(int iters, int* out) {
     const v4i a = (int)threadIdx.x, b = (int)threadIdx.x + 1;
     v8i c[8];
     for (int i = 0; i < 8; ++i) c[i] = (v8i)i;
-    for (int it = 0; it < iters; ++it) {
+    for (int it = 0; it < iters; ++it)
 #pragma unroll
-        for (int i = 0; i < 8; ++i)
-            c[i] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c[i], false);
-    }
+        for (int i = 0; i < 8; ++i) c[i] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c[i], false);
     int s = 0;
     for (int i = 0; i < 8; ++i) s += c[i][0];
     if (s == 0x7fffffff) out[0] = s;
 }
 
-__global__ __launch_bounds__(128, 2) void probe_format(int groups, int* out) {
+template <int S128>
+__global__ __launch_bounds__(128, 2) void p_fmt(int groups, int* out) {
     const int lane = threadIdx.x & 31;
     const float dw = 0.5f + lane * 1e-3f;
     float acc[2][2][8] = {};
     for (int g = 0; g < groups; ++g) {
         float gacc[2][2][8] = {};
+        v8i iacc[2][2] = {};
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
-            // Operands vary with g and s so no WMMA is loop-invariant.
             v4i af[2][2], bf[2][2];
 #pragma unroll
             for (int i = 0; i < 2; ++i)
@@ -66,19 +62,26 @@ __global__ __launch_bounds__(128, 2) void probe_format(int groups, int* out) {
             for (int j = 0; j < 2; ++j)
 #pragma unroll
                 for (int i = 0; i < 2; ++i) {
-                    v8i part = {0, 0, 0, 0, 0, 0, 0, 0};
-                    part = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i][0], true, bf[j][0], part, false);
-                    part = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i][1], true, bf[j][1], part, false);
+                    if (S128) {
+                        iacc[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i][0], true, bf[j][0], iacc[i][j], false);
+                        iacc[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i][1], true, bf[j][1], iacc[i][j], false);
+                    } else {
+                        v8i part = {0, 0, 0, 0, 0, 0, 0, 0};
+                        part = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i][0], true, bf[j][0], part, false);
+                        part = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i][1], true, bf[j][1], part, false);
 #pragma unroll
-                    for (int e = 0; e < 8; ++e) gacc[i][j][e] += dx * (float)part[e];
+                        for (int e = 0; e < 8; ++e) gacc[i][j][e] += dx * (float)part[e];
+                    }
                 }
         }
+        const float dx = 0.25f + g * 1e-6f + lane * 1e-4f;
 #pragma unroll
         for (int i = 0; i < 2; ++i)
 #pragma unroll
             for (int j = 0; j < 2; ++j)
 #pragma unroll
-                for (int e = 0; e < 8; ++e) acc[i][j][e] += dw * gacc[i][j][e];
+                for (int e = 0; e < 8; ++e)
+                    acc[i][j][e] += S128 ? (dw * dx) * (float)iacc[i][j][e] : dw * gacc[i][j][e];
     }
     float s = 0;
     for (int i = 0; i < 2; ++i)
@@ -87,39 +90,37 @@ __global__ __launch_bounds__(128, 2) void probe_format(int groups, int* out) {
     if (s == 1234.5f) out[0] = 1;
 }
 
-int main(int argc, char** argv) {
-    const int runs = argc > 1 ? std::atoi(argv[1]) : 7;
-    int* out = nullptr;
-    if (hipMalloc(&out, 16) != hipSuccess) return 1;
+template <class F>
+double sustained(F launch, double macs_per_launch) {
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    while (std::chrono::duration<double>(clk::now() - t0).count() < 1.5) { launch(); hipDeviceSynchronize(); }
     hipEvent_t e0, e1;
     hipEventCreate(&e0);
     hipEventCreate(&e1);
-    // Both kernels issue 32 WMMAs per loop trip per wave.
-    const int trips = 2048;
-    for (int wgs : {640, 1280, 2560}) {
-        auto measure = [&](auto kernel, int arg) {
-            hipLaunchKernelGGL(kernel, dim3(wgs), dim3(128), 0, 0, arg, out);
-            hipDeviceSynchronize();
-            std::vector<double> rates;
-            for (int r = 0; r < runs; ++r) {
-                hipEventRecord(e0);
-                hipLaunchKernelGGL(kernel, dim3(wgs), dim3(128), 0, 0, arg, out);
-                hipEventRecord(e1);
-                hipEventSynchronize(e1);
-                float ms = 0;
-                hipEventElapsedTime(&ms, e0, e1);
-                const double macs = (double)wgs * 4 * trips * 32 * 4096.0;
-                rates.push_back(macs / (ms * 1e-3) / 1e12);
-            }
-            std::sort(rates.begin(), rates.end());
-            return rates[rates.size() / 2];
-        };
-        // probe_wmma runs 8 WMMAs per iteration: trips*4 iterations = 32*trips.
-        const double w = measure(probe_wmma, trips * 4);
-        const double f = measure(probe_format, trips);
-        std::printf("workgroups %5d  wmma %6.2f e12 MAC/s  format %6.2f e12 MAC/s  (%.0f%%)\n",
-                    wgs, w, f, 100.0 * f / w);
+    hipEventRecord(e0);
+    int n = 0;
+    const auto t1 = clk::now();
+    while (std::chrono::duration<double>(clk::now() - t1).count() < 1.0) {
+        for (int i = 0; i < 4; ++i, ++n) launch();
+        hipDeviceSynchronize();
     }
-    hipFree(out);
-    return 0;
+    hipEventRecord(e1);
+    hipEventSynchronize(e1);
+    float ms = 0;
+    hipEventElapsedTime(&ms, e0, e1);
+    return macs_per_launch * n / (ms * 1e-3) / 1e12;
+}
+
+int main() {
+    int* out;
+    hipMalloc(&out, 16);
+    const int wgs = 1280, trips = 2048;
+    const double macs = (double)wgs * 4 * trips * 32 * 4096.0;
+    std::printf("wmma      %6.2f e12 MAC/s\n",
+                sustained([&] { hipLaunchKernelGGL(p_wmma, dim3(wgs), dim3(128), 0, 0, trips * 4, out); }, macs));
+    std::printf("format32  %6.2f e12 MAC/s\n",
+                sustained([&] { hipLaunchKernelGGL(p_fmt<0>, dim3(wgs), dim3(128), 0, 0, trips, out); }, macs));
+    std::printf("format128 %6.2f e12 MAC/s\n",
+                sustained([&] { hipLaunchKernelGGL(p_fmt<1>, dim3(wgs), dim3(128), 0, 0, trips, out); }, macs));
 }
