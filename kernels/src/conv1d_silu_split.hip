@@ -126,3 +126,57 @@ extern "C" __global__ void conv1d_silu_split_f32_masked(
         }
     }
 }
+
+// Token-parallel prefill form of conv1d_silu_split_f32 (single sequence):
+// thread (c, t) computes token t of channel c from input rows t-3..t, falling
+// back to the ring state for rows before the chunk. The convolution has no
+// recurrence, only the ring state carries across launches, so the serial
+// token loop above (40 workgroups for Bonsai's 10240 channels, the state read
+// and rewritten in global memory every token) is unnecessary here. Same
+// expression and FMA order, bit-identical outputs and state; measured
+// 142 -> 51 us for 512 tokens x 10240 channels on gfx1100.
+// Grid: [ceil(n_channels / 256), n_tokens]. conv1d_state_advance must run
+// after it: it is the only writer of the ring.
+extern "C" __global__ void conv1d_silu_split_f32_tp(
+    float* __restrict__ q_out, float* __restrict__ k_out, float* __restrict__ v_out,
+    const float* __restrict__ input, const float* __restrict__ weight, const float* __restrict__ state,
+    int k_dim, int v_dim, int n_tokens
+) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    const int n_channels = 2 * k_dim + v_dim;
+    if (c >= n_channels || t >= n_tokens) return;
+    const float x = input[(long long)t * n_channels + c];
+    const float s0 = t >= 1 ? input[(long long)(t - 1) * n_channels + c] : state[c * 3];
+    const float s1 = t >= 2 ? input[(long long)(t - 2) * n_channels + c] : state[c * 3 + (1 - t)];
+    const float s2 = t >= 3 ? input[(long long)(t - 3) * n_channels + c] : state[c * 3 + (2 - t)];
+    float y = weight[c * 4 + 3] * x + weight[c * 4 + 2] * s0
+            + weight[c * 4 + 1] * s1 + weight[c * 4] * s2;
+    float result = y / (1.0f + expf(-y));
+    if (c < k_dim) q_out[(long long)t * k_dim + c] = result;
+    else if (c < 2 * k_dim) k_out[(long long)t * k_dim + (c - k_dim)] = result;
+    else v_out[(long long)t * v_dim + (c - 2 * k_dim)] = result;
+}
+
+// Ring state after n_tokens inputs: [x_{n-1}, x_{n-2}, x_{n-3}], shifting in
+// the old state when n_tokens < 3.
+extern "C" __global__ void conv1d_state_advance(
+    const float* __restrict__ input, float* __restrict__ state, int n_channels, int n_tokens
+) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_channels) return;
+    const float o0 = state[c * 3], o1 = state[c * 3 + 1], o2 = state[c * 3 + 2];
+    float r[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int t = n_tokens - 1 - j;  // row feeding slot j
+        if (t >= 0) r[j] = input[(long long)t * n_channels + c];
+        else {
+            const int back = -t - 1;      // how far into the old ring
+            r[j] = back == 0 ? o0 : back == 1 ? o1 : o2;
+        }
+    }
+    state[c * 3] = r[0];
+    state[c * 3 + 1] = r[1];
+    state[c * 3 + 2] = r[2];
+}

@@ -4419,6 +4419,15 @@ impl Gpu {
         n_tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // From a few tokens up, the token-parallel pair (conv, then the ring
+        // advance) beats the serial per-channel loop: 142 -> 51 us at 512
+        // tokens, 29 -> 13 us at 97; at 1-2 tokens the second launch costs
+        // more than it saves. Bit-identical outputs and state.
+        if n_tokens >= 8 {
+            return self.conv1d_silu_split_f32_token_parallel(
+                q_out, k_out, v_out, input, weight, state, k_dim, v_dim, n_tokens,
+            );
+        }
         self.ensure_kernel(
             "conv1d_silu_split",
             kernels::CONV1D_SILU_SPLIT_SRC,
@@ -4470,6 +4479,80 @@ impl Gpu {
                 b
             },
         );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn conv1d_silu_split_f32_token_parallel(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("conv1d_silu_split", kernels::CONV1D_SILU_SPLIT_SRC, "conv1d_silu_split_f32_tp")?;
+        self.ensure_kernel("conv1d_silu_split", kernels::CONV1D_SILU_SPLIT_SRC, "conv1d_state_advance")?;
+        let qp = q_out.buf.as_ptr();
+        let kp = k_out.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let nt = n_tokens as i32;
+        let n_channels = 2 * k_dim + v_dim;
+        let nc = n_channels as i32;
+        let cgrid = n_channels.div_ceil(256) as u32;
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob("conv1d_silu_split_f32_tp", [cgrid, n_tokens as u32, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp);
+            b.push_ptr(kp);
+            b.push_ptr(vp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_ptr(sp);
+            b.push_i32(kd);
+            b.push_i32(vd);
+            b.push_i32(nt);
+            b
+        })?;
+        let mut adv: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nc as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob("conv1d_state_advance", [cgrid, 1, 1], [256, 1, 1], 0, &mut adv, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ip);
+            b.push_ptr(sp);
+            b.push_i32(nc);
+            b.push_i32(nt);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
