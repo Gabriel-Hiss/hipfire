@@ -2851,7 +2851,21 @@ pub fn draft_forward_opts(
         // Split drafts: SWA layers sliding, last full stays full.
         // All-sliding DFlash2: every layer sliding with same W.
         let is_swa_layer = windowed && (is_all_sliding_windowed || !is_full_layer);
-        if is_swa_layer {
+        if gpu.attention_dflash_gqa_split_admitted(b, cfg.n_heads, cfg.n_kv_heads, hd) && (!is_swa_layer || swa_w > b) {
+            gpu.attention_dflash_gqa_split_f32(
+                &scratch.q,
+                k_cat_l,
+                v_cat_l,
+                &scratch.attn_out,
+                &scratch.attn_partials,
+                b,
+                span + b,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                hd,
+                is_swa_layer.then_some((span, swa_w)),
+            )?;
+        } else if is_swa_layer {
             // Faithful non-causal SWA: window= swa_w, ctx_span= span
             gpu.attention_dflash_sliding_f32(
                 &scratch.q,
@@ -2865,19 +2879,6 @@ pub fn draft_forward_opts(
                 hd,
                 span,
                 swa_w,
-            )?;
-        } else if gpu.attention_dflash_gqa_split_admitted(b, cfg.n_heads, cfg.n_kv_heads, hd) {
-            gpu.attention_dflash_gqa_split_f32(
-                &scratch.q,
-                k_cat_l,
-                v_cat_l,
-                &scratch.attn_out,
-                &scratch.attn_partials,
-                b,
-                span + b,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                hd,
             )?;
         } else {
             use crate::llama::{attention_family, DispatchCtx, FullAttnParams, KernelKey};

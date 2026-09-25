@@ -12,11 +12,16 @@
 // (the key axis is split `gridDim.y` ways). Its `rep` waves are the query
 // heads sharing that KV head; K and V tiles are staged once into LDS (f16,
 // V transposed) and read by all of them. Each wave computes S^T = K Q^T with
-// the f16 WMMA, so a query's 16 scores sit in one lane pair and the
-// online softmax needs one cross-half shuffle; P is rebuilt in the A layout
-// with one more, and O stays in registers. Each workgroup writes the
-// unnormalised partial (m, l, O[128]) per (query, head, split) and
+// the f16 WMMA, so a query's 16 scores sit in one lane pair and the online
+// softmax needs one cross-half shuffle; P is rebuilt in the A layout with one
+// more, and O stays in registers. Each workgroup writes the unnormalised
+// partial (m, l, O[128]) per (query, head, split) and
 // `attention_dflash_split_merge` folds the splits.
+//
+// Sliding window: key kj is visible to query q iff kj >= key_lo0 + q (the
+// DFlash2 non-causal window `|ctx_span + q - kj| < W` gives
+// key_lo0 = ctx_span - W + 1; its upper side never binds for B < W). Full
+// attention passes a key_lo0 far below zero.
 //
 // Partials: F32 [B][n_heads][n_splits][130] = m, l, O.
 // Grid:  [n_kv_heads, n_splits]; block [32 * (n_heads / n_kv_heads)], rep <= 8.
@@ -39,7 +44,7 @@ __global__ void attention_dflash_gqa_split_f32(
     const float* __restrict__ v,
     float* __restrict__ partials,
     int B, int L, int n_heads, int n_kv_heads,
-    float scale, int tiles_per_split
+    float scale, int tiles_per_split, int key_lo0
 ) {
     __shared__ _Float16 K_lds[DGS_KT][DGS_HD];
     __shared__ _Float16 Vt_lds[DGS_HD][DGS_KT];
@@ -73,11 +78,14 @@ __global__ void attention_dflash_gqa_split_f32(
     float m_run = -INFINITY;   // for query `row`
     float l_run = 0.0f;
 
+    // No query sees a key below key_lo0, so ranges wholly below it are skipped.
     const int k_begin = split * tiles_per_split * DGS_KT;
     int k_end = k_begin + tiles_per_split * DGS_KT;
     if (k_end > L) k_end = L;
+    int kt0 = k_begin;
+    if (key_lo0 > kt0) kt0 = k_begin + ((key_lo0 - k_begin) / DGS_KT) * DGS_KT;
 
-    for (int kt = k_begin; kt < k_end; kt += DGS_KT) {
+    for (int kt = kt0; kt < k_end; kt += DGS_KT) {
         // Stage K [16 x 128] and V^T [128 x 16] as f16; keys past k_end are zero.
         for (int i = threadIdx.x; i < DGS_KT * DGS_HD / 4; i += blockDim.x) {
             const int key = i / (DGS_HD / 4);
@@ -109,17 +117,20 @@ __global__ void attention_dflash_gqa_split_f32(
             float tmax = -INFINITY;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                s[j] = (kt + 2 * j + hid < k_end) ? s[j] * scale : -INFINITY;
+                const int key = kt + 2 * j + hid;
+                s[j] = (key < k_end && key >= key_lo0 + row) ? s[j] * scale : -INFINITY;
                 tmax = fmaxf(tmax, s[j]);
             }
             tmax = fmaxf(tmax, __shfl_xor(tmax, 16));
             const float m_new = fmaxf(m_run, tmax);
-            const float alpha = expf(m_run - m_new);
+            // A query whose keys are all masked so far keeps m = -inf: no rescale, p = 0.
+            const bool none = m_new == -INFINITY;
+            const float alpha = none ? 1.0f : expf(m_run - m_new);
             float p[8];
             float psum = 0.0f;
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                p[j] = expf(s[j] - m_new);
+                p[j] = none ? 0.0f : expf(s[j] - m_new);
                 psum += p[j];
             }
             psum += __shfl_xor(psum, 16);

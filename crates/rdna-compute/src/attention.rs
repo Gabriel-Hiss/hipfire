@@ -8704,6 +8704,10 @@ impl Gpu {
     /// range): its waves are the GQA query heads and share each staged K/V
     /// tile, and the key ranges merge by log-sum-exp. 22-24x faster than the
     /// one-wave-per-head kernel at L = 1.3k-4k on gfx1100 (32/8 heads, hd 128).
+    ///
+    /// `sliding = Some((ctx_span, window))` applies the visibility rule of
+    /// [`Self::attention_dflash_sliding_f32`] (L = ctx_span + B); `None` is
+    /// full attention.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_dflash_gqa_split_f32(
         &mut self,
@@ -8717,6 +8721,7 @@ impl Gpu {
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
+        sliding: Option<(usize, usize)>,
     ) -> HipResult<()> {
         assert!(
             self.attention_dflash_gqa_split_admitted(b, n_heads, n_kv_heads, head_dim) && l > 0,
@@ -8739,6 +8744,14 @@ impl Gpu {
         let (bi, li, nh, nkv) = (b as i32, l as i32, n_heads as i32, n_kv_heads as i32);
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let tps = tiles_per_split as i32;
+        // Key kj is visible to query q iff kj >= key_lo0 + q.
+        let key_lo0: i32 = match sliding {
+            Some((ctx_span, window)) => {
+                assert!(l == ctx_span + b && window > b, "sliding window needs L = ctx_span + B and W > B");
+                ctx_span as i32 - window as i32 + 1
+            }
+            None => i32::MIN / 2,
+        };
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
@@ -8750,6 +8763,7 @@ impl Gpu {
             &nkv as *const _ as *mut c_void,
             &scale as *const _ as *mut c_void,
             &tps as *const _ as *mut c_void,
+            &key_lo0 as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(SPLIT, [n_kv_heads as u32, n_splits as u32, 1], [32 * rep as u32, 1, 1], 0, &mut params, || {
             let mut blob = hip_bridge::KernargBlob::new();
@@ -8763,6 +8777,7 @@ impl Gpu {
             blob.push_i32(nkv);
             blob.push_f32(scale);
             blob.push_i32(tps);
+            blob.push_i32(key_lo0);
             blob
         })?;
         let (hd, ns) = (head_dim as i32, n_splits as i32);
