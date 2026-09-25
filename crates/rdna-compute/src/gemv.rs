@@ -6227,8 +6227,9 @@ impl Gpu {
         result
     }
 
-    /// Q8_1 bytes a PTQ1 decode activation of width `k` occupies: the size a
-    /// caller-owned `xq` buffer for the `ptq1_*_rotate_q8` producers needs.
+    /// Q8_1 bytes a PTQ1 activation of width `k` occupies per token: the size a
+    /// caller-owned `xq` buffer for the `ptq1_*_rotate_q8` producers needs,
+    /// times the batch.
     pub fn ptq1_xq_bytes(k: usize) -> usize {
         k.div_ceil(128) * 144
     }
@@ -6253,6 +6254,9 @@ impl Gpu {
     /// `rmsnorm_f32 -> rotate_x_prism_hadamard -> quantize_q8_1_mmq_ds4` in
     /// one launch, bit-identical to the chain. `plain` receives the
     /// un-rotated normalized vector when a non-Prism projection also reads it.
+    /// `x`/`plain` are `[batch x k]`; `xq` is the GEMM layout `[k/128][batch]`
+    /// (decode: `batch = 1`).
+    #[allow(clippy::too_many_arguments)]
     pub fn ptq1_rmsnorm_rotate_q8(
         &mut self,
         x: &GpuTensor,
@@ -6261,6 +6265,7 @@ impl Gpu {
         xq: &GpuTensor,
         k: usize,
         eps: f32,
+        batch: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let sp = self.ptq1_prism_signs(k)?;
@@ -6270,6 +6275,7 @@ impl Gpu {
         let pp = plain.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
         let yp = xq.buf.as_ptr();
         let ni = k as i32;
+        let bi = batch as i32;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
@@ -6278,8 +6284,11 @@ impl Gpu {
             &yp as *const _ as *mut c_void,
             &ni as *const _ as *mut c_void,
             &eps as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob("ptq1_rmsnorm_rotate_q8", [(k / 1024) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+        let grid = [(k / 1024) as u32, batch as u32, 1];
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "ptq1_rmsnorm_rotate_q8", batch * k * 4);
+        let result = self.launch_maybe_blob("ptq1_rmsnorm_rotate_q8", grid, [256, 1, 1], 0, &mut params, || {
             let mut blob = hip_bridge::KernargBlob::new();
             blob.push_ptr(xp);
             blob.push_ptr(wp);
@@ -6288,8 +6297,16 @@ impl Gpu {
             blob.push_ptr(yp);
             blob.push_i32(ni);
             blob.push_f32(eps);
+            blob.push_i32(bi);
             blob
-        })
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        if let Some(p) = plain {
+            self.invalidate_x_caches_for(p.buf.as_ptr());
+        }
+        result
     }
 
     /// `silu_mul_f32 -> rotate -> Q8_1`, bit-identical to the chain.
@@ -6299,8 +6316,9 @@ impl Gpu {
         up: &GpuTensor,
         xq: &GpuTensor,
         k: usize,
+        batch: usize,
     ) -> HipResult<()> {
-        self.ptq1_pair_rotate_q8("ptq1_silu_mul_rotate_q8", gate, up, xq, k)
+        self.ptq1_pair_rotate_q8("ptq1_silu_mul_rotate_q8", gate, up, xq, k, batch)
     }
 
     /// `sigmoid_mul_f32 (x *= sigmoid(gate)) -> rotate -> Q8_1`, bit-identical
@@ -6311,8 +6329,9 @@ impl Gpu {
         gate: &GpuTensor,
         xq: &GpuTensor,
         k: usize,
+        batch: usize,
     ) -> HipResult<()> {
-        self.ptq1_pair_rotate_q8("ptq1_sigmoid_mul_rotate_q8", x, gate, xq, k)
+        self.ptq1_pair_rotate_q8("ptq1_sigmoid_mul_rotate_q8", x, gate, xq, k, batch)
     }
 
     fn ptq1_pair_rotate_q8(
@@ -6322,6 +6341,7 @@ impl Gpu {
         b: &GpuTensor,
         xq: &GpuTensor,
         k: usize,
+        batch: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let sp = self.ptq1_prism_signs(k)?;
@@ -6329,24 +6349,37 @@ impl Gpu {
         let ap = a.buf.as_ptr();
         let bp = b.buf.as_ptr();
         let yp = xq.buf.as_ptr();
+        let ki = k as i32;
+        let bi = batch as i32;
         let mut params: Vec<*mut c_void> = vec![
             &ap as *const _ as *mut c_void,
             &bp as *const _ as *mut c_void,
             &sp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(name, [(k / 1024) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+        let grid = [(k / 1024) as u32, batch as u32, 1];
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", name, batch * k * 8);
+        let result = self.launch_maybe_blob(name, grid, [256, 1, 1], 0, &mut params, || {
             let mut blob = hip_bridge::KernargBlob::new();
             blob.push_ptr(ap);
             blob.push_ptr(bp);
             blob.push_ptr(sp);
             blob.push_ptr(yp);
+            blob.push_i32(ki);
+            blob.push_i32(bi);
             blob
-        })
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
-    /// `gated_norm_f32 -> rotate -> Q8_1` for `n_heads * head_dim` values,
-    /// bit-identical to the chain.
+    /// `gated_norm_f32 -> rotate -> Q8_1` for `n_heads * head_dim` values per
+    /// token, bit-identical to the chain.
+    #[allow(clippy::too_many_arguments)]
     pub fn ptq1_gated_norm_rotate_q8(
         &mut self,
         x: &GpuTensor,
@@ -6356,6 +6389,7 @@ impl Gpu {
         n_heads: usize,
         head_dim: usize,
         eps: f32,
+        batch: usize,
     ) -> HipResult<()> {
         assert_eq!(head_dim, 128, "ptq1_gated_norm_rotate_q8 maps one 128-wide head per wave");
         let k = n_heads * head_dim;
@@ -6368,6 +6402,8 @@ impl Gpu {
         let wp = weight.buf.as_ptr();
         let yp = xq.buf.as_ptr();
         let hd = head_dim as i32;
+        let ki = k as i32;
+        let bi = batch as i32;
         let mut params: Vec<*mut c_void> = vec![
             &xp as *const _ as *mut c_void,
             &zp as *const _ as *mut c_void,
@@ -6376,8 +6412,12 @@ impl Gpu {
             &yp as *const _ as *mut c_void,
             &hd as *const _ as *mut c_void,
             &eps as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(NAME, [(k / 1024) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+        let grid = [(k / 1024) as u32, batch as u32, 1];
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", NAME, batch * k * 8);
+        let result = self.launch_maybe_blob(NAME, grid, [256, 1, 1], 0, &mut params, || {
             let mut blob = hip_bridge::KernargBlob::new();
             blob.push_ptr(xp);
             blob.push_ptr(zp);
@@ -6386,8 +6426,14 @@ impl Gpu {
             blob.push_ptr(yp);
             blob.push_i32(hd);
             blob.push_f32(eps);
+            blob.push_i32(ki);
+            blob.push_i32(bi);
             blob
-        })
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Up to three PTQ1 GEMVs over one pre-quantized activation `xq` (from a
@@ -14215,18 +14261,14 @@ impl Gpu {
         assert_eq!(k % 128, 0, "PTQ1G128 WMMA prefill requires K%128==0");
         self.bind_thread()?;
         let xp = self.ensure_q8_1_mmq_x(x, n, k)?;
-        let short_verify = self.arch == "gfx1100" && n <= 16;
         // The 64x64 workgroup tile beats the 16x32 wave tile from 64 tokens
         // up (1.3-1.9x measured on gfx1100) and loses below, where most of
         // its tile is padding. It uses the gfx11 WMMA builtin.
-        let tiled = self.arch.starts_with("gfx11") && n > 32;
-        let (kernel_name, kernel_src, grid) = if tiled {
-            (
-                "gemm_ptq1g128_wmma_t64",
-                kernels::GEMM_PTQ1G128_WMMA_T64_SRC,
-                [m.div_ceil(64) as u32, n.div_ceil(64) as u32, 1],
-            )
-        } else if short_verify {
+        if Self::ptq1_t64_admitted(&self.arch, n) {
+            return self.launch_ptq1_t64(a_raw.buf.as_ptr(), xp, y.buf.as_ptr(), m, k, n, false);
+        }
+        let short_verify = self.arch == "gfx1100" && n <= 16;
+        let (kernel_name, kernel_src, grid) = if short_verify {
             (
                 "gemm_ptq1g128_wmma_b1",
                 kernels::GEMM_PTQ1G128_WMMA_B1_SRC,
@@ -14259,23 +14301,91 @@ impl Gpu {
         ];
         let bytes = crate::profile::gemm_ptq1g128_bytes(m, k, n);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_wmma", bytes);
-        let result = self.launch_maybe_blob(
-            kernel_name,
-            grid,
-            [if tiled { 128 } else { 32 }, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ap);
-                b.push_ptr(xp);
-                b.push_ptr(yp);
-                b.push_i32(mi);
-                b.push_i32(ki);
-                b.push_i32(ni);
-                b
-            },
+        let result = self.launch_maybe_blob(kernel_name, grid, [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Whether `gemm_ptq1g128_wmma` takes the 64x64 workgroup tile for `n`
+    /// tokens on `arch`, and whether [`Self::gemm_ptq1g128_wmma_q8`] is usable.
+    pub fn ptq1_t64_admitted(arch: &str, n: usize) -> bool {
+        arch.starts_with("gfx11") && n > 32
+    }
+
+    /// `gemm_ptq1g128_wmma` over an activation already quantized into the
+    /// Q8_1 GEMM layout `[k/128][n]` by a `ptq1_*_rotate_q8` producer. With
+    /// `residual`, results add into `y` instead of overwriting it. Only the
+    /// 64x64 tile has this entry; see [`Self::ptq1_t64_admitted`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_ptq1g128_wmma_q8(
+        &mut self,
+        a_raw: &GpuTensor,
+        xq: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        assert!(
+            k % 128 == 0 && Self::ptq1_t64_admitted(&self.arch, n),
+            "gemm_ptq1g128_wmma_q8 needs K%128==0 and the 64x64 tile (gfx11, N>32)"
         );
+        self.bind_thread()?;
+        self.launch_ptq1_t64(a_raw.buf.as_ptr(), xq.buf.as_ptr(), y.buf.as_ptr(), m, k, n, residual)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_ptq1_t64(
+        &mut self,
+        ap: *mut c_void,
+        xp: *mut c_void,
+        yp: *mut c_void,
+        m: usize,
+        k: usize,
+        n: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        const NAME: &str = "gemm_ptq1g128_wmma_t64";
+        self.ensure_kernel(NAME, kernels::GEMM_PTQ1G128_WMMA_T64_SRC, NAME)?;
+        let mi = m as i32;
+        let ki = k as i32;
+        let ni = n as i32;
+        let ri = i32::from(residual);
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &ri as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemm_ptq1g128_bytes(m, k, n);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_wmma", bytes);
+        let grid = [m.div_ceil(64) as u32, n.div_ceil(64) as u32, 1];
+        let result = self.launch_maybe_blob(NAME, grid, [128, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b.push_i32(ri);
+            b
+        });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

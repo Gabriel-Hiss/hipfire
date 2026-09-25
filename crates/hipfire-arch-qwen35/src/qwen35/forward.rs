@@ -5024,7 +5024,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                             &s.fa_v,
                         )
                     } else if ptq1_fused_decode(gpu, &[&l.wq, &l.wk, &l.wv]) {
-                        gpu.ptq1_rmsnorm_rotate_q8(&s.x, &l.attn_norm, Some(&s.tmp), &s.x_rot, l.wq.k, config.norm_eps)
+                        gpu.ptq1_rmsnorm_rotate_q8(&s.x, &l.attn_norm, Some(&s.tmp), &s.x_rot, l.wq.k, config.norm_eps, 1)
                             .and_then(|()| {
                                 gpu.gemv_ptq1g128_multi(
                                     &s.x_rot,
@@ -5116,7 +5116,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 };
                 if !self.precomputed_attn_x_rot && ptq1_fused_decode(gpu, &[wqkv, wz]) {
                     (|| {
-                        gpu.ptq1_rmsnorm_rotate_q8(&s.x, attn_norm, Some(&s.tmp), &s.x_rot, wqkv.k, config.norm_eps)?;
+                        gpu.ptq1_rmsnorm_rotate_q8(&s.x, attn_norm, Some(&s.tmp), &s.x_rot, wqkv.k, config.norm_eps, 1)?;
                         let segs = [(&wqkv.buf, &s.dn_qkv, wqkv.m), (&wz.buf, &s.dn_z, wz.m)];
                         // Bonsai's beta/alpha are un-rotated BF16 over the
                         // same normalized input: fold them into the launch.
@@ -5226,7 +5226,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     }
                 };
                 if ptq1_fused_decode(gpu, &[w_gate, w_up]) {
-                    gpu.ptq1_rmsnorm_rotate_q8(&s.x, ffn_norm, Some(&s.tmp), &s.x_rot, w_gate.k, config.norm_eps)
+                    gpu.ptq1_rmsnorm_rotate_q8(&s.x, ffn_norm, Some(&s.tmp), &s.x_rot, w_gate.k, config.norm_eps, 1)
                         .and_then(|()| {
                             gpu.gemv_ptq1g128_multi(
                                 &s.x_rot,
@@ -5344,7 +5344,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                     _ => return Err(HipError::new(0, "RESID_DOWN_SWIGLU on MoE layer")),
                 };
                 if ptq1_fused_decode(gpu, &[w_down]) {
-                    gpu.ptq1_silu_mul_rotate_q8(&s.gate_ffn, &s.up, &s.x_rot, w_down.k)?;
+                    gpu.ptq1_silu_mul_rotate_q8(&s.gate_ffn, &s.up, &s.x_rot, w_down.k, 1)?;
                     return gpu.gemv_ptq1g128_multi(&s.x_rot, &[(&w_down.buf, &s.x, w_down.m)], w_down.k, true, None);
                 }
                 hipfire_runtime::llama::weight_gemv_swiglu_residual(
@@ -5387,6 +5387,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 self.n_v_heads,
                 config.linear_value_head_dim,
                 config.norm_eps,
+                1,
             )
         } else if gated_norm_mq_rotate_enabled(gpu, config, self.n_v_heads, wo) {
             gpu.gated_norm_rotate_mq_gfx1100(
@@ -5504,7 +5505,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 )?;
                 if !fused_epilogue {
                     if ptq1_fused_decode(gpu, &[wo]) {
-                        gpu.ptq1_sigmoid_mul_rotate_q8(&s.fa_attn_out, &s.fa_gate, &s.x_rot, wo.k)?;
+                        gpu.ptq1_sigmoid_mul_rotate_q8(&s.fa_attn_out, &s.fa_gate, &s.x_rot, wo.k, 1)?;
                     } else {
                         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
                     }
@@ -6253,7 +6254,7 @@ fn forward_scratch_layers_lowered(
     // Final norm + logits into scratch.logits (mirrors forward_scratch_layers).
     if ptq1_fused_decode(gpu, &[&weights.output]) {
         let w = &weights.output;
-        gpu.ptq1_rmsnorm_rotate_q8(&s.x, &weights.output_norm, Some(&s.tmp), &s.x_rot, w.k, config.norm_eps)?;
+        gpu.ptq1_rmsnorm_rotate_q8(&s.x, &weights.output_norm, Some(&s.tmp), &s.x_rot, w.k, config.norm_eps, 1)?;
         return gpu.gemv_ptq1g128_multi(&s.x_rot, &[(&w.buf, &s.logits, w.m)], w.k, false, None);
     }
     gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;

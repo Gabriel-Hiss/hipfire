@@ -15,8 +15,9 @@
 //   rotation   rotate_x_prism_hadamard (signs, then H, then 1/sqrt(block))
 //   quantize   quantize_q8_1_mmq_ds4 (8 lanes x 4 values per 32-value scale)
 //
-// Grid: one 256-thread workgroup per 1024-wide Hadamard block; thread t owns
-// block elements [4t, 4t+4). A block never reads another block's values after
+// Grid: [K / 1024 Hadamard blocks, n_tok tokens], 256 threads; thread t owns
+// block elements [4t, 4t+4) of token blockIdx.y. Inputs are [n_tok x K] rows;
+// Y is the GEMM activation layout [K/128 group][n_tok] (decode: n_tok = 1). A block never reads another block's values after
 // the producer, so blocks are independent except for rmsnorm's whole-vector
 // sum, which each workgroup recomputes.
 //
@@ -41,7 +42,8 @@ static __device__ __forceinline__ void prq_rotate_quantize(
     float v[4],
     float* tile,
     prq_block_q8_1_mmq* __restrict__ Y,
-    int blk
+    int blk,
+    int n_tok
 ) {
     const int tid = threadIdx.x;
     const int lane = tid & 31;
@@ -104,7 +106,7 @@ static __device__ __forceinline__ void prq_rotate_quantize(
     q.w = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, x3 * id)));
 
     const int e = blk * PRQ_BLOCK + 4 * tid;
-    prq_block_q8_1_mmq* out = Y + e / 128;
+    prq_block_q8_1_mmq* out = Y + (long long)(e / 128) * n_tok + blockIdx.y;
     const int iqs = e & 127;
     ((char4*)out->qs)[iqs / 4] = q;
     if ((iqs & 31) == 0) {
@@ -125,13 +127,15 @@ __global__ void ptq1_rmsnorm_rotate_q8(
     const float* __restrict__ signs,
     float* __restrict__ plain,
     prq_block_q8_1_mmq* __restrict__ Y,
-    int n, float eps
+    int n, float eps, int n_tok
 ) {
     __shared__ float tile[2 * PRQ_BLOCK];
     __shared__ float sdata[PRQ_THREADS];
     const int tid = threadIdx.x;
     const int blk = blockIdx.x;
     const int base = blk * PRQ_BLOCK + 4 * tid;
+    x += (long long)blockIdx.y * n;
+    if (plain) plain += (long long)blockIdx.y * n;
 
     const float4 xv = *(const float4*)(x + base);
     const float4 wv = *(const float4*)(weight + base);
@@ -171,7 +175,7 @@ __global__ void ptq1_rmsnorm_rotate_q8(
     float v[4] = {xv.x * wv.x * rms, xv.y * wv.y * rms, xv.z * wv.z * rms, xv.w * wv.w * rms};
     if (plain) *(float4*)(plain + base) = make_float4(v[0], v[1], v[2], v[3]);
     v[0] *= sv.x; v[1] *= sv.y; v[2] *= sv.z; v[3] *= sv.w;
-    prq_rotate_quantize(v, tile, Y, blk);
+    prq_rotate_quantize(v, tile, Y, blk, n_tok);
 }
 
 // silu_mul_f32 -> rotate -> Q8_1 (the FFN down-projection input).
@@ -180,12 +184,14 @@ __global__ void ptq1_silu_mul_rotate_q8(
     const float* __restrict__ gate,
     const float* __restrict__ up,
     const float* __restrict__ signs,
-    prq_block_q8_1_mmq* __restrict__ Y
+    prq_block_q8_1_mmq* __restrict__ Y,
+    int k, int n_tok
 ) {
     __shared__ float tile[2 * PRQ_BLOCK];
     const int base = blockIdx.x * PRQ_BLOCK + 4 * threadIdx.x;
-    const float4 g = *(const float4*)(gate + base);
-    const float4 u = *(const float4*)(up + base);
+    const long long row = (long long)blockIdx.y * k;
+    const float4 g = *(const float4*)(gate + row + base);
+    const float4 u = *(const float4*)(up + row + base);
     const float4 sv = *(const float4*)(signs + base);
     float v[4] = {
         ((g.x / (1.0f + expf(-g.x))) * u.x) * sv.x,
@@ -193,7 +199,7 @@ __global__ void ptq1_silu_mul_rotate_q8(
         ((g.z / (1.0f + expf(-g.z))) * u.z) * sv.z,
         ((g.w / (1.0f + expf(-g.w))) * u.w) * sv.w,
     };
-    prq_rotate_quantize(v, tile, Y, blockIdx.x);
+    prq_rotate_quantize(v, tile, Y, blockIdx.x, n_tok);
 }
 
 // sigmoid_mul_f32 (attention output gate) -> rotate -> Q8_1 (o_proj input).
@@ -202,12 +208,14 @@ __global__ void ptq1_sigmoid_mul_rotate_q8(
     const float* __restrict__ x,
     const float* __restrict__ gate,
     const float* __restrict__ signs,
-    prq_block_q8_1_mmq* __restrict__ Y
+    prq_block_q8_1_mmq* __restrict__ Y,
+    int k, int n_tok
 ) {
     __shared__ float tile[2 * PRQ_BLOCK];
     const int base = blockIdx.x * PRQ_BLOCK + 4 * threadIdx.x;
-    const float4 xv = *(const float4*)(x + base);
-    const float4 g = *(const float4*)(gate + base);
+    const long long row = (long long)blockIdx.y * k;
+    const float4 xv = *(const float4*)(x + row + base);
+    const float4 g = *(const float4*)(gate + row + base);
     const float4 sv = *(const float4*)(signs + base);
     float v[4] = {
         (xv.x * (1.0f / (1.0f + expf(-g.x)))) * sv.x,
@@ -215,7 +223,7 @@ __global__ void ptq1_sigmoid_mul_rotate_q8(
         (xv.z * (1.0f / (1.0f + expf(-g.z)))) * sv.z,
         (xv.w * (1.0f / (1.0f + expf(-g.w)))) * sv.w,
     };
-    prq_rotate_quantize(v, tile, Y, blockIdx.x);
+    prq_rotate_quantize(v, tile, Y, blockIdx.x, n_tok);
 }
 
 // gated_norm_f32 (per-head RMS norm times silu(z)) -> rotate -> Q8_1 (the
@@ -229,10 +237,12 @@ __global__ void ptq1_gated_norm_rotate_q8(
     const float* __restrict__ weight,
     const float* __restrict__ signs,
     prq_block_q8_1_mmq* __restrict__ Y,
-    int head_dim, float eps
+    int head_dim, float eps, int k, int n_tok
 ) {
     __shared__ float tile[2 * PRQ_BLOCK];
     const int lane = threadIdx.x & 31;
+    x += (long long)blockIdx.y * k;
+    z += (long long)blockIdx.y * k;
     const int base = blockIdx.x * PRQ_BLOCK + 4 * threadIdx.x;
     const int hb = blockIdx.x * PRQ_BLOCK + (threadIdx.x >> 5) * 128;
     float sq_sum = 0.0f;
@@ -256,5 +266,5 @@ __global__ void ptq1_gated_norm_rotate_q8(
         const float silu_z = zs[j] / (1.0f + expf(-zs[j]));
         v[j] = (normed * silu_z) * ss[j];
     }
-    prq_rotate_quantize(v, tile, Y, blockIdx.x);
+    prq_rotate_quantize(v, tile, Y, blockIdx.x, n_tok);
 }

@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Bit-exactness gate for the fused PTQ1 decode producers and the
-//! multi-segment residual GEMV against the unfused chains they replace:
+//! Bit-exactness gate for the fused PTQ1 producers, the multi-segment
+//! residual GEMV, and the prefill GEMM over producer output, against the
+//! unfused chains they replace:
 //!
 //!   rmsnorm_f32      -> rotate_x_prism_hadamard -> quantize -> gemv_ptq1g128
 //!   silu_mul_f32     -> rotate -> quantize -> gemv_ptq1g128
@@ -11,6 +12,8 @@
 //!   gated_norm_f32   -> rotate -> quantize -> gemv_ptq1g128
 //!   gemv_ptq1g128 x3 (+ add_inplace_f32)  vs  gemv_ptq1g128_multi
 //!   gemv_bf16_xf32 x2                     vs  gemv_ptq1g128_multi's BF16 pair
+//!   batched op -> rotate -> gemm_ptq1g128_wmma (+ add_inplace_f32)
+//!     vs  batched producer -> gemm_ptq1g128_wmma_q8 (residual epilogue)
 //!
 //! Every comparison is exact equality: the fused kernels repeat the chain's
 //! arithmetic in the chain's order, so any difference is a bug, not noise.
@@ -101,7 +104,7 @@ fn main() {
         gpu.rmsnorm_f32(&x, &nw, &plain_ref, 1e-6).unwrap();
         gpu.rotate_x_prism_hadamard(&plain_ref, &rot, k, 1).unwrap();
         gpu.gemv_ptq1g128(&w, &rot, &y_ref, m, k).unwrap();
-        gpu.ptq1_rmsnorm_rotate_q8(&x, &nw, Some(&plain), &xq, k, 1e-6).unwrap();
+        gpu.ptq1_rmsnorm_rotate_q8(&x, &nw, Some(&plain), &xq, k, 1e-6, 1).unwrap();
         gpu.gemv_ptq1g128_multi(&xq, &[(&w, &y, m)], k, false, None).unwrap();
         gpu.hip.device_synchronize().unwrap();
         println!("rmsnorm (K={k})");
@@ -120,13 +123,13 @@ fn main() {
         let y = gpu.alloc_tensor(&[m], DType::F32).unwrap();
         if name == "silu_mul" {
             gpu.silu_mul_f32(&a, &b, &tmp).unwrap();
-            gpu.ptq1_silu_mul_rotate_q8(&a, &b, &xq, k).unwrap();
+            gpu.ptq1_silu_mul_rotate_q8(&a, &b, &xq, k, 1).unwrap();
         } else {
             // sigmoid_mul_f32 is in place on its first operand; run it on a
             // copy so the fused kernel reads the original.
             gpu.hip.memcpy_dtod(&tmp.buf, &a.buf, k * 4).unwrap();
             gpu.sigmoid_mul_f32(&tmp, &b).unwrap();
-            gpu.ptq1_sigmoid_mul_rotate_q8(&a, &b, &xq, k).unwrap();
+            gpu.ptq1_sigmoid_mul_rotate_q8(&a, &b, &xq, k, 1).unwrap();
         }
         gpu.gemv_ptq1g128_multi(&xq, &[(&w, &y, m)], k, false, None).unwrap();
         gpu.rotate_x_prism_hadamard(&tmp, &rot, k, 1).unwrap();
@@ -151,7 +154,7 @@ fn main() {
         gpu.gated_norm_f32(&x, &z, &nw, &normed, heads, hd, 1e-6).unwrap();
         gpu.rotate_x_prism_hadamard(&normed, &rot, k, 1).unwrap();
         gpu.gemv_ptq1g128(&w, &rot, &y_ref, m, k).unwrap();
-        gpu.ptq1_gated_norm_rotate_q8(&x, &z, &nw, &xq, heads, hd, 1e-6).unwrap();
+        gpu.ptq1_gated_norm_rotate_q8(&x, &z, &nw, &xq, heads, hd, 1e-6, 1).unwrap();
         gpu.gemv_ptq1g128_multi(&xq, &[(&w, &y, m)], k, false, None).unwrap();
         gpu.hip.device_synchronize().unwrap();
         println!("gated_norm ({heads}x{hd})");
@@ -169,7 +172,7 @@ fn main() {
         let rot = gpu.alloc_tensor(&[k], DType::F32).unwrap();
         gpu.rmsnorm_f32(&x, &nw, &plain, 1e-6).unwrap();
         gpu.rotate_x_prism_hadamard(&plain, &rot, k, 1).unwrap();
-        gpu.ptq1_rmsnorm_rotate_q8(&x, &nw, None, &xq, k, 1e-6).unwrap();
+        gpu.ptq1_rmsnorm_rotate_q8(&x, &nw, None, &xq, k, 1e-6, 1).unwrap();
         let ws: Vec<_> = ms
             .iter()
             .map(|&mi| {
@@ -209,7 +212,7 @@ fn main() {
         let x = gpu.upload_f32(&rng.vec(k, 1.0), &[k]).expect("x");
         let nw = gpu.upload_f32(&rng.vec(k, 1.0), &[k]).expect("nw");
         let plain = gpu.alloc_tensor(&[k], DType::F32).unwrap();
-        gpu.ptq1_rmsnorm_rotate_q8(&x, &nw, Some(&plain), &xq, k, 1e-6).unwrap();
+        gpu.ptq1_rmsnorm_rotate_q8(&x, &nw, Some(&plain), &xq, k, 1e-6, 1).unwrap();
         let wq = ptq1_weights(&mut rng, mq, k);
         let wz = ptq1_weights(&mut rng, mz, k);
         let wq = gpu.upload_raw(&wq, &[wq.len()]).unwrap();
@@ -236,6 +239,80 @@ fn main() {
         for (i, label) in ["qkv", "z", "beta (bf16)", "alpha (bf16)"].iter().enumerate() {
             ok &= exact(label, &download(&mut gpu, &outs[i]), &download(&mut gpu, &refs[i]));
         }
+    }
+
+    // Prefill: batched producers into the [k/128][n] GEMM layout and the
+    // 64x64 WMMA tile reading it, plain and residual. 97 tokens leave a
+    // ragged last tile; gfx11 only (the tile's admission rule).
+    let n = 97usize;
+    if Gpu::ptq1_t64_admitted(&gpu.arch, n) {
+        let m = 1030usize;
+        let xqb = gpu
+            .alloc_tensor(&[n * Gpu::ptq1_xq_bytes(17408) / 4], DType::F32)
+            .expect("alloc batched xq");
+        let mut check = |gpu: &mut Gpu, rng: &mut Rng, name: &str, k: usize, chain: &GpuTensor| -> bool {
+            let w = ptq1_weights(rng, m, k);
+            let w = gpu.upload_raw(&w, &[w.len()]).unwrap();
+            let rot = gpu.alloc_tensor(&[n * k], DType::F32).unwrap();
+            gpu.rotate_x_prism_hadamard(chain, &rot, k, n).unwrap();
+            let base = rng.vec(n * m, 5.0);
+            let mut ok = true;
+            for residual in [false, true] {
+                let y_ref = gpu.upload_f32(&base, &[n * m]).unwrap();
+                let y = gpu.upload_f32(&base, &[n * m]).unwrap();
+                if residual {
+                    let t = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+                    gpu.gemm_ptq1g128_wmma(&w, &rot, &t, m, k, n).unwrap();
+                    gpu.add_inplace_f32(&y_ref, &t).unwrap();
+                } else {
+                    gpu.gemm_ptq1g128_wmma(&w, &rot, &y_ref, m, k, n).unwrap();
+                }
+                gpu.gemm_ptq1g128_wmma_q8(&w, &xqb, &y, m, k, n, residual).unwrap();
+                gpu.hip.device_synchronize().unwrap();
+                let label = format!("{name} gemm residual={residual}");
+                ok &= exact(&label, &download(gpu, &y), &download(gpu, &y_ref));
+            }
+            ok
+        };
+        println!("prefill batch {n}");
+
+        let k = 5120;
+        let x = gpu.upload_f32(&rng.vec(n * k, 3.0), &[n * k]).unwrap();
+        let nw = gpu.upload_f32(&rng.vec(k, 1.0), &[k]).unwrap();
+        let plain_ref = gpu.alloc_tensor(&[n * k], DType::F32).unwrap();
+        let plain = gpu.alloc_tensor(&[n * k], DType::F32).unwrap();
+        gpu.rmsnorm_batched(&x, &nw, &plain_ref, n, k, 1e-6).unwrap();
+        gpu.ptq1_rmsnorm_rotate_q8(&x, &nw, Some(&plain), &xqb, k, 1e-6, n).unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        ok &= exact("rmsnorm plain vs rmsnorm_batched", &download(&mut gpu, &plain), &download(&mut gpu, &plain_ref));
+        ok &= check(&mut gpu, &mut rng, "rmsnorm", k, &plain_ref);
+
+        for (name, k) in [("silu_mul", 17408usize), ("sigmoid_mul", 6144)] {
+            let a = gpu.upload_f32(&rng.vec(n * k, 4.0), &[n * k]).unwrap();
+            let b = gpu.upload_f32(&rng.vec(n * k, 4.0), &[n * k]).unwrap();
+            let tmp = gpu.alloc_tensor(&[n * k], DType::F32).unwrap();
+            if name == "silu_mul" {
+                gpu.silu_mul_f32(&a, &b, &tmp).unwrap();
+                gpu.ptq1_silu_mul_rotate_q8(&a, &b, &xqb, k, n).unwrap();
+            } else {
+                gpu.hip.memcpy_dtod(&tmp.buf, &a.buf, n * k * 4).unwrap();
+                gpu.sigmoid_mul_f32(&tmp, &b).unwrap();
+                gpu.ptq1_sigmoid_mul_rotate_q8(&a, &b, &xqb, k, n).unwrap();
+            }
+            ok &= check(&mut gpu, &mut rng, name, k, &tmp);
+        }
+
+        let (heads, hd) = (48usize, 128usize);
+        let k = heads * hd;
+        let x = gpu.upload_f32(&rng.vec(n * k, 2.0), &[n * k]).unwrap();
+        let z = gpu.upload_f32(&rng.vec(n * k, 3.0), &[n * k]).unwrap();
+        let nw = gpu.upload_f32(&rng.vec(hd, 1.0), &[hd]).unwrap();
+        let normed = gpu.alloc_tensor(&[n * k], DType::F32).unwrap();
+        gpu.gated_norm_f32_batched(&x, &z, &nw, &normed, heads, hd, 1e-6, n).unwrap();
+        gpu.ptq1_gated_norm_rotate_q8(&x, &z, &nw, &xqb, heads, hd, 1e-6, n).unwrap();
+        ok &= check(&mut gpu, &mut rng, "gated_norm", k, &normed);
+    } else {
+        println!("prefill batch: skipped (no 64x64 PTQ1 tile on {})", gpu.arch);
     }
 
     println!("{}", if ok { "PASS" } else { "FAIL" });

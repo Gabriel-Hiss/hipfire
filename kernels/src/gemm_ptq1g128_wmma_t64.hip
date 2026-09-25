@@ -31,6 +31,9 @@
 // the tile is mostly padding and the 16x32 kernel wins, so the host dispatches
 // this one for N > 32.
 //
+// With `residual`, each output adds into Y (the residual stream, in the order
+// of the add_inplace_f32 it replaces) instead of overwriting it.
+//
 // Grid: [ceil(M/64), ceil(N/64)]. Block: [128] (4 x wave32).
 
 typedef int __attribute__((ext_vector_type(4))) t64_i8x16;
@@ -70,7 +73,8 @@ __global__ void gemm_ptq1g128_wmma_t64(
     const unsigned char* __restrict__ A,
     const t64_block_q8_1* __restrict__ Xq,
     float* __restrict__ Y,
-    int M, int K, int N
+    int M, int K, int N,
+    int residual
 ) {
     __shared__ unsigned a_lds[T64_ROWS * T64_STRIDE];
     __shared__ unsigned x_lds[T64_TOKS * T64_STRIDE];
@@ -207,7 +211,10 @@ __global__ void gemm_ptq1g128_wmma_t64(
             #pragma unroll
             for (int e = 0; e < 8; ++e) {
                 const int row = row0 + w_row + i * 16 + 2 * e + (lane >> 4);
-                if (row < M) Y[(long long)tok * M + row] = acc[i][j][e];
+                if (row < M) {
+                    float* y = Y + (long long)tok * M + row;
+                    *y = residual ? *y + acc[i][j][e] : acc[i][j][e];
+                }
             }
     }
 }
