@@ -142,6 +142,10 @@ name = "dflash_spec_demo"
 required-features = []
 
 [[example]]
+name = "dflash_distill_dump"
+required-features = ["deltanet"]
+
+[[example]]
 name = "triattn_validate"
 required-features = []
 

@@ -2320,6 +2320,7 @@ pub fn generate_dflash(
         started_in_think,
         gen_start_contract_version_for_arch(m.arch_id),
     );
+    let token_log = spec_token_log_path().map(|path| (path, prompt_tokens.clone()));
     let run = match generate_spec(
         m,
         gpu,
@@ -2348,6 +2349,9 @@ pub fn generate_dflash(
         None => return true,
     };
     debug_assert_eq!(run.prefill_tokens_len, prefill_tokens_full);
+    if let Some((path, prompt)) = token_log {
+        append_spec_token_log(&path, &prompt, &run.streamed_tokens);
+    }
 
     // ── parse tool_calls + populate asst_turn_cache ──────────────
     //
@@ -2759,6 +2763,27 @@ pub fn generate_dflash(
         run.generated, run.spec_cycles
     );
     true
+}
+
+/// `HIPFIRE_SPEC_TOKEN_LOG=<file>`: every DFlash turn appends
+/// `{"prompt":[ids],"output":[ids]}` (the rendered conversation and the
+/// committed output) as one JSON line — the token record a drafter
+/// distillation run replays through the target to collect hidden states.
+fn spec_token_log_path() -> Option<String> {
+    hipfire_config::developer_var("HIPFIRE_SPEC_TOKEN_LOG").ok().filter(|p| !p.is_empty())
+}
+
+fn append_spec_token_log(path: &str, prompt: &[u32], output: &[u32]) {
+    use std::io::Write as _;
+    let line = serde_json::json!({ "prompt": prompt, "output": output }).to_string();
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(e) = written {
+        eprintln!("[spec-token-log] append to {path} failed: {e}");
+    }
 }
 
 /// Arch-generic spec-decode core extracted from `generate_dflash` (Phase 4 T4a).
