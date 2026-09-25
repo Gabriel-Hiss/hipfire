@@ -14393,8 +14393,17 @@ impl Gpu {
         n: usize,
         residual: bool,
     ) -> HipResult<()> {
-        const NAME: &str = "gemm_ptq1g128_wmma_t64";
-        self.ensure_kernel(NAME, kernels::GEMM_PTQ1G128_WMMA_T64_SRC, NAME)?;
+        // The 128-token build halves the decode per WMMA and wins on the big
+        // projections (N=512 on gfx1100: +4-7% at M>=10240 or K=17408) but
+        // loses 3-4% on the 5120/6144 ones, where it leaves too few
+        // workgroups for the device.
+        let wide = n >= 256 && (m >= 8192 || k >= 8192);
+        let (name, src, toks, threads) = if wide {
+            ("gemm_ptq1g128_wmma_t128", kernels::GEMM_PTQ1G128_WMMA_T128_SRC, 128, 256)
+        } else {
+            ("gemm_ptq1g128_wmma_t64", kernels::GEMM_PTQ1G128_WMMA_T64_SRC, 64, 128)
+        };
+        self.ensure_kernel(name, src, name)?;
         let mi = m as i32;
         let ki = k as i32;
         let ni = n as i32;
@@ -14410,8 +14419,8 @@ impl Gpu {
         ];
         let bytes = crate::profile::gemm_ptq1g128_bytes(m, k, n);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_wmma", bytes);
-        let grid = [m.div_ceil(64) as u32, n.div_ceil(64) as u32, 1];
-        let result = self.launch_maybe_blob(NAME, grid, [128, 1, 1], 0, &mut params, || {
+        let grid = [m.div_ceil(64) as u32, n.div_ceil(toks) as u32, 1];
+        let result = self.launch_maybe_blob(name, grid, [threads, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ap);
             b.push_ptr(xp);

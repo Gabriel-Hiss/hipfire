@@ -233,6 +233,9 @@ fn main() {
         ("wmma wide ", 257, 512, 17),
         ("wmma t64  ", 257, 512, 97),
         ("wmma t64 w", 1030, 5120, 200),
+        // K >= 8192 with N >= 256 takes the 64x128 tile; 300 leaves a ragged
+        // last token tile.
+        ("wmma t128 ", 130, 8192, 300),
     ] {
         let mut pk = Vec::with_capacity(m * (k / 128) * 28);
         for _r in 0..m {

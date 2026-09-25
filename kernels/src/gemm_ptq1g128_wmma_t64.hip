@@ -34,7 +34,11 @@
 // With `residual`, each output adds into Y (the residual stream, in the order
 // of the add_inplace_f32 it replaces) instead of overwriting it.
 //
-// Grid: [ceil(M/64), ceil(N/64)]. Block: [128] (4 x wave32).
+// Built twice. T64_TOKS 64: Grid [ceil(M/64), ceil(N/64)], Block [128]
+// (4 x wave32). T64_TOKS 128 (`gemm_ptq1g128_wmma_t128`): a 64 x 128 tile,
+// Block [256]; waves 0-3 decode the weight slab, waves 4-7 stage the 128
+// tokens, so each decoded group feeds twice the WMMAs. Same arithmetic per
+// output, bit-identical to the 64-token build.
 
 typedef int __attribute__((ext_vector_type(4))) t64_i8x16;
 typedef int __attribute__((ext_vector_type(8))) t64_i32x8;
@@ -64,12 +68,24 @@ static __device__ __forceinline__ unsigned t64_signed(unsigned d) {
     return ((d | 0x80808080u) - 0x01010101u) ^ 0x80808080u;
 }
 
-#define T64_ROWS 64
+#ifndef T64_TOKS
 #define T64_TOKS 64
+#endif
+#define T64_ROWS 64
 #define T64_STRIDE 36 // 32 words of int8 per row/token + 4 words of bank padding
 
-extern "C" __launch_bounds__(128, 2)
-__global__ void gemm_ptq1g128_wmma_t64(
+#if T64_TOKS == 128
+#define T64_KERNEL gemm_ptq1g128_wmma_t128
+#define T64_THREADS 256
+#define T64_MIN_BLOCKS 1
+#else
+#define T64_KERNEL gemm_ptq1g128_wmma_t64
+#define T64_THREADS 128
+#define T64_MIN_BLOCKS 2
+#endif
+
+extern "C" __launch_bounds__(T64_THREADS, T64_MIN_BLOCKS)
+__global__ void T64_KERNEL(
     const unsigned char* __restrict__ A,
     const t64_block_q8_1* __restrict__ Xq,
     float* __restrict__ Y,
@@ -88,9 +104,14 @@ __global__ void gemm_ptq1g128_wmma_t64(
     const int tok0 = blockIdx.y * T64_TOKS;
     const int groups = K >> 7;
 
+#if T64_TOKS == 128
+    // Activation staging: threads 128-255, one token each.
+    const int s_tok = tid & 127;
+#else
     // Activation staging: two threads per token, four uint4 each.
     const int s_tok = tid >> 1;
     const int s_part = tid & 1;
+#endif
     const int x_tok = min(tok0 + s_tok, N - 1);
 
     // Each wave computes 32 rows x 32 tokens = 2 x 2 WMMA tiles.
@@ -109,6 +130,9 @@ __global__ void gemm_ptq1g128_wmma_t64(
         // Weights: waves 0-1 (tid < 64) decode dwords 0-3 of row tid, waves
         // 2-3 dwords 4-6 of row tid - 64. Each lane loads its dwords as one
         // contiguous run and no wave diverges.
+#if T64_TOKS == 128
+        if (tid < 128)
+#endif
         {
             const int r = tid & 63;
             const int arow = min(row0 + r, M - 1);
@@ -149,7 +173,18 @@ __global__ void gemm_ptq1g128_wmma_t64(
                 dw_lds[r] = (float)(*(const _Float16*)&bits);
             }
         }
-        // Activations: 64 tokens of 128 int8 plus the four sub-block scales.
+        // Activations: the tile's tokens, 128 int8 plus four sub-block scales.
+#if T64_TOKS == 128
+        else {
+            const t64_block_q8_1* xb = Xq + (long long)g * N + x_tok;
+            const uint4* src = (const uint4*)xb->qs;
+            uint4* dst = (uint4*)(x_lds + s_tok * T64_STRIDE);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) dst[j] = src[j];
+            #pragma unroll
+            for (int s = 0; s < 4; ++s) dx_lds[s_tok * 4 + s] = (float)xb->ds4[2 * s];
+        }
+#else
         {
             const t64_block_q8_1* xb = Xq + (long long)g * N + x_tok;
             const uint4* src = (const uint4*)xb->qs;
@@ -161,6 +196,7 @@ __global__ void gemm_ptq1g128_wmma_t64(
                 for (int s = 0; s < 4; ++s) dx_lds[s_tok * 4 + s] = (float)xb->ds4[2 * s];
             }
         }
+#endif
         __syncthreads();
 
         // A fragment: lane's row (lane & 15), 16 int8 of K. B fragment: lane's

@@ -6631,6 +6631,12 @@ pub const GEMM_PTQ1G128_WMMA_B1_SRC: &str = concat!(
 pub const GEMM_PTQ1G128_WMMA_T64_SRC: &str =
     include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip");
 
+/// 64-row x 128-token build of GEMM_PTQ1G128_WMMA_T64_SRC (256 threads).
+pub const GEMM_PTQ1G128_WMMA_T128_SRC: &str = concat!(
+    "#define T64_TOKS 128\n",
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
+);
+
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
 pub const V4F_SILU_MUL_CLAMP_SRC: &str =
