@@ -6624,13 +6624,6 @@ pub const PROBE_WMMA_RATE_SRC: &str = include_str!("../../../kernels/src/probe_w
 /// scalar prefill kernel; see the source header.
 pub const GEMM_PTQ1G128_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_ptq1g128_wmma.hip");
-/// Single-token-tile variant for short PTQ1 verify blocks on gfx1100.
-/// The two-tile prefill kernel wastes a whole WMMA pass when N <= 16.
-pub const GEMM_PTQ1G128_WMMA_B1_SRC: &str = concat!(
-    "#define PTQ1_BATCH_TILES 1\n",
-    "#define PTQ1_WMMA_NAME gemm_ptq1g128_wmma_b1\n",
-    include_str!("../../../kernels/src/gemm_ptq1g128_wmma.hip")
-);
 /// 64-row x 64-token workgroup-tiled PTQ1_0 prefill GEMM (gfx11 iu8 WMMA);
 /// shares one decoded weight slab across 4 waves. See the source header.
 pub const GEMM_PTQ1G128_WMMA_T64_SRC: &str =

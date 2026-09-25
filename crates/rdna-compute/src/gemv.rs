@@ -14417,25 +14417,12 @@ impl Gpu {
         if Self::ptq1_t64_admitted(&self.arch, n) {
             return self.launch_ptq1_t64(a_raw.buf.as_ptr(), None, xp, y.buf.as_ptr(), m, k, n, false, false);
         }
-        let short_verify = self.arch == "gfx1100" && n <= 16;
-        let (kernel_name, kernel_src, grid) = if short_verify {
-            (
-                "gemm_ptq1g128_wmma_b1",
-                kernels::GEMM_PTQ1G128_WMMA_B1_SRC,
-                [m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1],
-            )
-        } else {
-            (
-                "gemm_ptq1g128_wmma",
-                kernels::GEMM_PTQ1G128_WMMA_SRC,
-                [
-                    m.div_ceil(16) as u32,
-                    n.div_ceil(if self.arch == "gfx1100" { 32 } else { 16 }) as u32,
-                    1,
-                ],
-            )
-        };
-        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        if self.arch.starts_with("gfx11") && n <= 16 {
+            return self.gemm_ptq1g128_verify(a_raw.buf.as_ptr(), xp, y.buf.as_ptr(), m, k, n, false);
+        }
+        let kernel_name = "gemm_ptq1g128_wmma";
+        let grid = [m.div_ceil(16) as u32, n.div_ceil(if self.arch == "gfx1100" { 32 } else { 16 }) as u32, 1];
+        self.ensure_kernel(kernel_name, kernels::GEMM_PTQ1G128_WMMA_SRC, kernel_name)?;
         let ap = a_raw.buf.as_ptr();
         let yp = y.buf.as_ptr();
         let mi = m as i32;
@@ -14459,6 +14446,55 @@ impl Gpu {
             b.push_i32(mi);
             b.push_i32(ki);
             b.push_i32(ni);
+            b
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// `gemm_ptq1g128_verify`: `Y[N x M]` for `n <= 16` tokens over a Q8_1
+    /// activation in the `[k/128][n]` GEMM layout. Every token's row equals
+    /// [`Self::gemv_ptq1g128`] on that token bit for bit, so a speculative
+    /// verify reproduces the decode path's projections. gfx11 only (iu8 WMMA).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_ptq1g128_verify(
+        &mut self,
+        ap: *mut c_void,
+        xp: *mut c_void,
+        yp: *mut c_void,
+        m: usize,
+        k: usize,
+        n: usize,
+        residual: bool,
+    ) -> HipResult<()> {
+        debug_assert!(n <= 16 && k % 128 == 0);
+        self.ensure_kernel("gemm_ptq1g128_verify", kernels::GEMV_PTQ1G128_SRC, "gemm_ptq1g128_verify")?;
+        let mi = m as i32;
+        let ki = k as i32;
+        let ni = n as i32;
+        let ri = residual as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mi as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &ri as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemm_ptq1g128_bytes(m, k, n);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_verify", bytes);
+        let result = self.launch_maybe_blob("gemm_ptq1g128_verify", [m.div_ceil(16) as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(ni);
+            b.push_i32(ri);
             b
         });
         if let Some(t) = timer {

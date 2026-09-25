@@ -74,8 +74,8 @@ static __device__ __forceinline__ int ptq1_dot(unsigned digits, int x, int acc) 
 // One 128-weight block against its Q8_1 block. Digits are stored offset by
 // one, so sum((d-1)*x) = sum(d*x) - sum(x) per 32-element sub-block; the
 // caller supplies sum(x) because every row of the lane shares it. The integer
-// sub-block sums equal the reference's exactly, and the float epilogue keeps
-// its order: acc = sum_k ds_k * sumi_k, result = d * acc.
+// sub-block sums equal the reference's exactly. Returns the block's unscaled
+// float sum acc = sum_k ds_k * sumi_k; ptq1_acc_block applies the weight scale.
 static __device__ __forceinline__ float ptq1_block_dot(
     const unsigned w[7],
     const int xv[32],
@@ -115,13 +115,24 @@ static __device__ __forceinline__ float ptq1_block_dot(
         s3 = ptq1_dot(__builtin_amdgcn_perm(w1, w0, 0x07050301u), xv[30 + t / 2], s3);
     }
 
-    float acc = 0.0f;
-    acc += dx[0] * (float)(s0 - sx[0]);
-    acc += dx[1] * (float)(s1 - sx[1]);
-    acc += dx[2] * (float)(s2 - sx[2]);
-    acc += dx[3] * (float)(s3 - sx[3]);
-    const unsigned short dbits = (unsigned short)(w[6] >> 16);
-    return (float)(*(const _Float16*)&dbits) * acc;
+    float acc = __builtin_fmaf(dx[0], (float)(s0 - sx[0]), 0.0f);
+    acc = __builtin_fmaf(dx[1], (float)(s1 - sx[1]), acc);
+    acc = __builtin_fmaf(dx[2], (float)(s2 - sx[2]), acc);
+    acc = __builtin_fmaf(dx[3], (float)(s3 - sx[3]), acc);
+    return acc;
+}
+
+static __device__ __forceinline__ float ptq1_scale(unsigned w6) {
+    const unsigned short dbits = (unsigned short)(w6 >> 16);
+    return (float)(*(const _Float16*)&dbits);
+}
+
+// row += d * block, rounded twice on purpose. The decode GEMV and the verify
+// GEMM share this step, so a verified token's logits equal the decoded
+// token's bit for bit; a contracted fma here would round once and differ.
+static __device__ __forceinline__ float ptq1_acc_block(float acc, float d, float blk) {
+#pragma clang fp contract(off)
+    return acc + d * blk;
 }
 
 // Activation block g: four sub-block scales, 32 packed int8 dwords, and the
@@ -198,7 +209,8 @@ static __device__ __forceinline__ void ptq1_gemv_rows(
         ptq1_xblock x;
         ptq1_load_x(Xq, g, x);
         #pragma unroll
-        for (int i = 0; i < PTQ1_RL; ++i) acc[i] += ptq1_block_dot(w[i], x.xv, x.sx, x.dx);
+        for (int i = 0; i < PTQ1_RL; ++i)
+            acc[i] = ptq1_acc_block(acc[i], ptq1_scale(w[i][6]), ptq1_block_dot(w[i], x.xv, x.sx, x.dx));
     }
 
     #pragma unroll
@@ -288,6 +300,132 @@ extern "C" __global__ void gemv_ptq1g128_multi(
     b -= b2;
     if (b < BM) ptq1_bf16_row(B0, xf, yb0, b, K);
     else ptq1_bf16_row(B1, xf, yb1, b - BM, K);
+}
+
+// Short-verify GEMM Y[N, M] = X[N, K] A[M, K]^T for N <= 16 on the iu8 matrix
+// unit, computing every token's row exactly as gemv_ptq1g128 does: the same
+// exact integer sub-block sums, block_dot's float order, the lane-s residue
+// walk g = s, s+8, ..., and its xor-butterfly across the eight residues. A
+// verified token's projections therefore equal the decoded token's bit for bit.
+//
+// Workgroup: 16 rows, 8 waves. Wave w plays the GEMV's lane s = w. Lane L
+// holds A row (L & 15) and B token (L & 15) (gfx11 wave32 WMMA replicates both
+// operands across the half-waves); C[j] is row 2j + (L >> 4), token L & 15.
+// The body is gfx11-only; the host routes nothing else here.
+// One Q8_1 sub-block (32 elements) is two chained WMMAs, so its int32 sum is
+// exact before the float epilogue.
+typedef int __attribute__((ext_vector_type(4))) ptq1_v4i;
+typedef int __attribute__((ext_vector_type(8))) ptq1_v8i;
+
+// Digits {0,1,2} -> signed trits {-1,0,1}, four bytes per v_perm.
+static __device__ __forceinline__ int ptq1_trit4(unsigned d) {
+    return (int)__builtin_amdgcn_perm(0u, 0x000100FFu, d);
+}
+
+// A block's 128 signed trits as 32 dwords in activation-dword order (dword e
+// holds elements 4e..4e+3), the order ptq1_block_dot pairs them with xv[e].
+static __device__ __forceinline__ void ptq1_trits32(const unsigned w[7], int t32[32]) {
+    unsigned D[5];
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        ptq1_digits5(w[k], D);
+        #pragma unroll
+        for (int t = 0; t < 5; ++t) t32[4 * t + k] = ptq1_trit4(D[t]);
+    }
+    #pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        ptq1_digits5(w[4 + k], D);
+        #pragma unroll
+        for (int t = 0; t < 5; ++t) t32[20 + 2 * t + k] = ptq1_trit4(D[t]);
+    }
+    unsigned v = __builtin_amdgcn_perm(0u, w[6], 0x0c010c00u);
+    #pragma unroll
+    for (int t = 0; t < 4; t += 2) {
+        const unsigned w0 = v * 3u;
+        v = w0 & 0x00FF00FFu;
+        const unsigned w1 = v * 3u;
+        v = w1 & 0x00FF00FFu;
+        t32[30 + t / 2] = ptq1_trit4(__builtin_amdgcn_perm(w1, w0, 0x07050301u));
+    }
+}
+
+__launch_bounds__(256, 1)
+extern "C" __global__ void gemm_ptq1g128_verify(
+    const unsigned char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq, // [K/128 group][N]
+    float* __restrict__ Y,                 // [N, M]
+    int M, int K, int N, int residual
+) {
+#if defined(__GFX11__)
+    __shared__ float red[PTQ1_LPR][16][16];
+    const int L = threadIdx.x & 31;
+    const int s = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const int groups = K >> 7;
+    const int tok = L & 15;
+    const int row0 = blockIdx.x * 16;
+    const unsigned* rp = (const unsigned*)A + (long long)min(row0 + (L & 15), M - 1) * groups * 7;
+    const int xtok = tok < N ? tok : 0;
+    float acc[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+
+    for (int g = s; g < groups; g += PTQ1_LPR) {
+        const uint4* xb = (const uint4*)(Xq + (long long)g * N + xtok);
+        const uint4 h = xb[0];
+        const unsigned hw[4] = {h.x, h.y, h.z, h.w};
+        float dx[4];
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const unsigned short b = (unsigned short)(hw[k] & 0xFFFFu);
+            dx[k] = (float)(*(const _Float16*)&b);
+        }
+        ptq1_v4i bx[8];
+        #pragma unroll
+        for (int q = 0; q < 8; ++q) {
+            const uint4 v = xb[1 + q];
+            bx[q] = ptq1_v4i{(int)v.x, (int)v.y, (int)v.z, (int)v.w};
+        }
+        unsigned w[7];
+        const unsigned* wp = rp + (long long)g * 7;
+        #pragma unroll
+        for (int q = 0; q < 7; ++q) w[q] = wp[q];
+        int t32[32];
+        ptq1_trits32(w, t32);
+        float blk[8];
+        #pragma unroll
+        for (int sb = 0; sb < 4; ++sb) {
+            ptq1_v8i c = {0, 0, 0, 0, 0, 0, 0, 0};
+            #pragma unroll
+            for (int hh = 0; hh < 2; ++hh) {
+                const int t = 2 * sb + hh;
+                const ptq1_v4i av = {t32[4 * t], t32[4 * t + 1], t32[4 * t + 2], t32[4 * t + 3]};
+                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, av, true, bx[t], c, false);
+            }
+            #pragma unroll
+            for (int j = 0; j < 8; ++j)
+                blk[j] = __builtin_fmaf(dx[sb], (float)c[j], sb == 0 ? 0.0f : blk[j]);
+        }
+        const float d = ptq1_scale(w[6]);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) acc[j] = ptq1_acc_block(acc[j], __shfl(d, 2 * j + (L >> 4)), blk[j]);
+    }
+
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) red[s][2 * j + (L >> 4)][tok] = acc[j];
+    __syncthreads();
+    const int r = threadIdx.x >> 4, t = threadIdx.x & 15;
+    // The GEMV's shfl_xor butterfly over lanes s = 0..7 at offsets 4, 2, 1.
+    const float b0 = red[0][r][t] + red[4][r][t];
+    const float b1 = red[1][r][t] + red[5][r][t];
+    const float b2 = red[2][r][t] + red[6][r][t];
+    const float b3 = red[3][r][t] + red[7][r][t];
+    const float v = (b0 + b2) + (b1 + b3);
+    const int row = row0 + r;
+    if (row < M && t < N) {
+        float* yp = Y + (long long)t * M + row;
+        *yp = residual ? *yp + v : v;
+    }
+#endif
 }
 
 #define PTQ1_BATCH_TILE 8
