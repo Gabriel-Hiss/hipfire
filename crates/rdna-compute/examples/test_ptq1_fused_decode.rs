@@ -287,6 +287,49 @@ fn main() {
         ok &= exact("rmsnorm plain vs rmsnorm_batched", &download(&mut gpu, &plain), &download(&mut gpu, &plain_ref));
         ok &= check(&mut gpu, &mut rng, "rmsnorm", k, &plain_ref);
 
+        // FFN gate/up: the GLU GEMM + ptq1_glu_rotate_q8 against two GEMMs +
+        // ptq1_silu_mul_rotate_q8, compared on the Q8_1 blocks they produce.
+        // M=1030 leaves a ragged 32-row tile, 97 tokens a ragged token tile.
+        {
+            let (m, kh) = (1030usize, 2048usize);
+            let xq_in = gpu.alloc_tensor(&[n * Gpu::ptq1_xq_bytes(k) / 4], DType::F32).unwrap();
+            gpu.ptq1_rmsnorm_rotate_q8(&x, &nw, None, &xq_in, k, 1e-6, n).unwrap();
+            let wg = ptq1_weights(&mut rng, m, k);
+            let wu = ptq1_weights(&mut rng, m, k);
+            let wg = gpu.upload_raw(&wg, &[wg.len()]).unwrap();
+            let wu = gpu.upload_raw(&wu, &[wu.len()]).unwrap();
+            // The producers rotate in 1024-wide blocks: pad the hidden width.
+            let g = gpu.zeros(&[n * kh], DType::F32).unwrap();
+            let u = gpu.zeros(&[n * kh], DType::F32).unwrap();
+            let h = gpu.zeros(&[n * kh], DType::F32).unwrap();
+            let mut table = HashMap::new();
+            table.insert(kh, (0..kh).map(|_| if rng.next() & 1 == 0 { -1 } else { 1 }).collect::<Vec<i32>>());
+            for &w in &widths {
+                table.insert(w, (0..w).map(|_| if rng.next() & 1 == 0 { -1 } else { 1 }).collect::<Vec<i32>>());
+            }
+            gpu.configure_prism_hadamard(BLOCK, false, &table).expect("configure prism");
+            // Row stride of g/u/h is kh; only the first m columns are GEMM
+            // outputs, so run the GEMMs with the stride-m layout into
+            // [n x m] views and zero-pad through a copy per token.
+            let gm = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+            let um = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+            let hm = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+            gpu.gemm_ptq1g128_wmma_q8(&wg, &xq_in, &gm, m, k, n, false).unwrap();
+            gpu.gemm_ptq1g128_wmma_q8(&wu, &xq_in, &um, m, k, n, false).unwrap();
+            gpu.gemm_ptq1g128_wmma_q8_glu(&wg, &wu, &xq_in, &hm, m, k, n).unwrap();
+            for t in 0..n {
+                for (src, dst) in [(&gm, &g), (&um, &u), (&hm, &h)] {
+                    gpu.hip.memcpy_dtod_at(&dst.buf, t * kh * 4, &src.buf, t * m * 4, m * 4).unwrap();
+                }
+            }
+            let xq_ref = gpu.zeros(&[n * Gpu::ptq1_xq_bytes(kh) / 4], DType::F32).unwrap();
+            let xq_glu = gpu.zeros(&[n * Gpu::ptq1_xq_bytes(kh) / 4], DType::F32).unwrap();
+            gpu.ptq1_silu_mul_rotate_q8(&g, &u, &xq_ref, kh, n).unwrap();
+            gpu.ptq1_glu_rotate_q8(&h, &xq_glu, kh, n).unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            ok &= exact("glu gemm + rotate vs gate/up + silu", &download(&mut gpu, &xq_glu), &download(&mut gpu, &xq_ref));
+        }
+
         for (name, k) in [("silu_mul", 17408usize), ("sigmoid_mul", 6144)] {
             let a = gpu.upload_f32(&rng.vec(n * k, 4.0), &[n * k]).unwrap();
             let b = gpu.upload_f32(&rng.vec(n * k, 4.0), &[n * k]).unwrap();

@@ -77,6 +77,14 @@ static __device__ __forceinline__ unsigned t64_signed(unsigned d) {
 #ifndef T64_SCALE128
 #define T64_SCALE128 0
 #endif
+// T64_GLU: the FFN gate and up projections in one launch. A workgroup covers
+// 32 output channels: tile rows 0-31 are those rows of A (gate), rows 32-63
+// the same rows of A2 (up), so every row accumulates exactly as in two
+// separate launches. The epilogue writes silu(gate) * up, the value
+// ptq1_silu_mul_rotate_q8 computes, to Y[N x M]; `residual` is ignored.
+#ifndef T64_GLU
+#define T64_GLU 0
+#endif
 
 #if T64_TOKS == 128
 #define T64_THREADS 256
@@ -95,6 +103,9 @@ static __device__ __forceinline__ unsigned t64_signed(unsigned d) {
 extern "C" __launch_bounds__(T64_THREADS, T64_MIN_BLOCKS)
 __global__ void T64_KERNEL(
     const unsigned char* __restrict__ A,
+#if T64_GLU
+    const unsigned char* __restrict__ A2,
+#endif
     const t64_block_q8_1* __restrict__ Xq,
     float* __restrict__ Y,
     int M, int K, int N,
@@ -108,7 +119,11 @@ __global__ void T64_KERNEL(
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int wave = tid >> 5;
+#if T64_GLU
+    const int row0 = blockIdx.x * (T64_ROWS / 2);
+#else
     const int row0 = blockIdx.x * T64_ROWS;
+#endif
     const int tok0 = blockIdx.y * T64_TOKS;
     const int groups = K >> 7;
 
@@ -143,8 +158,13 @@ __global__ void T64_KERNEL(
 #endif
         {
             const int r = tid & 63;
+#if T64_GLU
+            const int arow = min(row0 + (r & 31), M - 1);
+            const unsigned* q = (const unsigned*)((r < 32 ? A : A2) + (long long)arow * groups * 28) + g * 7;
+#else
             const int arow = min(row0 + r, M - 1);
             const unsigned* q = (const unsigned*)(A + (long long)arow * groups * 28) + g * 7;
+#endif
             unsigned* dst = a_lds + r * T64_STRIDE;
             if (tid < 64) {
                 unsigned w[4];
@@ -296,6 +316,39 @@ __global__ void T64_KERNEL(
         __syncthreads();
     }
 
+#if T64_GLU
+    // Up rows (waves with w_row 32) hand their sums to the gate waves through
+    // the activation tile, which the last barrier released.
+    float* up_l = (float*)x_lds; // [32][T64_TOKS + 1]
+    if (w_row == 32) {
+        #pragma unroll
+        for (int j = 0; j < 2; ++j)
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int e = 0; e < 8; ++e)
+                    up_l[(i * 16 + 2 * e + (lane >> 4)) * (T64_TOKS + 1) + w_tok + j * 16 + (lane & 15)] = acc[i][j][e];
+    }
+    __syncthreads();
+    if (w_row == 0) {
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int tl = w_tok + j * 16 + (lane & 15);
+            if (tok0 + tl >= N) continue;
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int rl = i * 16 + 2 * e + (lane >> 4);
+                    if (row0 + rl < M) {
+                        const float gv = acc[i][j][e];
+                        const float uv = up_l[rl * (T64_TOKS + 1) + tl];
+                        Y[(long long)(tok0 + tl) * M + row0 + rl] = (gv / (1.0f + expf(-gv))) * uv;
+                    }
+                }
+        }
+    }
+#else
     #pragma unroll
     for (int j = 0; j < 2; ++j) {
         const int tok = tok0 + w_tok + j * 16 + (lane & 15);
@@ -311,4 +364,5 @@ __global__ void T64_KERNEL(
                 }
             }
     }
+#endif
 }

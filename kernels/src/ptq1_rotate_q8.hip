@@ -228,6 +228,24 @@ __global__ void PRQ_NAME(ptq1_silu_mul_rotate_q8)(
     prq_rotate_quantize(v, tile, Y, blockIdx.x, n_tok);
 }
 
+// rotate -> Q8_1 of a vector that already holds silu(gate) * up, written by
+// the GLU form of the PTQ1 prefill GEMM with the same expression as
+// ptq1_silu_mul_rotate_q8, so the output is bit-identical to that producer.
+extern "C" __launch_bounds__(PRQ_THREADS, 1)
+__global__ void PRQ_NAME(ptq1_glu_rotate_q8)(
+    const float* __restrict__ h,
+    const float* __restrict__ signs,
+    prq_block_q8_1_mmq* __restrict__ Y,
+    int k, int n_tok
+) {
+    __shared__ float tile[2 * PRQ_BLOCK];
+    const int base = blockIdx.x * PRQ_BLOCK + 4 * threadIdx.x;
+    const float4 hv = *(const float4*)(h + (long long)blockIdx.y * k + base);
+    const float4 sv = *(const float4*)(signs + base);
+    float v[4] = {hv.x * sv.x, hv.y * sv.y, hv.z * sv.z, hv.w * sv.w};
+    prq_rotate_quantize(v, tile, Y, blockIdx.x, n_tok);
+}
+
 // sigmoid_mul_f32 (attention output gate) -> rotate -> Q8_1 (o_proj input).
 extern "C" __launch_bounds__(PRQ_THREADS, 1)
 __global__ void PRQ_NAME(ptq1_sigmoid_mul_rotate_q8)(

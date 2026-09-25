@@ -6655,6 +6655,25 @@ pub const GEMM_PTQ1G128_WMMA_T128S_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
 );
 
+/// T64_GLU builds of the PTQ1 prefill GEMM (gate and up in one launch,
+/// epilogue writes silu(gate) * up), per activation scale group and tile.
+pub const GEMM_PTQ1G128_WMMA_T64_GLU_SRC: &str = concat!(
+    "#define T64_GLU 1\n#define T64_KERNEL gemm_ptq1g128_wmma_t64_glu\n",
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
+);
+pub const GEMM_PTQ1G128_WMMA_T128_GLU_SRC: &str = concat!(
+    "#define T64_GLU 1\n#define T64_TOKS 128\n#define T64_KERNEL gemm_ptq1g128_wmma_t128_glu\n",
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
+);
+pub const GEMM_PTQ1G128_WMMA_T64S_GLU_SRC: &str = concat!(
+    "#define T64_GLU 1\n#define T64_SCALE128 1\n#define T64_KERNEL gemm_ptq1g128_wmma_t64s_glu\n",
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
+);
+pub const GEMM_PTQ1G128_WMMA_T128S_GLU_SRC: &str = concat!(
+    "#define T64_GLU 1\n#define T64_TOKS 128\n#define T64_SCALE128 1\n#define T64_KERNEL gemm_ptq1g128_wmma_t128s_glu\n",
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
+);
+
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
 pub const V4F_SILU_MUL_CLAMP_SRC: &str =

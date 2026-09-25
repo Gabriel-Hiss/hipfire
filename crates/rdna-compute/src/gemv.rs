@@ -6426,6 +6426,41 @@ impl Gpu {
         self.ptq1_pair_rotate_q8("ptq1_silu_mul_rotate_q8", gate, up, xq, k, batch)
     }
 
+    /// rotate -> Q8_1 of `h = silu(gate) * up` written by
+    /// [`Self::gemm_ptq1g128_wmma_q8_glu`]; bit-identical to
+    /// [`Self::ptq1_silu_mul_rotate_q8`] over the separate gate and up.
+    pub fn ptq1_glu_rotate_q8(&mut self, h: &GpuTensor, xq: &GpuTensor, k: usize, batch: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        let sp = self.ptq1_prism_signs(k)?;
+        let kname = self.ptq1_producer("ptq1_glu_rotate_q8", batch)?;
+        let hp = h.buf.as_ptr();
+        let yp = xq.buf.as_ptr();
+        let ki = k as i32;
+        let bi = batch as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &hp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &ki as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
+        ];
+        let grid = [(k / 1024) as u32, batch as u32, 1];
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "ptq1_glu_rotate_q8", batch * k * 4);
+        let result = self.launch_maybe_blob(&kname, grid, [256, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(hp);
+            blob.push_ptr(sp);
+            blob.push_ptr(yp);
+            blob.push_i32(ki);
+            blob.push_i32(bi);
+            blob
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// `sigmoid_mul_f32 (x *= sigmoid(gate)) -> rotate -> Q8_1`, bit-identical
     /// to the chain; `x` itself is left unmodified.
     pub fn ptq1_sigmoid_mul_rotate_q8(
@@ -14370,7 +14405,7 @@ impl Gpu {
         // up (1.3-1.9x measured on gfx1100) and loses below, where most of
         // its tile is padding. It uses the gfx11 WMMA builtin.
         if Self::ptq1_t64_admitted(&self.arch, n) {
-            return self.launch_ptq1_t64(a_raw.buf.as_ptr(), xp, y.buf.as_ptr(), m, k, n, false, false);
+            return self.launch_ptq1_t64(a_raw.buf.as_ptr(), None, xp, y.buf.as_ptr(), m, k, n, false, false);
         }
         let short_verify = self.arch == "gfx1100" && n <= 16;
         let (kernel_name, kernel_src, grid) = if short_verify {
@@ -14449,13 +14484,42 @@ impl Gpu {
         );
         self.bind_thread()?;
         let scale128 = Ptq1ActFormat::prefill().scale128();
-        self.launch_ptq1_t64(a_raw.buf.as_ptr(), xq.buf.as_ptr(), y.buf.as_ptr(), m, k, n, residual, scale128)
+        self.launch_ptq1_t64(a_raw.buf.as_ptr(), None, xq.buf.as_ptr(), y.buf.as_ptr(), m, k, n, residual, scale128)
     }
 
+    /// The FFN gate and up projections over one pre-quantized activation in a
+    /// single launch: `y[N x m] = silu(xq @ w_gate^T) * (xq @ w_up^T)`, each
+    /// projection accumulated exactly as [`Self::gemm_ptq1g128_wmma_q8`] does
+    /// and combined with `ptq1_silu_mul_rotate_q8`'s expression. Feed `y` to
+    /// [`Self::ptq1_glu_rotate_q8`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_ptq1g128_wmma_q8_glu(
+        &mut self,
+        w_gate: &GpuTensor,
+        w_up: &GpuTensor,
+        xq: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert!(
+            k % 128 == 0 && Self::ptq1_t64_admitted(&self.arch, n),
+            "gemm_ptq1g128_wmma_q8_glu needs K%128==0 and the 64x64 tile (gfx11, N>32)"
+        );
+        self.bind_thread()?;
+        let scale128 = Ptq1ActFormat::prefill().scale128();
+        let up = w_up.buf.as_ptr();
+        self.launch_ptq1_t64(w_gate.buf.as_ptr(), Some(up), xq.buf.as_ptr(), y.buf.as_ptr(), m, k, n, false, scale128)
+    }
+
+    /// `a2` selects the GLU build: `ap` is the gate, `a2` the up projection,
+    /// and each workgroup covers 32 output rows of both.
     #[allow(clippy::too_many_arguments)]
     fn launch_ptq1_t64(
         &mut self,
         ap: *mut c_void,
+        a2: Option<*mut c_void>,
         xp: *mut c_void,
         yp: *mut c_void,
         m: usize,
@@ -14471,32 +14535,45 @@ impl Gpu {
         // With one scale per 128 the 128-token tile won on every Bonsai shape
         // at N=512 (5.61 vs 6.05 ms summed over the seven), so it takes all.
         let wide = n >= 256 && (scale128 || m >= 8192 || k >= 8192);
-        let (name, src, toks, threads) = match (wide, scale128) {
-            (true, false) => ("gemm_ptq1g128_wmma_t128", kernels::GEMM_PTQ1G128_WMMA_T128_SRC, 128, 256),
-            (false, false) => ("gemm_ptq1g128_wmma_t64", kernels::GEMM_PTQ1G128_WMMA_T64_SRC, 64, 128),
-            (true, true) => ("gemm_ptq1g128_wmma_t128s", kernels::GEMM_PTQ1G128_WMMA_T128S_SRC, 128, 256),
-            (false, true) => ("gemm_ptq1g128_wmma_t64s", kernels::GEMM_PTQ1G128_WMMA_T64S_SRC, 64, 128),
+        let glu = a2.is_some();
+        let (name, src, toks, threads) = match (glu, wide, scale128) {
+            (false, true, false) => ("gemm_ptq1g128_wmma_t128", kernels::GEMM_PTQ1G128_WMMA_T128_SRC, 128, 256),
+            (false, false, false) => ("gemm_ptq1g128_wmma_t64", kernels::GEMM_PTQ1G128_WMMA_T64_SRC, 64, 128),
+            (false, true, true) => ("gemm_ptq1g128_wmma_t128s", kernels::GEMM_PTQ1G128_WMMA_T128S_SRC, 128, 256),
+            (false, false, true) => ("gemm_ptq1g128_wmma_t64s", kernels::GEMM_PTQ1G128_WMMA_T64S_SRC, 64, 128),
+            (true, true, false) => ("gemm_ptq1g128_wmma_t128_glu", kernels::GEMM_PTQ1G128_WMMA_T128_GLU_SRC, 128, 256),
+            (true, false, false) => ("gemm_ptq1g128_wmma_t64_glu", kernels::GEMM_PTQ1G128_WMMA_T64_GLU_SRC, 64, 128),
+            (true, true, true) => ("gemm_ptq1g128_wmma_t128s_glu", kernels::GEMM_PTQ1G128_WMMA_T128S_GLU_SRC, 128, 256),
+            (true, false, true) => ("gemm_ptq1g128_wmma_t64s_glu", kernels::GEMM_PTQ1G128_WMMA_T64S_GLU_SRC, 64, 128),
         };
         self.ensure_kernel(name, src, name)?;
+        let up = a2.unwrap_or(std::ptr::null_mut());
         let mi = m as i32;
         let ki = k as i32;
         let ni = n as i32;
         let ri = i32::from(residual);
-        let mut params: Vec<*mut c_void> = vec![
-            &ap as *const _ as *mut c_void,
+        let mut params: Vec<*mut c_void> = vec![&ap as *const _ as *mut c_void];
+        if glu {
+            params.push(&up as *const _ as *mut c_void);
+        }
+        params.extend([
             &xp as *const _ as *mut c_void,
             &yp as *const _ as *mut c_void,
             &mi as *const _ as *mut c_void,
             &ki as *const _ as *mut c_void,
             &ni as *const _ as *mut c_void,
             &ri as *const _ as *mut c_void,
-        ];
-        let bytes = crate::profile::gemm_ptq1g128_bytes(m, k, n);
+        ]);
+        let rows = if glu { 2 * m } else { m };
+        let bytes = crate::profile::gemm_ptq1g128_bytes(rows, k, n);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_ptq1g128_wmma", bytes);
-        let grid = [m.div_ceil(64) as u32, n.div_ceil(toks) as u32, 1];
+        let grid = [m.div_ceil(if glu { 32 } else { 64 }) as u32, n.div_ceil(toks) as u32, 1];
         let result = self.launch_maybe_blob(name, grid, [threads, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ap);
+            if glu {
+                b.push_ptr(up);
+            }
             b.push_ptr(xp);
             b.push_ptr(yp);
             b.push_i32(mi);

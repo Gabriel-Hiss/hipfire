@@ -1412,9 +1412,11 @@ fn ptq1_q8_gemm_epilogue(
     }
 }
 
-/// Dense FFN block for PTQ1 weights: fused rmsnorm producer, gate and up
-/// GEMMs over the shared Q8_1 activation, fused silu_mul producer, down GEMM
-/// with the epilogue. Q8_1 activations reuse the f32 scratch they replace
+/// Dense FFN block for PTQ1 weights: fused rmsnorm producer, gate and up in
+/// one GLU GEMM writing silu(gate) * up, rotate + Q8_1 of that, down GEMM
+/// with the epilogue. Bit-identical to separate gate/up GEMMs followed by
+/// `ptq1_silu_mul_rotate_q8` (`HIPFIRE_PTQ1_GLU=0`), with half the f32
+/// traffic between them. Q8_1 activations reuse the f32 scratch they replace
 /// (`x_rot_batch`, `ffn_hidden_batch`), which is larger than the Q8_1 form.
 #[allow(clippy::too_many_arguments)]
 fn ptq1_prefill_ffn(
@@ -1430,10 +1432,17 @@ fn ptq1_prefill_ffn(
     dim: usize,
     hidden_dim: usize,
 ) -> HipResult<()> {
+    static GLU: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_PTQ1_GLU").as_deref() != Ok("0"));
     gpu.ptq1_rmsnorm_rotate_q8(&pbs.x_batch, ffn_norm, None, &pbs.x_rot_batch, dim, eps, n)?;
-    gpu.gemm_ptq1g128_wmma_q8(&w_gate.buf, &pbs.x_rot_batch, &pbs.gate_ffn_batch, w_gate.m, w_gate.k, n, false)?;
-    gpu.gemm_ptq1g128_wmma_q8(&w_up.buf, &pbs.x_rot_batch, &pbs.up_batch, w_up.m, w_up.k, n, false)?;
-    gpu.ptq1_silu_mul_rotate_q8(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch, hidden_dim, n)?;
+    if *GLU && w_gate.m == w_up.m {
+        gpu.gemm_ptq1g128_wmma_q8_glu(&w_gate.buf, &w_up.buf, &pbs.x_rot_batch, &pbs.gate_ffn_batch, w_gate.m, w_gate.k, n)?;
+        gpu.ptq1_glu_rotate_q8(&pbs.gate_ffn_batch, &pbs.ffn_hidden_batch, hidden_dim, n)?;
+    } else {
+        gpu.gemm_ptq1g128_wmma_q8(&w_gate.buf, &pbs.x_rot_batch, &pbs.gate_ffn_batch, w_gate.m, w_gate.k, n, false)?;
+        gpu.gemm_ptq1g128_wmma_q8(&w_up.buf, &pbs.x_rot_batch, &pbs.up_batch, w_up.m, w_up.k, n, false)?;
+        gpu.ptq1_silu_mul_rotate_q8(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch, hidden_dim, n)?;
+    }
     ptq1_q8_gemm_epilogue(gpu, pbs, w_down, &pbs.ffn_hidden_batch, epilogue, n)
 }
 
