@@ -23,6 +23,13 @@
 // BF16 widens to F32 losslessly (bf16 IS the top 16 bits of an f32), so the
 // inner loop is a plain FMA with no decode and no scale handling.
 #define BF16_BATCH_TILE 8
+// Rows per wave. The activation matrix is read once per row tile, so with one
+// row per wave a [512 x 5120] prefill re-read 10.5 MB from cache for each of
+// the 48 gate rows (~500 MB per call, 209 us measured). Four rows cut that
+// traffic 4x. Each output keeps its lane's k sequence and the shuffle tree;
+// the compiler's FMA contraction differs from the one-row form, which the
+// CPU-oracle channel test measures as equal or smaller error.
+#define BF16_ROW_TILE 4
 
 __launch_bounds__(32, 8)
 extern "C" __global__ void gemm_bf16_xf32_batched(
@@ -31,35 +38,47 @@ extern "C" __global__ void gemm_bf16_xf32_batched(
     float* __restrict__ Y,                 // [N x M] f32
     int M, int K, int N
 ) {
-    const int row = blockIdx.x;
+    const int row0 = blockIdx.x * BF16_ROW_TILE;
     const int n0 = blockIdx.y * BF16_BATCH_TILE;
-    if (row >= M || n0 >= N) return;
+    if (row0 >= M || n0 >= N) return;
     const int lane = threadIdx.x;
-    const unsigned short* wrow = W + (long long)row * K;
 
-    float acc[BF16_BATCH_TILE];
+    // Rows past M read row M-1; their stores are suppressed.
+    const unsigned short* wrow[BF16_ROW_TILE];
     #pragma unroll
-    for (int nb = 0; nb < BF16_BATCH_TILE; ++nb) acc[nb] = 0.0f;
+    for (int r = 0; r < BF16_ROW_TILE; ++r) wrow[r] = W + (long long)min(row0 + r, M - 1) * K;
+    // Columns past N read column N-1; their stores are suppressed.
+    const float* xcol[BF16_BATCH_TILE];
+    #pragma unroll
+    for (int nb = 0; nb < BF16_BATCH_TILE; ++nb) xcol[nb] = X + (long long)min(n0 + nb, N - 1) * K;
 
-    // One weight element feeds all BF16_BATCH_TILE columns, so the weight load
-    // is amortised over the tile — the same reuse `gemm_ptq1g128_prefill` gets
-    // from decoding a group once for eight columns.
+    float acc[BF16_ROW_TILE][BF16_BATCH_TILE];
+    #pragma unroll
+    for (int r = 0; r < BF16_ROW_TILE; ++r)
+        #pragma unroll
+        for (int nb = 0; nb < BF16_BATCH_TILE; ++nb) acc[r][nb] = 0.0f;
+
+    // One weight element feeds all BF16_BATCH_TILE columns and one activation
+    // element all BF16_ROW_TILE rows.
     for (int k = lane; k < K; k += 32) {
-        const float w = __uint_as_float((unsigned int)wrow[k] << 16);
+        float w[BF16_ROW_TILE];
+        #pragma unroll
+        for (int r = 0; r < BF16_ROW_TILE; ++r) w[r] = __uint_as_float((unsigned int)wrow[r][k] << 16);
         #pragma unroll
         for (int nb = 0; nb < BF16_BATCH_TILE; ++nb) {
-            const int n = n0 + nb;
-            if (n >= N) break;
-            acc[nb] += w * X[(long long)n * K + k];
+            const float x = xcol[nb][k];
+            #pragma unroll
+            for (int r = 0; r < BF16_ROW_TILE; ++r) acc[r][nb] += w[r] * x;
         }
     }
 
     #pragma unroll
-    for (int nb = 0; nb < BF16_BATCH_TILE; ++nb) {
-        const int n = n0 + nb;
-        if (n >= N) break;
-        float s = acc[nb];
-        for (int off = 16; off > 0; off >>= 1) s += __shfl_down(s, off);
-        if (lane == 0) Y[(long long)n * M + row] = s;
+    for (int r = 0; r < BF16_ROW_TILE; ++r) {
+        #pragma unroll
+        for (int nb = 0; nb < BF16_BATCH_TILE; ++nb) {
+            float s = acc[r][nb];
+            for (int off = 16; off > 0; off >>= 1) s += __shfl_down(s, off);
+            if (lane == 0 && row0 + r < M && n0 + nb < N) Y[(long long)(n0 + nb) * M + row0 + r] = s;
+        }
     }
 }

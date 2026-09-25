@@ -14418,7 +14418,7 @@ impl Gpu {
             crate::profile::begin_timer(&self.hip, "gemm", "gemm_bf16_xf32_batched", bytes);
         let result = self.launch_maybe_blob(
             "gemm_bf16_xf32_batched",
-            [m as u32, n.div_ceil(8) as u32, 1],
+            [m.div_ceil(4) as u32, n.div_ceil(8) as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
