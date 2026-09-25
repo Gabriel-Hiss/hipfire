@@ -54,10 +54,13 @@
 // row_shl:N gives lane i the value from lane i+N; after each addition the next
 // DPP therefore observes the same partial sums as offsets 16,8,4,2,1 in the
 // original tree.
+// The first step must give lane i the value of lane i+16 (identity lane
+// selects across the two halves); selects of 0 hand every lane lane 16 and
+// corrupt every partial sum but lane 0's first one.
 __device__ __forceinline__ float hipfire_gdn_reduce_sum_lane0_dpp(float value) {
     int bits = __builtin_bit_cast(int, value);
     const int other_half = __builtin_amdgcn_permlanex16(
-        bits, bits, 0, 0, false, false);
+        bits, bits, 0x76543210u, 0xfedcba98u, false, false);
     value += __builtin_bit_cast(float, other_half);
 
     bits = __builtin_bit_cast(int, value);
