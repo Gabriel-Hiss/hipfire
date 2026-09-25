@@ -4028,7 +4028,7 @@ pub(crate) fn batch_chunk_embed_tokens(
     // device pointer instead of taking them as a baked-in scalar arg.
     //
     // Other formats fall back to the per-token loop (kept for correctness
-    // breadth; the MQ4-quantized hot path doesn't hit them).
+    // breadth; the MQ4-quantized and PTQ1 hot paths don't hit them).
     //
     // Multi-GPU band-mode: skip embedding when this is not the first band.
     // The activation already lives in `pbs.x_batch` from a peer-copy of
@@ -4037,7 +4037,7 @@ pub(crate) fn batch_chunk_embed_tokens(
         && !pre_embedded
         && matches!(
             weights.embd_format,
-            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0
+            EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 | EmbeddingFormat::PTQ1G128H
         )
     {
         if !pre_uploaded {
@@ -4058,6 +4058,15 @@ pub(crate) fn batch_chunk_embed_tokens(
             }
             EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?;
+            }
+            EmbeddingFormat::PTQ1G128H => {
+                gpu.embedding_lookup_ptq1g128_prism_batched(
                     &weights.token_embd,
                     &pbs.x_batch,
                     &pbs.tokens,

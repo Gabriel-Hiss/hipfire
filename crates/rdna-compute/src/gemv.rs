@@ -2331,6 +2331,42 @@ impl Gpu {
         self.prism_hadamard(&latent, out, dim, 1, true)
     }
 
+    /// Batched [`Self::embedding_lookup_ptq1g128_prism`]: `n` token ids from
+    /// device `tokens` into rows of `out` `[n x dim]`, then one inverse Prism
+    /// Hadamard over the batch, in place. Same values as the per-token path.
+    pub fn embedding_lookup_ptq1g128_prism_batched(
+        &mut self,
+        table: &GpuTensor,
+        out: &GpuTensor,
+        tokens: &GpuTensor,
+        n: usize,
+        dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(dim % 128, 0, "PTQ1G128 embedding requires dim%128==0");
+        const NAME: &str = "embedding_lookup_ptq1g128_batched";
+        self.ensure_kernel(NAME, kernels::EMBEDDING_LOOKUP_PTQ1G128_SRC, NAME)?;
+        let tp = table.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let kp = tokens.buf.as_ptr();
+        let dim_i = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &dim_i as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(NAME, [(dim / 128) as u32, n as u32, 1], [128, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(tp);
+            blob.push_ptr(op);
+            blob.push_ptr(kp);
+            blob.push_i32(dim_i);
+            blob
+        })?;
+        self.prism_hadamard(out, out, dim, n, true)
+    }
+
     /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256. Rotates x per group via ds_swizzle,
     /// then standard 4-bit dot product. signs1/signs2 are the FWHT sign tables (256 floats each).
     pub fn gemv_mq4g256(

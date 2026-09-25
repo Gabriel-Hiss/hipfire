@@ -32,3 +32,21 @@ extern "C" __global__ void embedding_lookup_ptq1g128(
         }
     }
 }
+
+// Prefill form: token blockIdx.y of `tokens` into row blockIdx.y of `out`.
+// Grid: [dim / 128, n_tokens]. Same values as the single-token kernel.
+extern "C" __global__ void embedding_lookup_ptq1g128_batched(
+    const unsigned char* __restrict__ table,
+    float* __restrict__ out,
+    const int* __restrict__ tokens,
+    int dim
+) {
+    const int groups = dim / 128;
+    const int g = blockIdx.x;
+    const unsigned char* q = table + ((long long)tokens[blockIdx.y] * groups + g) * 28;
+    const float d = (float)(*(const _Float16*)(q + 26));
+    float* o = out + (long long)blockIdx.y * dim + g * 128;
+    for (int e = threadIdx.x; e < 128; e += blockDim.x) {
+        o[e] = d * ptq1_trit(q, e);
+    }
+}
