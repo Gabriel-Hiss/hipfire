@@ -1691,6 +1691,25 @@ fn dispatch_attend(
                             || gfx12_query16_workload_eligible(ctx))
                         && io.head_dim % 32 == 0
                         && io.head_dim <= 256;
+                    // A speculative verify block (<= 16 queries) takes the
+                    // split-key kernel: the 64-query pair kernel would run a
+                    // quarter of its waves on n_heads workgroups.
+                    if let Some(partials) = io.flash_partials.filter(|p| {
+                        gpu.attention_q8_0_verify_split_admitted(io.batch_size, io.n_heads, io.n_kv_heads, io.head_dim, p)
+                    }) {
+                        return hip!(gpu.attention_q8_0_verify_split(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            partials,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.batch_size,
+                        ));
+                    }
                     if wmma_ok {
                         return hip!(gpu.attention_q8_0_flash_prefill_wmma(
                             io.q,

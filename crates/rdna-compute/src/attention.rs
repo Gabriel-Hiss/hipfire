@@ -2841,6 +2841,118 @@ impl Gpu {
         })
     }
 
+    /// Most key ranges [`Self::attention_q8_0_verify_split`] splits into.
+    const Q8_VERIFY_SPLIT_MAX: usize = 32;
+
+    /// Key ranges [`Self::attention_q8_0_verify_split`] uses with a `partials`
+    /// buffer of `numel` floats: fixed per buffer (not per call) so a
+    /// captured graph replays with the same grid at any position.
+    fn q8_verify_splits(numel: usize, n_heads: usize) -> usize {
+        (numel / (16 * n_heads * 258)).min(Self::Q8_VERIFY_SPLIT_MAX)
+    }
+
+    /// Whether [`Self::attention_q8_0_verify_split`] covers this shape with
+    /// `partials` (the layer's flash partials buffer).
+    pub fn attention_q8_0_verify_split_admitted(
+        &self,
+        batch_size: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        partials: &GpuTensor,
+    ) -> bool {
+        self.flash_prefill_pair_applies(head_dim, n_heads, n_kv_heads)
+            && (2..=16).contains(&batch_size)
+            && n_heads / n_kv_heads <= 8
+            && Self::q8_verify_splits(partials.numel(), n_heads) >= 4
+    }
+
+    /// Causal Q8_0-KV attention for a verify block of at most 16 queries on
+    /// gfx11 at head_dim 256, split over the key axis; see
+    /// `kernels/src/attention_q8_0_verify_split_pair.hip`. Same inputs and
+    /// output as [`Self::attention_q8_0_flash_prefill_wmma`]; `partials`
+    /// holds the per-range (m, l, O) that `attention_dflash_split_merge` folds.
+    /// 1.3k-token context, 24/4 heads: 311 -> 88 us.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_verify_split(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        assert!(self.attention_q8_0_verify_split_admitted(batch_size, n_heads, n_kv_heads, head_dim, partials));
+        self.bind_thread()?;
+        const SPLIT: &str = "attention_q8_0_verify_split_pair";
+        const MERGE: &str = "attention_dflash_split_merge";
+        self.ensure_kernel(SPLIT, kernels::ATTENTION_Q8_0_VERIFY_SPLIT_PAIR_SRC, SPLIT)?;
+        self.ensure_kernel(MERGE, kernels::ATTENTION_DFLASH_GQA_SPLIT_SRC, MERGE)?;
+        let n_splits = Self::q8_verify_splits(partials.numel(), n_heads);
+        let rep = n_heads / n_kv_heads;
+        let (qp, kp, vp, op, pp, part) = (
+            q.buf.as_ptr(),
+            k_cache.buf.as_ptr(),
+            v_cache.buf.as_ptr(),
+            out.buf.as_ptr(),
+            positions.buf.as_ptr(),
+            partials.buf.as_ptr(),
+        );
+        let (nh, nkv, bs) = (n_heads as i32, n_kv_heads as i32, batch_size as i32);
+        let sc = 1.0f32 / 16.0; // 1 / sqrt(256)
+        // At least 8 key tiles per range: fewer, longer ranges measured faster
+        // than more, shorter ones at 0.6k-5k keys (less partial traffic).
+        let min_tiles = 8i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &part as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &min_tiles as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(SPLIT, [n_kv_heads as u32, n_splits as u32, 1], [64 * rep as u32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(qp);
+            b.push_ptr(kp);
+            b.push_ptr(vp);
+            b.push_ptr(part);
+            b.push_ptr(pp);
+            b.push_i32(nh);
+            b.push_i32(nkv);
+            b.push_i32(bs);
+            b.push_f32(sc);
+            b.push_i32(min_tiles);
+            b
+        })?;
+        let (hd, ns) = (head_dim as i32, n_splits as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &part as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ns as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(MERGE, [n_heads as u32, batch_size as u32, 1], [head_dim as u32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(part);
+            b.push_ptr(op);
+            b.push_i32(nh);
+            b.push_i32(hd);
+            b.push_i32(ns);
+            b
+        })
+    }
+
     /// Multi-slot variant of `attention_q8_0_flash_prefill_wmma`.
     ///
     /// Same tile-array ABI as [`attention_q8_0_flash_prefill_slots`] (the
