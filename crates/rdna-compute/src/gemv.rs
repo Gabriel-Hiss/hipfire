@@ -6343,11 +6343,11 @@ impl Gpu {
     }
 
     /// Load the `ptq1_*_rotate_q8` producer `base` in the activation format
-    /// for `batch` tokens and return the kernel name to launch. Decode
-    /// (`batch == 1`) always uses the Q8_1 contract; prefill uses
-    /// [`Ptq1ActFormat::prefill`].
+    /// for `batch` tokens and return the kernel name to launch. Decode and
+    /// verify batches (up to [`Self::PTQ1_VERIFY_MAX_N`] tokens) use the Q8_1
+    /// contract; prefill uses [`Ptq1ActFormat::prefill`].
     fn ptq1_producer(&mut self, base: &'static str, batch: usize) -> HipResult<String> {
-        let fmt = if batch > 1 { Ptq1ActFormat::prefill() } else { Ptq1ActFormat::Q8 };
+        let fmt = if batch > Self::PTQ1_VERIFY_MAX_N { Ptq1ActFormat::prefill() } else { Ptq1ActFormat::Q8 };
         let name = format!("{base}{}", fmt.suffix());
         if !self.functions.contains_key(&name) {
             let rename = if fmt.suffix().is_empty() {
@@ -14417,7 +14417,7 @@ impl Gpu {
         if Self::ptq1_t64_admitted(&self.arch, n) {
             return self.launch_ptq1_t64(a_raw.buf.as_ptr(), None, xp, y.buf.as_ptr(), m, k, n, false, false);
         }
-        if self.arch.starts_with("gfx11") && n <= 16 {
+        if Self::ptq1_verify_admitted(&self.arch, n) {
             return self.gemm_ptq1g128_verify(a_raw.buf.as_ptr(), xp, y.buf.as_ptr(), m, k, n, false);
         }
         let kernel_name = "gemm_ptq1g128_wmma";
@@ -14504,15 +14504,30 @@ impl Gpu {
     }
 
     /// Whether `gemm_ptq1g128_wmma` takes the 64x64 workgroup tile for `n`
-    /// tokens on `arch`, and whether [`Self::gemm_ptq1g128_wmma_q8`] is usable.
+    /// tokens on `arch`.
     pub fn ptq1_t64_admitted(arch: &str, n: usize) -> bool {
         arch.starts_with("gfx11") && n > 32
     }
 
+    /// Whether `n` tokens take `gemm_ptq1g128_verify` (the decode GEMV's
+    /// arithmetic per token) on `arch`.
+    pub fn ptq1_verify_admitted(arch: &str, n: usize) -> bool {
+        arch.starts_with("gfx11") && n <= Self::PTQ1_VERIFY_MAX_N
+    }
+
+    /// Largest batch the verify GEMM and the Q8_1 producer format cover.
+    pub const PTQ1_VERIFY_MAX_N: usize = 16;
+
+    /// Whether [`Self::gemm_ptq1g128_wmma_q8`] is usable for `n` tokens.
+    pub fn ptq1_q8_gemm_admitted(arch: &str, n: usize) -> bool {
+        Self::ptq1_t64_admitted(arch, n) || Self::ptq1_verify_admitted(arch, n)
+    }
+
     /// `gemm_ptq1g128_wmma` over an activation already quantized into the
     /// Q8_1 GEMM layout `[k/128][n]` by a `ptq1_*_rotate_q8` producer. With
-    /// `residual`, results add into `y` instead of overwriting it. Only the
-    /// 64x64 tile has this entry; see [`Self::ptq1_t64_admitted`].
+    /// `residual`, results add into `y` instead of overwriting it. Up to
+    /// [`Self::PTQ1_VERIFY_MAX_N`] tokens run the verify GEMM, above 32 the
+    /// 64x64 tile; see [`Self::ptq1_q8_gemm_admitted`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_ptq1g128_wmma_q8(
         &mut self,
@@ -14525,10 +14540,13 @@ impl Gpu {
         residual: bool,
     ) -> HipResult<()> {
         assert!(
-            k % 128 == 0 && Self::ptq1_t64_admitted(&self.arch, n),
-            "gemm_ptq1g128_wmma_q8 needs K%128==0 and the 64x64 tile (gfx11, N>32)"
+            k % 128 == 0 && Self::ptq1_q8_gemm_admitted(&self.arch, n),
+            "gemm_ptq1g128_wmma_q8 needs K%128==0 on gfx11 with N<=16 or N>32"
         );
         self.bind_thread()?;
+        if Self::ptq1_verify_admitted(&self.arch, n) {
+            return self.gemm_ptq1g128_verify(a_raw.buf.as_ptr(), xq.buf.as_ptr(), y.buf.as_ptr(), m, k, n, residual);
+        }
         let scale128 = Ptq1ActFormat::prefill().scale128();
         self.launch_ptq1_t64(a_raw.buf.as_ptr(), None, xq.buf.as_ptr(), y.buf.as_ptr(), m, k, n, residual, scale128)
     }

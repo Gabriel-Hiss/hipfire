@@ -1381,7 +1381,9 @@ fn run_proj_gemm(
 /// the Q8_1 quantization, written straight into the GEMM's `[k/128][n]`
 /// layout, and residual adds move into the GEMM epilogue. Every stage keeps
 /// the arithmetic and order of the kernel it replaces (`test_ptq1_fused_decode`
-/// pins the producers bit-exact). Needs the 64x64 GEMM tile (gfx11, n > 32).
+/// pins the producers bit-exact). Needs a Q8_1-input GEMM for `n` on gfx11:
+/// the verify GEMM up to 16 tokens (a speculative verify then runs the decode
+/// path's arithmetic per token) or the 64x64 tile above 32.
 /// `HIPFIRE_PTQ1_FUSED=0` restores the unfused chain.
 fn ptq1_prefill_fused(gpu: &Gpu, n: usize, ws: &[&WeightTensor]) -> bool {
     static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -1389,7 +1391,7 @@ fn ptq1_prefill_fused(gpu: &Gpu, n: usize, ws: &[&WeightTensor]) -> bool {
     });
     *ENABLED
         && gpu.prism_hadamard_block_size() == 1024
-        && Gpu::ptq1_t64_admitted(&gpu.arch, n)
+        && Gpu::ptq1_q8_gemm_admitted(&gpu.arch, n)
         && ws.iter().all(|w| w.gpu_dtype == DType::PTQ1G128H && w.k % 1024 == 0)
 }
 
@@ -1435,7 +1437,7 @@ fn ptq1_prefill_ffn(
     static GLU: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_PTQ1_GLU").as_deref() != Ok("0"));
     gpu.ptq1_rmsnorm_rotate_q8(&pbs.x_batch, ffn_norm, None, &pbs.x_rot_batch, dim, eps, n)?;
-    if *GLU && w_gate.m == w_up.m {
+    if *GLU && w_gate.m == w_up.m && Gpu::ptq1_t64_admitted(&gpu.arch, n) {
         gpu.gemm_ptq1g128_wmma_q8_glu(&w_gate.buf, &w_up.buf, &pbs.x_rot_batch, &pbs.gate_ffn_batch, w_gate.m, w_gate.k, n)?;
         gpu.ptq1_glu_rotate_q8(&pbs.gate_ffn_batch, &pbs.ffn_hidden_batch, hidden_dim, n)?;
     } else {
