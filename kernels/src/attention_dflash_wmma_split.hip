@@ -18,10 +18,11 @@
 // partial (m, l, O[128]) per (query, head, split) and
 // `attention_dflash_split_merge` folds the splits.
 //
-// Sliding window: key kj is visible to query q iff kj >= key_lo0 + q (the
-// DFlash2 non-causal window `|ctx_span + q - kj| < W` gives
-// key_lo0 = ctx_span - W + 1; its upper side never binds for B < W). Full
-// attention passes a key_lo0 far below zero.
+// Visibility: key kj is visible to query q iff key_lo0 + q <= kj <= key_hi0 + q.
+// A sliding window W over a context of ctx_span keys gives key_lo0 =
+// ctx_span - W + 1 (the upper side of the non-causal window never binds for
+// B < W); a causal sliding layer adds key_hi0 = ctx_span (no later block
+// token). Full attention passes bounds far outside [0, L).
 //
 // Partials: F32 [B][n_heads][n_splits][130] = m, l, O.
 // Grid:  [n_kv_heads, n_splits]; block [32 * (n_heads / n_kv_heads)], rep <= 8.
@@ -44,7 +45,7 @@ __global__ void attention_dflash_gqa_split_f32(
     const float* __restrict__ v,
     float* __restrict__ partials,
     int B, int L, int n_heads, int n_kv_heads,
-    float scale, int tiles_per_split, int key_lo0
+    float scale, int tiles_per_split, int key_lo0, int key_hi0
 ) {
     __shared__ _Float16 K_lds[DGS_KT][DGS_HD];
     __shared__ _Float16 Vt_lds[DGS_HD][DGS_KT];
@@ -118,7 +119,7 @@ __global__ void attention_dflash_gqa_split_f32(
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int key = kt + 2 * j + hid;
-                s[j] = (key < k_end && key >= key_lo0 + row) ? s[j] * scale : -INFINITY;
+                s[j] = (key < k_end && key >= key_lo0 + row && key <= key_hi0 + row) ? s[j] * scale : -INFINITY;
                 tmax = fmaxf(tmax, s[j]);
             }
             tmax = fmaxf(tmax, __shfl_xor(tmax, 16));

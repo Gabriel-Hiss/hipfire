@@ -79,6 +79,13 @@ pub struct DflashConfig {
     /// Public indicator so callers can skip last-layer full backfill and reuse
     /// the same `W` ring for every layer.
     pub all_layers_sliding: bool,
+    /// Whether sliding layers mask later block tokens (key position <= query
+    /// position). The artifact's `is_causal` when it sets one, else `true`:
+    /// the upstream DFlash attention makes `sliding_attention` layers causal
+    /// unless the config says otherwise (DFlash2 checkpoints set `false`).
+    /// Running a causally trained draft non-causally cost ~12-14% of τ on the
+    /// 6-layer Qwen3.5-27B draft. Full-attention layers are never causal.
+    pub sliding_causal: bool,
     /// DFlash2 dynamic-conv knobs from nested `dflash_config` (defaults in
     /// parens): group 16, kernel 2, rank 256, top_k 16. `None` when the
     /// artifact is legacy DFlash (fields absent) — forward then skips conv
@@ -217,6 +224,13 @@ impl DflashConfig {
                 }
             }
         };
+        let sliding_causal = meta
+            .get("config")
+            .and_then(|c| c.get("is_causal"))
+            .or_else(|| df.get("is_causal"))
+            .or_else(|| df.get("dflash_config").and_then(|c| c.get("is_causal")))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
         // Nested dflash_config fields (DFlash2) with legacy flat fallbacks.
         let dflash_cfg_nested = df.get("dflash_config").and_then(|v| v.as_object());
         let dflash_u64 = |key: &str| {
@@ -247,6 +261,7 @@ impl DflashConfig {
             num_target_layers,
             declared_window,
             all_layers_sliding,
+            sliding_causal,
             conv_group_size,
             conv_kernel_size,
             selector_rank,
@@ -2863,10 +2878,12 @@ pub fn draft_forward_opts(
                 cfg.n_heads,
                 cfg.n_kv_heads,
                 hd,
-                is_swa_layer.then_some((span, swa_w)),
+                is_swa_layer.then_some((span, swa_w, cfg.sliding_causal)),
             )?;
         } else if is_swa_layer {
-            // Faithful non-causal SWA: window= swa_w, ctx_span= span
+            // Faithful non-causal SWA: window= swa_w, ctx_span= span. This
+            // scalar kernel has no causal variant, so a causally trained
+            // sliding layer runs non-causal off gfx11.
             gpu.attention_dflash_sliding_f32(
                 &scratch.q,
                 k_cat_l,
@@ -3354,6 +3371,7 @@ pub fn propose_candidates_host(
             num_target_layers: 0,
             declared_window: None,
             all_layers_sliding: false,
+            sliding_causal: true,
             conv_group_size: None,
             conv_kernel_size: None,
             selector_rank: Some(rank),
@@ -3473,6 +3491,7 @@ pub fn propose_candidates_device(
             num_target_layers: 0,
             declared_window: None,
             all_layers_sliding: false,
+            sliding_causal: true,
             conv_group_size: None,
             conv_kernel_size: None,
             selector_rank: Some(rank),
