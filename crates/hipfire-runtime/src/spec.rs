@@ -778,6 +778,22 @@ pub trait Speculator {
         self.reset(gpu)
     }
 
+    /// Retract the window the last `step` committed at `position` so target
+    /// and drafter hold only its first `keep` processed tokens (the seed plus
+    /// `keep - 1` accepted drafts), for a semantic stop inside the window.
+    /// `Ok(true)` when done in place; `Ok(false)` when this speculator cannot,
+    /// and the caller falls back to reset + full-history realign.
+    fn retract_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        keep: usize,
+    ) -> Result<bool, String> {
+        let _ = (gpu, target, position, keep);
+        Ok(false)
+    }
+
     /// Live post-reset evidence for serve-fault-inject snapshots.
     ///
     /// `None` means the live Speculator does not expose DFlash-style evidence

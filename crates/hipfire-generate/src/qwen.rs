@@ -3524,7 +3524,44 @@ pub fn generate_spec(
         // state from an invalid oversize history. Abort/prefill errors share
         // the single fail-closed terminal (no second done/error).
         let keep = consumed.min(committed_tail.len());
-        if keep < committed_tail.len() {
+        // Cheap path first: the speculator rewinds the window it just committed
+        // to its observed prefix in place (DFlash chain: snapshot + GDN tape
+        // replay of `keep` tokens). Falls through to the full realign below
+        // only when the speculator cannot.
+        let retracted = keep < committed_tail.len()
+            && match spec.retract_window(gpu, slot, position_before, keep) {
+                Ok(done) => done,
+                Err(msg) => {
+                    let ep = production_fail_closed_rollback_live(
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                        &mut m.dflash_checkpoints,
+                        &mut m.asst_turn_cache,
+                        gpu,
+                        slot,
+                        spec.as_mut(),
+                    );
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &format!("spec window retract failed: {msg}"),
+                        "gpu",
+                        true,
+                        &ep,
+                    );
+                    drop(guard);
+                    return None;
+                }
+            };
+        if retracted {
+            debug_assert_eq!(
+                position,
+                spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode).position,
+                "retracted window must land where the full realign would"
+            );
+        }
+        if keep < committed_tail.len() && !retracted {
             let plan = spec_prefix_realign_plan(&prompt_tokens, first_token, &raw_decode);
             let compact_offset = slot.kv_cache_mut().map(|kv| kv.compact_offset).unwrap_or(0);
             if let Err(msg) = spec_prefix_realign_admit(

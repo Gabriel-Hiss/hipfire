@@ -1337,6 +1337,10 @@ pub struct GdnTape {
     pub q_scratch: GpuTensor,     // [max_n × v_dim] (post repeat-interleave)
     pub k_scratch: GpuTensor,     // [max_n × v_dim]
     pub attn_scratch: GpuTensor,  // [max_n × v_dim]
+    /// Rows the last chain verify captured (its block length), or 0 when that
+    /// verify did not populate the tape. Lets a caller rewind the window it
+    /// just committed to a shorter prefix by replaying this tape again.
+    pub valid_rows: usize,
 }
 
 impl GdnTape {
@@ -1383,6 +1387,7 @@ impl GdnTape {
             q_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             k_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
             attn_scratch: gpu.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            valid_rows: 0,
         })
     }
 
@@ -4727,7 +4732,17 @@ pub fn spec_step_dflash(
         moe_router_logits_present,
     );
     let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
-    let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
+    let mut gdn_tape_opt = match gdn_tape {
+        Some(tape) if use_tape_replay => {
+            tape.valid_rows = b;
+            Some(tape)
+        }
+        Some(tape) => {
+            tape.valid_rows = 0;
+            None
+        }
+        None => None,
+    };
 
     if phase_on {
         gpu.hip.device_synchronize()?;

@@ -620,6 +620,9 @@ pub struct DflashSpeculator {
     /// Greedy-only CPU PLD → DFlash cascade. `None` = disabled: `step`
     /// passes `pld_spine=None` and `name()` reports `"dflash"`.
     pld: Option<PldCascade>,
+    /// Position of the last chain `step`, while its window is retractable
+    /// (see [`Speculator::retract_window`]). Cleared by any other mutation.
+    last_window: Option<usize>,
 }
 
 impl DflashSpeculator {
@@ -645,6 +648,7 @@ impl DflashSpeculator {
             ck_interval,
             ck_cap,
             pld: None,
+            last_window: None,
         }
     }
 
@@ -697,6 +701,7 @@ impl Speculator for DflashSpeculator {
         resume_from: Option<usize>,
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
+        self.last_window = None;
         let slot = target
             .as_any_mut()
             .downcast_mut::<ModelSlot>()
@@ -860,6 +865,7 @@ impl Speculator for DflashSpeculator {
         start_pos: usize,
         abort: &dyn Fn() -> bool,
     ) -> Result<bool, String> {
+        self.last_window = None;
         if tokens.is_empty() {
             return Ok(true);
         }
@@ -932,6 +938,7 @@ impl Speculator for DflashSpeculator {
             .downcast_mut::<ModelSlot>()
             .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
 
+        self.last_window = None;
         if max_emit == 0 {
             return Err("DflashSpeculator: max_emit=0 (no remaining output budget)".into());
         }
@@ -1080,6 +1087,11 @@ impl Speculator for DflashSpeculator {
             }
         }
 
+        // A chain window is retractable while its snapshot and tape are the
+        // ones this verify left behind; DDTree commits through its own tape.
+        if self.df.ddtree.is_none() && result.is_ok() {
+            self.last_window = Some(position);
+        }
         result
             .map(lower_qwen35)
             // Defense only — accept stage already committed ≤ max_emit.
@@ -1088,6 +1100,7 @@ impl Speculator for DflashSpeculator {
     }
 
     fn on_evict(&mut self, gpu: &mut Gpu, retain: &EvictRetain) -> Result<(), String> {
+        self.last_window = None;
         // Compact the drafter's cached target-hidden rows to match the target KV
         // after the FlashCASK eviction the daemon already applied to the target.
         let ne = self.df.draft_config.num_extract();
@@ -1104,6 +1117,7 @@ impl Speculator for DflashSpeculator {
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.last_window = None;
         // Drafter-local reset: invalidate cached suffix projections and free the
         // divergent-render checkpoint ring (the target KV/recurrent reset is the
         // daemon's job — it owns the bundle).
@@ -1118,6 +1132,41 @@ impl Speculator for DflashSpeculator {
             pld.disabled_for_request = false;
         }
         Ok(())
+    }
+
+    fn retract_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        keep: usize,
+    ) -> Result<bool, String> {
+        // The last chain step at `position` restored `target_snap` (state at
+        // `position`) and replayed its tape for accept+1 tokens. Replaying the
+        // same tape for `keep` tokens instead leaves the recurrent state at
+        // `position + keep`; full-attention KV past it is overwritten by the
+        // next verify, exactly as for a rejected draft.
+        let rows = self.df.gdn_tape.valid_rows;
+        if self.last_window.take() != Some(position) || rows == 0 || keep > rows {
+            return Ok(false);
+        }
+        let slot = target
+            .as_any_mut()
+            .downcast_mut::<ModelSlot>()
+            .ok_or("DflashSpeculator: target is not a Qwen3.5 ModelSlot")?;
+        self.df
+            .target_snap
+            .restore_to(&mut slot.dn_state, gpu)
+            .map_err(|e| format!("retract_window restore: {e}"))?;
+        if keep > 0 {
+            self.df
+                .gdn_tape
+                .replay_gdn(gpu, &slot.weights, &slot.config, &mut slot.dn_state, keep)
+                .map_err(|e| format!("retract_window replay_gdn: {e}"))?;
+        }
+        self.df.gdn_tape.valid_rows = 0;
+        self.df.draft_scratch.thlog.truncate_committed(position + keep);
+        Ok(true)
     }
 
     fn reset_state_evidence(&self) -> Option<hipfire_runtime::spec::SpecResetEvidence> {
@@ -1148,6 +1197,7 @@ impl Speculator for DflashSpeculator {
         target: &mut dyn SpecTarget,
         position: usize,
     ) -> Result<usize, String> {
+        self.last_window = None;
         // Restore the target's DeltaNet recurrent state to the checkpoint at
         // `position` and drop the now-stale tail of the ring (mirrors the old
         // divergent-render resume at generate_dflash 4021-4036). Caller rewinds

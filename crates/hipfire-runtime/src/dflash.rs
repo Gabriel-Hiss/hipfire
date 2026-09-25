@@ -1111,6 +1111,18 @@ mod target_hidden_log {
             }
         }
 
+        /// Drop committed rows past `rows` (a window retracted to a shorter
+        /// prefix). The rows past it stay on GPU as garbage and are
+        /// overwritten by the next `append_committed`; both projection
+        /// watermarks clamp so no cached projection of a dropped row is reused.
+        pub fn truncate_committed(&mut self, rows: usize) {
+            debug_assert!(rows <= self.abs_positions.len());
+            self.abs_positions.truncate(rows);
+            self.uploaded_rows = self.uploaded_rows.min(rows);
+            self.proj_cached_rows = self.proj_cached_rows.min(rows);
+            self.full_cached_rows = self.full_cached_rows.min(rows);
+        }
+
         /// Post-eviction rebuild: `new_abs` is the compacted absolute-position
         /// list (one entry per retained row). Replaces the row layout and
         /// invalidates the projection cache (row indices shifted).
