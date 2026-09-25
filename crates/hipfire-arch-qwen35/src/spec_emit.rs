@@ -85,15 +85,16 @@ fn qwen_dflash_eos_filter_config() -> EosFilterConfig {
 }
 
 impl<'a> Qwen35Emit<'a> {
-    /// Build the qwen35 emitter from the model-independent [`SpecEmitCtx`],
-    /// extracting the grammar `ToolSchema` list from the request's raw tool JSON
-    /// (`ctx.tools`). Returns the arch-erased `Box<dyn SpecEmit>` the daemon
-    /// drives. The JSON→schema extraction mirrors the daemon's old
-    /// `tool_schemas_dflash` builder.
+    /// Build the qwen35 emitter from the model-independent [`SpecEmitCtx`].
+    /// `ctx.tools` enables tool-call parsing; with `ctx.grammar` the grammar
+    /// `ToolSchema` list is extracted from the same raw tool JSON. Returns the
+    /// arch-erased `Box<dyn SpecEmit>` the daemon drives. The JSON→schema
+    /// extraction mirrors the daemon's old `tool_schemas_dflash` builder.
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
         let tool_protocol_enabled = ctx.tools.is_some();
         let tool_schemas: Vec<grammar::ToolSchema> = ctx
             .tools
+            .filter(|_| ctx.grammar)
             .map(|arr| {
                 arr.iter()
                     .filter_map(|t| {
@@ -613,6 +614,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: Some(&[]),
+            grammar: false,
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,
@@ -737,6 +739,44 @@ mod tests {
     }
 
     #[test]
+    fn declared_tools_with_grammar_off_parse_native_xml_calls() {
+        // Plain Qwen3.5 runs grammar-off and emits native XML calls; the declared
+        // schema must not arm the Hermes grammar, and the call must still come
+        // back structured (the AR path's contract).
+        let tools = [serde_json::json!({"type": "function", "function": {
+            "name": "read_file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}})];
+        let tok = test_tokenizer();
+        let body = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n</function>\n</tool_call>";
+        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+            tokenizer: &tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: Some(&tools),
+            grammar: false,
+            stop: Vec::new(),
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+        let mut stream = Vec::new();
+        for (i, id) in tok.encode(body).into_iter().enumerate() {
+            let outcome = if i == 0 { emit.begin(id) } else { emit.observe(id) };
+            assert!(outcome.stop.is_none(), "stopped at token {i}: {:?}", outcome.stop);
+            stream.extend(outcome.events);
+        }
+        let finish = emit.finish();
+        assert!(tokens_text(&stream).is_empty());
+        assert_eq!(finish.finish_reason, "tool_calls");
+        let calls = held_calls(&finish);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/main.rs");
+    }
+
+    #[test]
     fn malformed_unclosed_span_is_fail_closed() {
         let (stream, finish, _) = drive_text("pre<tool_call>{\"name\":\"x\"");
         assert!(!tokens_text(&stream).contains("<tool_call>"));
@@ -837,6 +877,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            grammar: false,
             stop: vec![first_text.clone()],
             max_think: 0,
             max_tokens: 256,
@@ -865,6 +906,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            grammar: false,
             stop: vec!["STOP".to_string()],
             max_think: 0,
             max_tokens: 256,

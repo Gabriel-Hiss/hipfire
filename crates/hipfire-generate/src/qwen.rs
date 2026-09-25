@@ -2272,19 +2272,16 @@ pub fn generate_dflash(
     // ── Grammar-guided decoding setup (dflash path) ─────────────
     //
     // qwen35 enforces tool-call grammar POST-acceptance inside the emitter
-    // (`Qwen35Emit::observe`); the emitter now extracts its own `ToolSchema`
-    // list from the raw tool JSON inside `make_spec_emitter`. This wrapper only
-    // honors the `HIPFIRE_QWEN35_GRAMMAR=0` kill-switch by withholding `tools`
-    // (⇒ empty schema ⇒ grammar inactive).
+    // (`Qwen35Emit::observe`); the emitter extracts its own `ToolSchema` list
+    // from the raw tool JSON inside `make_spec_emitter`. The tools always reach
+    // the emitter so tool calls are parsed as on the AR path; `grammar` carries
+    // the `HIPFIRE_QWEN35_GRAMMAR` resolution (plain Qwen3.5/3.6 emit native
+    // XML calls and run grammar-off).
     let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
         hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
         &m.model_path,
     );
-    let emit_tools: Option<Vec<serde_json::Value>> = if grammar_enabled {
-        tools.map(|t| t.to_vec())
-    } else {
-        None
-    };
+    let emit_tools: Option<Vec<serde_json::Value>> = tools.map(|t| t.to_vec());
 
     // The decode core (slot guard, prefill, accept-window loop, bake, finish) is
     // the arch-generic `generate_spec`. This wrapper owns the qwen35/llama-specific
@@ -2337,6 +2334,7 @@ pub fn generate_dflash(
         SpecEmitRequest {
             im_end: im_end_token,
             tools: emit_tools,
+            grammar: grammar_enabled,
             stop: stop.to_vec(),
             max_think: max_think_tokens,
             assistant_prefix: spec_assistant_prefix(started_in_think),
@@ -3100,6 +3098,7 @@ pub fn generate_spec(
         eos: slot.eos_token(),
         im_end: emit_req.im_end,
         tools: emit_req.tools.as_deref(),
+        grammar: emit_req.grammar,
         stop: emit_req.stop,
         max_think: emit_req.max_think,
         max_tokens,

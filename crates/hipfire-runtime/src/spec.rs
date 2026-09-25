@@ -1392,10 +1392,14 @@ pub struct SpecEmitCtx<'a> {
     pub eos: u32,
     /// Secondary terminator (e.g. `<|im_end|>`), if the arch uses one.
     pub im_end: Option<u32>,
-    /// Raw tool definitions from the request (OpenAI-shape JSON). Each carrier
-    /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
-    /// tool-call grammar.
+    /// Raw tool definitions from the request (OpenAI-shape JSON). `Some`
+    /// enables tool-call parsing of the output; each carrier extracts its own
+    /// grammar `ToolSchema` from these when [`Self::grammar`] is set.
     pub tools: Option<&'a [serde_json::Value]>,
+    /// Whether the carrier may enforce its tool-call grammar over `tools`.
+    /// Parsing does not depend on it: a Qwen3.5 model with native XML tool
+    /// calls runs grammar-off and still returns structured calls.
+    pub grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).

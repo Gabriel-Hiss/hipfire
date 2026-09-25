@@ -1253,8 +1253,10 @@ pub fn fail_closed_epilogue_after_sync(
 /// + the slot's eos + the tokenizer and calls `carrier.make_spec_emitter`.
 pub struct SpecEmitRequest {
     pub im_end: Option<u32>,
-    /// Raw tool definitions (OpenAI-shape JSON); `None`/empty ⇒ no tool grammar.
+    /// Raw tool definitions (OpenAI-shape JSON); `Some` enables tool-call parsing.
     pub tools: Option<Vec<serde_json::Value>>,
+    /// Whether the arch's tool-call grammar is enforced over `tools`.
+    pub grammar: bool,
     pub stop: Vec<String>,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,

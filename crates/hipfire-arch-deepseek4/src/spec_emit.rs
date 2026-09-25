@@ -104,14 +104,14 @@ fn build_grammar(
 
 impl<'a> Deepseek4Emit<'a> {
     /// Build the ds4 emitter from the model-independent [`SpecEmitCtx`]. The
-    /// think-mode picks the DSML parser's initial state; the in-step grammar is
-    /// built from `ctx.tools` + `ctx.decoded_vocab`.
+    /// think-mode picks the DSML parser's initial state; with `ctx.grammar` the
+    /// in-step grammar is built from `ctx.tools` + `ctx.decoded_vocab`.
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
         let parser = match ctx.think_mode {
             ThinkMode::Low | ThinkMode::High | ThinkMode::Max => dsml::StreamParser::new_in_think(),
             ThinkMode::NonThink => dsml::StreamParser::new(),
         };
-        let grammar = build_grammar(ctx.tools, ctx.decoded_vocab);
+        let grammar = build_grammar(ctx.tools.filter(|_| ctx.grammar), ctx.decoded_vocab);
         Box::new(Self {
             tokenizer: ctx.tokenizer,
             parser,
