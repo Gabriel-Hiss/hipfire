@@ -23,7 +23,17 @@ pub struct Ptq1Bf16Pair<'a> {
 /// contract of the PrismML fork (int8, one scale per 32 values) and the only
 /// decode format. `S128` variants use one scale per 128 values (written to all
 /// four slots), `Q4` variants round to [-7, 7]. Selected for prefill by
-/// `HIPFIRE_PTQ1_ACT` = `q8` (default) | `q8s128` | `q4` | `q4s128`.
+/// `HIPFIRE_PTQ1_ACT` = `q8s128` (default) | `q8` | `q4` | `q4s128`.
+///
+/// Why `Q8S128` is the prefill default. With one scale per 128 the GEMM
+/// chains a group's eight WMMAs in int32 and scales once, instead of a float
+/// conversion and FMA after every 32-wide sub-block, which on RDNA3 serialize
+/// with the WMMA (Bonsai-27B pp2048 +14%). Against the fork over 1024
+/// teacher-forced positions of a code continuation, both formats flip the
+/// argmax only where the fork's top-2 margin is under 0.09 (Q8 1020/1024,
+/// Q8S128 1021/1024), share 19.48 vs 19.41 of the top 20 on average, and
+/// deviate in top-20 logit gaps by 0.070 vs 0.079 on average. `Q4` flips
+/// non-tied argmaxes (999/1024) and stays opt-in for measurement only.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ptq1ActFormat {
     Q8,
@@ -36,10 +46,10 @@ impl Ptq1ActFormat {
     pub fn prefill() -> Self {
         static FORMAT: std::sync::LazyLock<Ptq1ActFormat> = std::sync::LazyLock::new(|| {
             match hipfire_config::developer_var("HIPFIRE_PTQ1_ACT").as_deref() {
-                Ok("q8s128") => Ptq1ActFormat::Q8S128,
+                Ok("q8") => Ptq1ActFormat::Q8,
                 Ok("q4") => Ptq1ActFormat::Q4,
                 Ok("q4s128") => Ptq1ActFormat::Q4S128,
-                _ => Ptq1ActFormat::Q8,
+                _ => Ptq1ActFormat::Q8S128,
             }
         });
         *FORMAT

@@ -66,6 +66,10 @@ fn exact(name: &str, a: &[f32], b: &[f32]) -> bool {
 }
 
 fn main() {
+    // The prefill section compares against the unfused Q8_1 chain (one scale
+    // per 32), so it pins that format; the prefill default is one per 128.
+    // SAFETY: single-threaded, before anything reads the environment.
+    unsafe { std::env::set_var("HIPFIRE_PTQ1_ACT", "q8") };
     let mut gpu = Gpu::init().expect("gpu init");
     let mut rng = Rng(0x5EED_1234);
 
