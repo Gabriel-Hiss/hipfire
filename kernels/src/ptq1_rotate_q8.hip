@@ -29,6 +29,25 @@
 
 #define PRQ_BLOCK 1024
 #define PRQ_THREADS 256
+// Activation format. The default is the Q8_1 contract the fork uses (int8,
+// one scale per 32 values). Prefill builds may widen the scale group to 128
+// (PRQ_SCALE128) and/or narrow the values to 4-bit range (PRQ_Q4: [-7, 7]),
+// still stored as int8 in the same layout; PRQ_NAME suffixes the kernel names
+// so each build loads as its own module.
+#ifndef PRQ_SCALE128
+#define PRQ_SCALE128 0
+#endif
+#ifndef PRQ_Q4
+#define PRQ_Q4 0
+#endif
+#ifndef PRQ_NAME
+#define PRQ_NAME(x) x
+#endif
+#if PRQ_Q4
+#define PRQ_QMAX 7.0f
+#else
+#define PRQ_QMAX 127.0f
+#endif
 
 struct prq_block_q8_1_mmq {
     _Float16 ds4[8];
@@ -89,21 +108,28 @@ static __device__ __forceinline__ void prq_rotate_quantize(
     const float x2 = v[2] * scale;
     const float x3 = v[3] * scale;
 
+    // Scale group: 32 values (8 lanes, the Q8_1 contract) or, with
+    // PRQ_SCALE128, 128 values (the whole wave). The 128 form writes the same
+    // scale into all four ds4 slots, so the layout is unchanged.
     float amax = fmaxf(fmaxf(fabsf(x0), fabsf(x1)), fmaxf(fabsf(x2), fabsf(x3)));
+#if PRQ_SCALE128
+    for (int offset = 16; offset > 0; offset >>= 1) {
+#else
     for (int offset = 4; offset > 0; offset >>= 1) {
+#endif
         amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
     }
     float sum = x0 + x1 + x2 + x3;
     for (int offset = 4; offset > 0; offset >>= 1) {
         sum += __shfl_xor(sum, offset, 32);
     }
-    const float d = amax > 1.0e-20f ? amax / 127.0f : 0.0f;
+    const float d = amax > 1.0e-20f ? amax / PRQ_QMAX : 0.0f;
     const float id = d > 0.0f ? 1.0f / d : 0.0f;
     char4 q;
-    q.x = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, x0 * id)));
-    q.y = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, x1 * id)));
-    q.z = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, x2 * id)));
-    q.w = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, x3 * id)));
+    q.x = (char)lrintf(fmaxf(-PRQ_QMAX, fminf(PRQ_QMAX, x0 * id)));
+    q.y = (char)lrintf(fmaxf(-PRQ_QMAX, fminf(PRQ_QMAX, x1 * id)));
+    q.z = (char)lrintf(fmaxf(-PRQ_QMAX, fminf(PRQ_QMAX, x2 * id)));
+    q.w = (char)lrintf(fmaxf(-PRQ_QMAX, fminf(PRQ_QMAX, x3 * id)));
 
     const int e = blk * PRQ_BLOCK + 4 * tid;
     prq_block_q8_1_mmq* out = Y + (long long)(e / 128) * n_tok + blockIdx.y;
@@ -121,7 +147,7 @@ static __device__ __forceinline__ void prq_rotate_quantize(
 // receives the un-rotated normalized vector for projections that are not
 // Hadamard-folded (Bonsai's BF16 alpha/beta).
 extern "C" __launch_bounds__(PRQ_THREADS, 1)
-__global__ void ptq1_rmsnorm_rotate_q8(
+__global__ void PRQ_NAME(ptq1_rmsnorm_rotate_q8)(
     const float* __restrict__ x,
     const float* __restrict__ weight,
     const float* __restrict__ signs,
@@ -180,7 +206,7 @@ __global__ void ptq1_rmsnorm_rotate_q8(
 
 // silu_mul_f32 -> rotate -> Q8_1 (the FFN down-projection input).
 extern "C" __launch_bounds__(PRQ_THREADS, 1)
-__global__ void ptq1_silu_mul_rotate_q8(
+__global__ void PRQ_NAME(ptq1_silu_mul_rotate_q8)(
     const float* __restrict__ gate,
     const float* __restrict__ up,
     const float* __restrict__ signs,
@@ -204,7 +230,7 @@ __global__ void ptq1_silu_mul_rotate_q8(
 
 // sigmoid_mul_f32 (attention output gate) -> rotate -> Q8_1 (o_proj input).
 extern "C" __launch_bounds__(PRQ_THREADS, 1)
-__global__ void ptq1_sigmoid_mul_rotate_q8(
+__global__ void PRQ_NAME(ptq1_sigmoid_mul_rotate_q8)(
     const float* __restrict__ x,
     const float* __restrict__ gate,
     const float* __restrict__ signs,
@@ -231,7 +257,7 @@ __global__ void ptq1_sigmoid_mul_rotate_q8(
 // head w of the block; the sum keeps gated_norm_f32's order (lane-strided
 // partials, xor-shuffle reduction).
 extern "C" __launch_bounds__(PRQ_THREADS, 1)
-__global__ void ptq1_gated_norm_rotate_q8(
+__global__ void PRQ_NAME(ptq1_gated_norm_rotate_q8)(
     const float* __restrict__ x,
     const float* __restrict__ z,
     const float* __restrict__ weight,

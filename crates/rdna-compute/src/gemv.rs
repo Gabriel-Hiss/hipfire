@@ -18,6 +18,51 @@ pub struct Ptq1Bf16Pair<'a> {
     pub x: &'a GpuTensor,
 }
 
+/// Activation format the PTQ1 prefill producers write and the prefill GEMM
+/// reads, all in the 144-byte `block_q8_1_mmq` layout. `Q8` is the Q8_1
+/// contract of the PrismML fork (int8, one scale per 32 values) and the only
+/// decode format. `S128` variants use one scale per 128 values (written to all
+/// four slots), `Q4` variants round to [-7, 7]. Selected for prefill by
+/// `HIPFIRE_PTQ1_ACT` = `q8` (default) | `q8s128` | `q4` | `q4s128`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ptq1ActFormat {
+    Q8,
+    Q8S128,
+    Q4,
+    Q4S128,
+}
+
+impl Ptq1ActFormat {
+    pub fn prefill() -> Self {
+        static FORMAT: std::sync::LazyLock<Ptq1ActFormat> = std::sync::LazyLock::new(|| {
+            match hipfire_config::developer_var("HIPFIRE_PTQ1_ACT").as_deref() {
+                Ok("q8s128") => Ptq1ActFormat::Q8S128,
+                Ok("q4") => Ptq1ActFormat::Q4,
+                Ok("q4s128") => Ptq1ActFormat::Q4S128,
+                _ => Ptq1ActFormat::Q8,
+            }
+        });
+        *FORMAT
+    }
+
+    pub fn scale128(self) -> bool {
+        matches!(self, Self::Q8S128 | Self::Q4S128)
+    }
+
+    pub fn q4(self) -> bool {
+        matches!(self, Self::Q4 | Self::Q4S128)
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Q8 => "",
+            Self::Q8S128 => "_s128",
+            Self::Q4 => "_q4",
+            Self::Q4S128 => "_q4s128",
+        }
+    }
+}
+
 fn gfx942_rotate_live_validation_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX942_ROTATE_VALIDATE_LIVE")
         .ok()
@@ -6287,6 +6332,30 @@ impl Gpu {
             .ok_or_else(|| hip_bridge::HipError::new(0, &format!("no Prism signs for K={k}")))
     }
 
+    /// Load the `ptq1_*_rotate_q8` producer `base` in the activation format
+    /// for `batch` tokens and return the kernel name to launch. Decode
+    /// (`batch == 1`) always uses the Q8_1 contract; prefill uses
+    /// [`Ptq1ActFormat::prefill`].
+    fn ptq1_producer(&mut self, base: &'static str, batch: usize) -> HipResult<String> {
+        let fmt = if batch > 1 { Ptq1ActFormat::prefill() } else { Ptq1ActFormat::Q8 };
+        let name = format!("{base}{}", fmt.suffix());
+        if !self.functions.contains_key(&name) {
+            let rename = if fmt.suffix().is_empty() {
+                "#define PRQ_NAME(x) x".to_string()
+            } else {
+                format!("#define PRQ_NAME(x) x##{}", fmt.suffix())
+            };
+            let src = format!(
+                "#define PRQ_SCALE128 {}\n#define PRQ_Q4 {}\n{rename}\n{}",
+                u8::from(fmt.scale128()),
+                u8::from(fmt.q4()),
+                kernels::PTQ1_ROTATE_Q8_SRC
+            );
+            self.ensure_kernel(&name, &src, &name)?;
+        }
+        Ok(name)
+    }
+
     /// `rmsnorm_f32 -> rotate_x_prism_hadamard -> quantize_q8_1_mmq_ds4` in
     /// one launch, bit-identical to the chain. `plain` receives the
     /// un-rotated normalized vector when a non-Prism projection also reads it.
@@ -6305,7 +6374,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let sp = self.ptq1_prism_signs(k)?;
-        self.ensure_kernel("ptq1_rmsnorm_rotate_q8", kernels::PTQ1_ROTATE_Q8_SRC, "ptq1_rmsnorm_rotate_q8")?;
+        let name = self.ptq1_producer("ptq1_rmsnorm_rotate_q8", batch)?;
         let xp = x.buf.as_ptr();
         let wp = weight.buf.as_ptr();
         let pp = plain.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
@@ -6324,7 +6393,7 @@ impl Gpu {
         ];
         let grid = [(k / 1024) as u32, batch as u32, 1];
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "ptq1_rmsnorm_rotate_q8", batch * k * 4);
-        let result = self.launch_maybe_blob("ptq1_rmsnorm_rotate_q8", grid, [256, 1, 1], 0, &mut params, || {
+        let result = self.launch_maybe_blob(&name, grid, [256, 1, 1], 0, &mut params, || {
             let mut blob = hip_bridge::KernargBlob::new();
             blob.push_ptr(xp);
             blob.push_ptr(wp);
@@ -6381,7 +6450,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let sp = self.ptq1_prism_signs(k)?;
-        self.ensure_kernel(name, kernels::PTQ1_ROTATE_Q8_SRC, name)?;
+        let kname = self.ptq1_producer(name, batch)?;
         let ap = a.buf.as_ptr();
         let bp = b.buf.as_ptr();
         let yp = xq.buf.as_ptr();
@@ -6397,7 +6466,7 @@ impl Gpu {
         ];
         let grid = [(k / 1024) as u32, batch as u32, 1];
         let timer = crate::profile::begin_timer(&self.hip, "fwht", name, batch * k * 8);
-        let result = self.launch_maybe_blob(name, grid, [256, 1, 1], 0, &mut params, || {
+        let result = self.launch_maybe_blob(&kname, grid, [256, 1, 1], 0, &mut params, || {
             let mut blob = hip_bridge::KernargBlob::new();
             blob.push_ptr(ap);
             blob.push_ptr(bp);
@@ -6432,7 +6501,7 @@ impl Gpu {
         self.bind_thread()?;
         let sp = self.ptq1_prism_signs(k)?;
         const NAME: &str = "ptq1_gated_norm_rotate_q8";
-        self.ensure_kernel(NAME, kernels::PTQ1_ROTATE_Q8_SRC, NAME)?;
+        let kname = self.ptq1_producer(NAME, batch)?;
         let xp = x.buf.as_ptr();
         let zp = z.buf.as_ptr();
         let wp = weight.buf.as_ptr();
@@ -6453,7 +6522,7 @@ impl Gpu {
         ];
         let grid = [(k / 1024) as u32, batch as u32, 1];
         let timer = crate::profile::begin_timer(&self.hip, "fwht", NAME, batch * k * 8);
-        let result = self.launch_maybe_blob(NAME, grid, [256, 1, 1], 0, &mut params, || {
+        let result = self.launch_maybe_blob(&kname, grid, [256, 1, 1], 0, &mut params, || {
             let mut blob = hip_bridge::KernargBlob::new();
             blob.push_ptr(xp);
             blob.push_ptr(zp);
@@ -14301,7 +14370,7 @@ impl Gpu {
         // up (1.3-1.9x measured on gfx1100) and loses below, where most of
         // its tile is padding. It uses the gfx11 WMMA builtin.
         if Self::ptq1_t64_admitted(&self.arch, n) {
-            return self.launch_ptq1_t64(a_raw.buf.as_ptr(), xp, y.buf.as_ptr(), m, k, n, false);
+            return self.launch_ptq1_t64(a_raw.buf.as_ptr(), xp, y.buf.as_ptr(), m, k, n, false, false);
         }
         let short_verify = self.arch == "gfx1100" && n <= 16;
         let (kernel_name, kernel_src, grid) = if short_verify {
@@ -14379,7 +14448,8 @@ impl Gpu {
             "gemm_ptq1g128_wmma_q8 needs K%128==0 and the 64x64 tile (gfx11, N>32)"
         );
         self.bind_thread()?;
-        self.launch_ptq1_t64(a_raw.buf.as_ptr(), xq.buf.as_ptr(), y.buf.as_ptr(), m, k, n, residual)
+        let scale128 = Ptq1ActFormat::prefill().scale128();
+        self.launch_ptq1_t64(a_raw.buf.as_ptr(), xq.buf.as_ptr(), y.buf.as_ptr(), m, k, n, residual, scale128)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -14392,16 +14462,20 @@ impl Gpu {
         k: usize,
         n: usize,
         residual: bool,
+        scale128: bool,
     ) -> HipResult<()> {
         // The 128-token build halves the decode per WMMA and wins on the big
         // projections (N=512 on gfx1100: +4-7% at M>=10240 or K=17408) but
         // loses 3-4% on the 5120/6144 ones, where it leaves too few
         // workgroups for the device.
-        let wide = n >= 256 && (m >= 8192 || k >= 8192);
-        let (name, src, toks, threads) = if wide {
-            ("gemm_ptq1g128_wmma_t128", kernels::GEMM_PTQ1G128_WMMA_T128_SRC, 128, 256)
-        } else {
-            ("gemm_ptq1g128_wmma_t64", kernels::GEMM_PTQ1G128_WMMA_T64_SRC, 64, 128)
+        // With one scale per 128 the 128-token tile won on every Bonsai shape
+        // at N=512 (5.61 vs 6.05 ms summed over the seven), so it takes all.
+        let wide = n >= 256 && (scale128 || m >= 8192 || k >= 8192);
+        let (name, src, toks, threads) = match (wide, scale128) {
+            (true, false) => ("gemm_ptq1g128_wmma_t128", kernels::GEMM_PTQ1G128_WMMA_T128_SRC, 128, 256),
+            (false, false) => ("gemm_ptq1g128_wmma_t64", kernels::GEMM_PTQ1G128_WMMA_T64_SRC, 64, 128),
+            (true, true) => ("gemm_ptq1g128_wmma_t128s", kernels::GEMM_PTQ1G128_WMMA_T128S_SRC, 128, 256),
+            (false, true) => ("gemm_ptq1g128_wmma_t64s", kernels::GEMM_PTQ1G128_WMMA_T64S_SRC, 64, 128),
         };
         self.ensure_kernel(name, src, name)?;
         let mi = m as i32;

@@ -74,14 +74,22 @@ static __device__ __forceinline__ unsigned t64_signed(unsigned d) {
 #define T64_ROWS 64
 #define T64_STRIDE 36 // 32 words of int8 per row/token + 4 words of bank padding
 
+#ifndef T64_SCALE128
+#define T64_SCALE128 0
+#endif
+
 #if T64_TOKS == 128
-#define T64_KERNEL gemm_ptq1g128_wmma_t128
 #define T64_THREADS 256
 #define T64_MIN_BLOCKS 1
+#ifndef T64_KERNEL
+#define T64_KERNEL gemm_ptq1g128_wmma_t128
+#endif
 #else
-#define T64_KERNEL gemm_ptq1g128_wmma_t64
 #define T64_THREADS 128
 #define T64_MIN_BLOCKS 2
+#ifndef T64_KERNEL
+#define T64_KERNEL gemm_ptq1g128_wmma_t64
+#endif
 #endif
 
 extern "C" __launch_bounds__(T64_THREADS, T64_MIN_BLOCKS)
@@ -201,6 +209,47 @@ __global__ void T64_KERNEL(
 
         // A fragment: lane's row (lane & 15), 16 int8 of K. B fragment: lane's
         // token (lane & 15). C[e] lands at row 2e + (lane >> 4), token lane & 15.
+#if T64_SCALE128
+        // One activation scale per 128-group (all four ds4 slots equal): the
+        // eight K16 WMMAs of the group chain in int32 and are scaled once.
+        t64_i32x8 iacc[2][2];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i)
+            #pragma unroll
+            for (int j = 0; j < 2; ++j) iacc[i][j] = (t64_i32x8){0, 0, 0, 0, 0, 0, 0, 0};
+        #pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            t64_i8x16 af[2][2], bf[2][2];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const unsigned* ar = a_lds + (w_row + i * 16 + (lane & 15)) * T64_STRIDE;
+                const unsigned* xr = x_lds + (w_tok + i * 16 + (lane & 15)) * T64_STRIDE;
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    af[i][h] = *(const t64_i8x16*)(ar + (2 * s + h) * 4);
+                    bf[i][h] = *(const t64_i8x16*)(xr + (2 * s + h) * 4);
+                }
+            }
+            #pragma unroll
+            for (int j = 0; j < 2; ++j)
+                #pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    iacc[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i][0], true, bf[j][0], iacc[i][j], false);
+                    iacc[i][j] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, af[i][1], true, bf[j][1], iacc[i][j], false);
+                }
+        }
+        #pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const float dx = dx_lds[(w_tok + j * 16 + (lane & 15)) * 4];
+            #pragma unroll
+            for (int i = 0; i < 2; ++i)
+                #pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const float dw = dw_lds[w_row + i * 16 + 2 * e + (lane >> 4)];
+                    acc[i][j][e] += (dw * dx) * (float)iacc[i][j][e];
+                }
+        }
+#else
         float gacc[2][2][8];
         #pragma unroll
         for (int i = 0; i < 2; ++i)
@@ -243,6 +292,7 @@ __global__ void T64_KERNEL(
                 #pragma unroll
                 for (int j = 0; j < 2; ++j) acc[i][j][e] += dw * gacc[i][j][e];
             }
+#endif
         __syncthreads();
     }
 

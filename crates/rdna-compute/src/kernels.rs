@@ -6637,6 +6637,19 @@ pub const GEMM_PTQ1G128_WMMA_T128_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
 );
 
+/// GEMM_PTQ1G128_WMMA_T64_SRC over activations with one scale per 128 values
+/// (all four ds4 slots equal): the group's WMMAs chain in int32, scaled once.
+pub const GEMM_PTQ1G128_WMMA_T64S_SRC: &str = concat!(
+    "#define T64_SCALE128 1\n#define T64_KERNEL gemm_ptq1g128_wmma_t64s\n",
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
+);
+
+/// 64x128-tile build of GEMM_PTQ1G128_WMMA_T64S_SRC.
+pub const GEMM_PTQ1G128_WMMA_T128S_SRC: &str = concat!(
+    "#define T64_TOKS 128\n#define T64_SCALE128 1\n#define T64_KERNEL gemm_ptq1g128_wmma_t128s\n",
+    include_str!("../../../kernels/src/gemm_ptq1g128_wmma_t64.hip")
+);
+
 /// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
 /// L = swiglu_limit (DeepSeek V4 config = 10.0).
 pub const V4F_SILU_MUL_CLAMP_SRC: &str =
