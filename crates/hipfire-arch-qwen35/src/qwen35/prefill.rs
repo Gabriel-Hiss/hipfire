@@ -1375,6 +1375,68 @@ fn run_proj_gemm(
     )
 }
 
+/// PTQ1 (Prism-Hadamard ternary) prefill fusions, the batched form of the
+/// decode ones: each GEMM input comes from one launch that fuses its producer
+/// (rmsnorm / silu_mul / sigmoid_mul / gated_norm) with the Prism rotation and
+/// the Q8_1 quantization, written straight into the GEMM's `[k/128][n]`
+/// layout, and residual adds move into the GEMM epilogue. Every stage keeps
+/// the arithmetic and order of the kernel it replaces (`test_ptq1_fused_decode`
+/// pins the producers bit-exact). Needs the 64x64 GEMM tile (gfx11, n > 32).
+/// `HIPFIRE_PTQ1_FUSED=0` restores the unfused chain.
+fn ptq1_prefill_fused(gpu: &Gpu, n: usize, ws: &[&WeightTensor]) -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_PTQ1_FUSED").as_deref() != Ok("0")
+    });
+    *ENABLED
+        && gpu.prism_hadamard_block_size() == 1024
+        && Gpu::ptq1_t64_admitted(&gpu.arch, n)
+        && ws.iter().all(|w| w.gpu_dtype == DType::PTQ1G128H && w.k % 1024 == 0)
+}
+
+/// PTQ1 GEMM over a producer's Q8_1 activation, honouring the batch epilogue:
+/// `Residual` adds into `pbs.x_batch`, `Partial` overwrites the partial slice.
+fn ptq1_q8_gemm_epilogue(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    w: &WeightTensor,
+    xq: &GpuTensor,
+    epilogue: &BatchEpilogue<'_>,
+    n: usize,
+) -> HipResult<()> {
+    match epilogue {
+        BatchEpilogue::Residual => gpu.gemm_ptq1g128_wmma_q8(&w.buf, xq, &pbs.x_batch, w.m, w.k, n, true),
+        BatchEpilogue::Partial(out) => {
+            let out_n = out.sub_offset(0, n * w.m);
+            gpu.gemm_ptq1g128_wmma_q8(&w.buf, xq, &out_n, w.m, w.k, n, false)
+        }
+    }
+}
+
+/// Dense FFN block for PTQ1 weights: fused rmsnorm producer, gate and up
+/// GEMMs over the shared Q8_1 activation, fused silu_mul producer, down GEMM
+/// with the epilogue. Q8_1 activations reuse the f32 scratch they replace
+/// (`x_rot_batch`, `ffn_hidden_batch`), which is larger than the Q8_1 form.
+#[allow(clippy::too_many_arguments)]
+fn ptq1_prefill_ffn(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    w_gate: &WeightTensor,
+    w_up: &WeightTensor,
+    w_down: &WeightTensor,
+    ffn_norm: &GpuTensor,
+    eps: f32,
+    epilogue: &BatchEpilogue<'_>,
+    n: usize,
+    dim: usize,
+    hidden_dim: usize,
+) -> HipResult<()> {
+    gpu.ptq1_rmsnorm_rotate_q8(&pbs.x_batch, ffn_norm, None, &pbs.x_rot_batch, dim, eps, n)?;
+    gpu.gemm_ptq1g128_wmma_q8(&w_gate.buf, &pbs.x_rot_batch, &pbs.gate_ffn_batch, w_gate.m, w_gate.k, n, false)?;
+    gpu.gemm_ptq1g128_wmma_q8(&w_up.buf, &pbs.x_rot_batch, &pbs.up_batch, w_up.m, w_up.k, n, false)?;
+    gpu.ptq1_silu_mul_rotate_q8(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch, hidden_dim, n)?;
+    ptq1_q8_gemm_epilogue(gpu, pbs, w_down, &pbs.ffn_hidden_batch, epilogue, n)
+}
+
 /// Plain (unfused) batched-GEMM dispatcher key for a weight dtype.
 ///
 /// Q8 keeps the chunked kernel it already used, so this is behaviour-preserving
@@ -4225,11 +4287,25 @@ pub(crate) fn batch_chunk_delta_net_attn(
         d.iter().any(|&dt| rot(dt)) && d.iter().any(|&dt| !rot(dt))
     };
 
+    let la_ptq1 = ptq1_prefill_fused(gpu, n, &[&layer.wqkv, &layer.wz]);
+
     // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
     // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
     // we reuse x_rot_batch as the "normed, unrotated" output
     // so the subsequent GEMM can read it the same way.
-    if mixed_basis {
+    if la_ptq1 {
+        // Q8_1 rotated activation into x_rot_batch; the plain normalized
+        // one into x_norm_batch for the un-rotated (BF16) gate projections.
+        gpu.ptq1_rmsnorm_rotate_q8(
+            &pbs.x_batch,
+            &layer.attn_norm,
+            Some(&pbs.x_norm_batch),
+            &pbs.x_rot_batch,
+            dim,
+            config.norm_eps,
+            n,
+        )?;
+    } else if mixed_basis {
         gpu.rmsnorm_batched(
             &pbs.x_batch,
             &layer.attn_norm,
@@ -4270,7 +4346,18 @@ pub(crate) fn batch_chunk_delta_net_attn(
     }
 
     // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
-    if is_6bit {
+    if la_ptq1 {
+        for (w, y) in [(&layer.wqkv, &pbs.dn_qkv_batch), (&layer.wz, &pbs.dn_z_batch)] {
+            gpu.gemm_ptq1g128_wmma_q8(&w.buf, &pbs.x_rot_batch, y, w.m, w.k, n, false)?;
+        }
+        for (w, y) in [(&layer.w_beta, &pbs.dn_beta_batch), (&layer.w_alpha, &pbs.dn_alpha_batch)] {
+            if ptq1_prefill_fused(gpu, n, &[w]) {
+                gpu.gemm_ptq1g128_wmma_q8(&w.buf, &pbs.x_rot_batch, y, w.m, w.k, n, false)?;
+            } else {
+                run_proj_gemm(gpu, w, &pbs.x_norm_batch, y, n)?;
+            }
+        }
+    } else if is_6bit {
         run_fused_qkvza_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvzaHfq6G256,
@@ -4796,6 +4883,20 @@ pub(crate) fn batch_chunk_delta_net_attn(
         );
     }
 
+    if ptq1_prefill_fused(gpu, n, &[&layer.wo]) && config.linear_value_head_dim == 128 {
+        gpu.ptq1_gated_norm_rotate_q8(
+            &pbs.dn_attn_out_batch,
+            &pbs.dn_z_batch,
+            &layer.norm_weight,
+            &pbs.dn_normed_rot_batch,
+            n_v_heads,
+            config.linear_value_head_dim,
+            config.norm_eps,
+            n,
+        )?;
+        return ptq1_q8_gemm_epilogue(gpu, pbs, &layer.wo, &pbs.dn_normed_rot_batch, &epilogue, n);
+    }
+
     // Batched gated output norm.
     gpu.gated_norm_f32_batched(
         &pbs.dn_attn_out_batch,
@@ -4886,6 +4987,21 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
+    if ptq1_prefill_fused(gpu, n, &[&layer.w_gate, &layer.w_up, &layer.w_down]) {
+        return ptq1_prefill_ffn(
+            gpu,
+            pbs,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+            &layer.ffn_norm,
+            config.norm_eps,
+            &epilogue,
+            n,
+            dim,
+            hidden_dim,
+        );
+    }
     // FFN: rmsnorm (+ rotate for MQ).
     let ffn_is_mq = matches!(
         layer.w_gate.gpu_dtype,
@@ -5175,7 +5291,10 @@ pub(crate) fn batch_chunk_full_attn_attn(
         layer.wk.gpu_dtype == layer.wq.gpu_dtype && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
     // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
-    if qkv_is_mq {
+    let fa_ptq1 = ptq1_prefill_fused(gpu, n, &[&layer.wq, &layer.wk, &layer.wv]);
+    if fa_ptq1 {
+        gpu.ptq1_rmsnorm_rotate_q8(&pbs.x_batch, &layer.attn_norm, None, &pbs.x_rot_batch, dim, config.norm_eps, n)?;
+    } else if qkv_is_mq {
         // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
         fused_rmsnorm_rotate_mq_batched_for(
             gpu,
@@ -5199,7 +5318,15 @@ pub(crate) fn batch_chunk_full_attn_attn(
     }
 
     // 2. Batched 3-way QKV projection (wq+wk+wv).
-    if qkv_is_6bit && qkv_same_dtype {
+    if fa_ptq1 {
+        for (w, y) in [
+            (&layer.wq, &pbs.fa_q_full_batch),
+            (&layer.wk, &pbs.fa_k_batch),
+            (&layer.wv, &pbs.fa_v_batch),
+        ] {
+            gpu.gemm_ptq1g128_wmma_q8(&w.buf, &pbs.x_rot_batch, y, w.m, w.k, n, false)?;
+        }
+    } else if qkv_is_6bit && qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
             hipfire_dispatch::types::KernelKey::FusedQkvHfq6G256,
@@ -5516,6 +5643,19 @@ pub(crate) fn batch_chunk_full_attn_attn(
             .map_err(|e| HipError::new(0, &e.to_string()))?;
     }
 
+    if ptq1_prefill_fused(gpu, n, &[&layer.wo]) {
+        // sigmoid gate, rotation and Q8_1 in one launch; fa_attn_out_batch
+        // itself stays un-gated, and nothing after this reads it.
+        gpu.ptq1_sigmoid_mul_rotate_q8(
+            &pbs.fa_attn_out_batch,
+            &pbs.fa_gate_batch,
+            &pbs.fa_attn_out_rot_batch,
+            layer.wo.k,
+            n,
+        )?;
+        return ptq1_q8_gemm_epilogue(gpu, pbs, &layer.wo, &pbs.fa_attn_out_rot_batch, &epilogue, n);
+    }
+
     // 8. Fused sigmoid(gate) * attn_out, element-wise over the
     // full [N × q_dim] tensor.
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
@@ -5577,6 +5717,21 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
+    if ptq1_prefill_fused(gpu, n, &[&layer.w_gate, &layer.w_up, &layer.w_down]) {
+        return ptq1_prefill_ffn(
+            gpu,
+            pbs,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+            &layer.ffn_norm,
+            config.norm_eps,
+            &epilogue,
+            n,
+            dim,
+            hidden_dim,
+        );
+    }
     // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
     // (+ rotate for MQ), w_down residual.
     let fa_ffn_is_mq = matches!(

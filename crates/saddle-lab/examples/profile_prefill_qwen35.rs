@@ -144,6 +144,8 @@ fn main() {
             None,
         )
         .expect("warmup prefill failed");
+        // Launches are asynchronous; without the sync this measured enqueue time.
+        gpu.hip.device_synchronize().expect("sync");
         eprintln!(
             "warmup {}: {:.1}ms",
             w + 1,
