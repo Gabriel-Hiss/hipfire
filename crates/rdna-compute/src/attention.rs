@@ -8678,6 +8678,112 @@ impl Gpu {
         }
     }
 
+    /// Largest key-split count [`Self::attention_dflash_gqa_split_f32`] uses;
+    /// sizes its `partials` buffer (see [`Self::attention_dflash_gqa_split_partials`]).
+    pub const DFLASH_GQA_SPLIT_MAX: usize = 32;
+
+    /// F32 elements the `partials` buffer of
+    /// [`Self::attention_dflash_gqa_split_f32`] needs for `b` queries.
+    pub fn attention_dflash_gqa_split_partials(b: usize, n_heads: usize) -> usize {
+        b * n_heads * Self::DFLASH_GQA_SPLIT_MAX * 130
+    }
+
+    /// Whether [`Self::attention_dflash_gqa_split_f32`] covers this shape.
+    pub fn attention_dflash_gqa_split_admitted(&self, b: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize) -> bool {
+        self.arch.starts_with("gfx11")
+            && head_dim == 128
+            && (1..=16).contains(&b)
+            && n_kv_heads > 0
+            && n_heads % n_kv_heads == 0
+            && n_heads / n_kv_heads <= 8
+    }
+
+    /// Non-causal attention for at most 16 queries over a long F32 K/V (the
+    /// DFlash draft's shape), same layout and contract as
+    /// [`Self::attention_dflash_wmma_f32`]. One workgroup per (KV head, key
+    /// range): its waves are the GQA query heads and share each staged K/V
+    /// tile, and the key ranges merge by log-sum-exp. 22-24x faster than the
+    /// one-wave-per-head kernel at L = 1.3k-4k on gfx1100 (32/8 heads, hd 128).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_dflash_gqa_split_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        partials: &GpuTensor,
+        b: usize,
+        l: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        assert!(
+            self.attention_dflash_gqa_split_admitted(b, n_heads, n_kv_heads, head_dim) && l > 0,
+            "attention_dflash_gqa_split_f32: unsupported shape b={b} l={l} heads={n_heads}/{n_kv_heads} hd={head_dim} on {}",
+            self.arch
+        );
+        assert!(partials.numel() >= Self::attention_dflash_gqa_split_partials(b, n_heads));
+        self.bind_thread()?;
+        const SPLIT: &str = "attention_dflash_gqa_split_f32";
+        const MERGE: &str = "attention_dflash_split_merge";
+        self.ensure_kernel(SPLIT, kernels::ATTENTION_DFLASH_GQA_SPLIT_SRC, SPLIT)?;
+        self.ensure_kernel(MERGE, kernels::ATTENTION_DFLASH_GQA_SPLIT_SRC, MERGE)?;
+        // At least 4 key tiles per workgroup; beyond 128 tiles the split
+        // count stays at the cap and each range grows.
+        let tiles = l.div_ceil(16);
+        let tiles_per_split = tiles.div_ceil(Self::DFLASH_GQA_SPLIT_MAX).max(4);
+        let n_splits = tiles.div_ceil(tiles_per_split);
+        let rep = n_heads / n_kv_heads;
+        let (qp, kp, vp, pp, op) = (q.buf.as_ptr(), k.buf.as_ptr(), v.buf.as_ptr(), partials.buf.as_ptr(), out.buf.as_ptr());
+        let (bi, li, nh, nkv) = (b as i32, l as i32, n_heads as i32, n_kv_heads as i32);
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let tps = tiles_per_split as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &bi as *const _ as *mut c_void,
+            &li as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+            &tps as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(SPLIT, [n_kv_heads as u32, n_splits as u32, 1], [32 * rep as u32, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(qp);
+            blob.push_ptr(kp);
+            blob.push_ptr(vp);
+            blob.push_ptr(pp);
+            blob.push_i32(bi);
+            blob.push_i32(li);
+            blob.push_i32(nh);
+            blob.push_i32(nkv);
+            blob.push_f32(scale);
+            blob.push_i32(tps);
+            blob
+        })?;
+        let (hd, ns) = (head_dim as i32, n_splits as i32);
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ns as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(MERGE, [n_heads as u32, b as u32, 1], [head_dim as u32, 1, 1], 0, &mut params, || {
+            let mut blob = hip_bridge::KernargBlob::new();
+            blob.push_ptr(pp);
+            blob.push_ptr(op);
+            blob.push_i32(nh);
+            blob.push_i32(hd);
+            blob.push_i32(ns);
+            blob
+        })
+    }
+
     /// FlashAttention-style WMMA with M=32 query tile (vs M=16 in
     /// `attention_dflash_wmma_f32`). Two waves per block; doubles the
     /// queries served per K-tile load, halving global-memory K

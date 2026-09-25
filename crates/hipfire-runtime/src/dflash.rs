@@ -1225,6 +1225,9 @@ pub struct DflashScratch {
     pub up: GpuTensor,       // [B, intermediate]
     pub gate_up: GpuTensor,  // [B, intermediate]
     pub attn_out: GpuTensor, // [B, q_dim]
+    /// Per-(query, head, key range) partials of the split-key attention
+    /// (`Gpu::attention_dflash_gqa_split_f32`).
+    pub attn_partials: GpuTensor,
     /// Shared residual plane. Attention and FFN consume it sequentially,
     /// including under the per-layer FFN graph, so separate planes only pin
     /// another B×hidden allocation without enabling overlap.
@@ -1483,6 +1486,8 @@ impl DflashScratch {
             up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
             gate_up: gpu.alloc_tensor(&[b * inter], DType::F32)?,
             attn_out: gpu.alloc_tensor(&[b * qd], DType::F32)?,
+            attn_partials: gpu
+                .alloc_tensor(&[rdna_compute::Gpu::attention_dflash_gqa_split_partials(b, cfg.n_heads)], DType::F32)?,
             residual: gpu.alloc_tensor(&[b * h], DType::F32)?,
 
             target_hidden: gpu.alloc_tensor(&[l * ne * h], DType::F32)?,
@@ -1560,6 +1565,7 @@ impl DflashScratch {
         let _ = gpu.free_tensor(self.up);
         let _ = gpu.free_tensor(self.gate_up);
         let _ = gpu.free_tensor(self.attn_out);
+        let _ = gpu.free_tensor(self.attn_partials);
         let _ = gpu.free_tensor(self.residual);
         let _ = gpu.free_tensor(self.target_hidden);
         let _ = gpu.free_tensor(self.target_hidden_proj);
@@ -2859,6 +2865,19 @@ pub fn draft_forward_opts(
                 hd,
                 span,
                 swa_w,
+            )?;
+        } else if gpu.attention_dflash_gqa_split_admitted(b, cfg.n_heads, cfg.n_kv_heads, hd) {
+            gpu.attention_dflash_gqa_split_f32(
+                &scratch.q,
+                k_cat_l,
+                v_cat_l,
+                &scratch.attn_out,
+                &scratch.attn_partials,
+                b,
+                span + b,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                hd,
             )?;
         } else {
             use crate::llama::{attention_family, DispatchCtx, FullAttnParams, KernelKey};

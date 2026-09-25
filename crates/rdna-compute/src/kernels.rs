@@ -5679,6 +5679,10 @@ pub const QKV_SPLIT_INTERLEAVED_SRC: &str =
 /// block `[32]`. See `kernels/src/attention_dflash_wmma.hip`.
 pub const ATTENTION_DFLASH_WMMA_SRC: &str =
     include_str!("../../../kernels/src/attention_dflash_wmma.hip");
+/// Split-key GQA attention for at most 16 queries (the DFlash draft), plus
+/// its log-sum-exp merge. See `kernels/src/attention_dflash_wmma_split.hip`.
+pub const ATTENTION_DFLASH_GQA_SPLIT_SRC: &str =
+    include_str!("../../../kernels/src/attention_dflash_wmma_split.hip");
 
 /// gfx12/RDNA4 sister of `ATTENTION_DFLASH_WMMA_SRC`. Same algorithm; the
 /// WMMA fragments use `half8_t` operands + the `_w32_gfx12` intrinsic (the
