@@ -271,6 +271,20 @@ static __device__ __forceinline__ void ptq1_bf16_row(
     if (tid == 0) y[row] = sum;
 }
 
+// Y[N x M] = X[N x K] W^T with one wave per (row, token): every output is
+// ptq1_bf16_row's for that token, so a verify batch matches the decode GEMV's
+// BF16 rows bit for bit. Grid [M, N], block [32].
+__launch_bounds__(32)
+extern "C" __global__ void gemm_bf16_xf32_rows(
+    const unsigned short* __restrict__ W,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int M, int K
+) {
+    const int tok = blockIdx.y;
+    ptq1_bf16_row(W, X + (long long)tok * K, Y + (long long)tok * M, blockIdx.x, K);
+}
+
 // Up to three PTQ1 matrices that read the same activation (qkv+z, q+k+v,
 // gate+up) in one launch, so the short matrices share one ramp and tail and
 // the launch count drops. Segment i owns ceil(M_i / PTQ1_WG_ROWS) blocks, in
