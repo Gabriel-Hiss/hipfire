@@ -106,39 +106,47 @@ __global__ void gemm_ptq1g128_wmma_t64(
             for (int e = 0; e < 8; ++e) acc[i][j][e] = 0.0f;
 
     for (int g = 0; g < groups; ++g) {
-        // Weights: 64 rows x 7 dwords decoded as units u = tid + 128 i with
-        // dword k = u / 64 and row u % 64. Trit words land in the element
-        // order the vec_dot traversal defines: qs[0..15] digit t -> elements
-        // 16t + m, qs[16..23] -> 80 + 8t + m, qh -> 120 + 2t + h.
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            const int u = tid + 128 * i;
-            if (u < T64_ROWS * 7) {
-                const int k = u >> 6;
-                const int r = u & 63;
-                const int arow = min(row0 + r, M - 1);
-                const unsigned w =
-                    ((const unsigned*)(A + (long long)arow * groups * 28))[g * 7 + k];
-                unsigned* dst = a_lds + r * T64_STRIDE;
-                if (k < 6) {
+        // Weights: waves 0-1 (tid < 64) decode dwords 0-3 of row tid, waves
+        // 2-3 dwords 4-6 of row tid - 64. Each lane loads its dwords as one
+        // contiguous run and no wave diverges.
+        {
+            const int r = tid & 63;
+            const int arow = min(row0 + r, M - 1);
+            const unsigned* q = (const unsigned*)(A + (long long)arow * groups * 28) + g * 7;
+            unsigned* dst = a_lds + r * T64_STRIDE;
+            if (tid < 64) {
+                unsigned w[4];
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) w[k] = q[k];
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) {
                     unsigned D[5];
-                    t64_digits5(w, D);
+                    t64_digits5(w[k], D);
                     #pragma unroll
-                    for (int t = 0; t < 5; ++t)
-                        dst[k < 4 ? 4 * t + k : 20 + 2 * t + (k - 4)] = t64_signed(D[t]);
-                } else {
-                    unsigned v = __builtin_amdgcn_perm(0u, w, 0x0c010c00u); // [qh0, 0, qh1, 0]
-                    #pragma unroll
-                    for (int t = 0; t < 4; t += 2) {
-                        const unsigned w0 = v * 3u;
-                        v = w0 & 0x00FF00FFu;
-                        const unsigned w1 = v * 3u;
-                        v = w1 & 0x00FF00FFu;
-                        dst[30 + t / 2] = t64_signed(__builtin_amdgcn_perm(w1, w0, 0x07050301u));
-                    }
-                    const unsigned short bits = (unsigned short)(w >> 16);
-                    dw_lds[r] = (float)(*(const _Float16*)&bits);
+                    for (int t = 0; t < 5; ++t) dst[4 * t + k] = t64_signed(D[t]);
                 }
+            } else {
+                unsigned w[3];
+                #pragma unroll
+                for (int k = 0; k < 3; ++k) w[k] = q[4 + k];
+                #pragma unroll
+                for (int k = 0; k < 2; ++k) {
+                    unsigned D[5];
+                    t64_digits5(w[k], D);
+                    #pragma unroll
+                    for (int t = 0; t < 5; ++t) dst[20 + 2 * t + k] = t64_signed(D[t]);
+                }
+                unsigned v = __builtin_amdgcn_perm(0u, w[2], 0x0c010c00u);
+                #pragma unroll
+                for (int t = 0; t < 4; t += 2) {
+                    const unsigned w0 = v * 3u;
+                    v = w0 & 0x00FF00FFu;
+                    const unsigned w1 = v * 3u;
+                    v = w1 & 0x00FF00FFu;
+                    dst[30 + t / 2] = t64_signed(__builtin_amdgcn_perm(w1, w0, 0x07050301u));
+                }
+                const unsigned short bits = (unsigned short)(w[2] >> 16);
+                dw_lds[r] = (float)(*(const _Float16*)&bits);
             }
         }
         // Activations: 64 tokens of 128 int8 plus the four sub-block scales.
