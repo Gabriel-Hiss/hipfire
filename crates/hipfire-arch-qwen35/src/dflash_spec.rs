@@ -617,6 +617,9 @@ pub struct DflashSpeculator {
     resume_enabled: bool,
     ck_interval: usize,
     ck_cap: usize,
+    /// One-shot forced checkpoint position for the next `prefill`
+    /// (see [`Speculator::set_turn_checkpoint`]).
+    turn_ckpt: Option<usize>,
     /// Greedy-only CPU PLD → DFlash cascade. `None` = disabled: `step`
     /// passes `pld_spine=None` and `name()` reports `"dflash"`.
     pld: Option<PldCascade>,
@@ -647,6 +650,7 @@ impl DflashSpeculator {
             resume_enabled,
             ck_interval,
             ck_cap,
+            turn_ckpt: None,
             pld: None,
             last_window: None,
         }
@@ -690,6 +694,9 @@ impl Speculator for DflashSpeculator {
             "dflash"
         }
     }
+    fn set_turn_checkpoint(&mut self, pos: Option<usize>) {
+        self.turn_ckpt = pos;
+    }
     fn prefill(
         &mut self,
         gpu: &mut Gpu,
@@ -721,6 +728,7 @@ impl Speculator for DflashSpeculator {
         // `prefill_start`, reusing the prior turn's KV + recurrent state; miss →
         // seed the full prompt (the seed fn resets target state itself).
         let (ck_interval, ck_cap) = (self.ck_interval, self.ck_cap);
+        let turn_ckpt = self.turn_ckpt.take();
         let ckpt_sink = if self.resume_enabled {
             Some(&mut self.checkpoints)
         } else {
@@ -737,6 +745,7 @@ impl Speculator for DflashSpeculator {
                 ckpt_sink,
                 ck_interval,
                 ck_cap,
+                turn_ckpt,
             )
         } else {
             seed_target_hidden_from_prompt_abortable(
@@ -749,6 +758,7 @@ impl Speculator for DflashSpeculator {
                 ckpt_sink,
                 ck_interval,
                 ck_cap,
+                turn_ckpt,
             )
         }
         .map_err(|e| e.to_string())?;
@@ -883,6 +893,7 @@ impl Speculator for DflashSpeculator {
             None,
             self.ck_interval,
             self.ck_cap,
+            None,
         )
         .map_err(|e| e.to_string())?;
         if aborted {

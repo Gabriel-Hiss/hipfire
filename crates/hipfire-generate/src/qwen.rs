@@ -2907,7 +2907,18 @@ pub fn generate_spec(
             return None;
         }
     };
+    // Checkpoint the recurrent state at the final `<|im_start|>` (this turn's
+    // assistant opener). The next request re-renders this turn from history,
+    // which diverges right after the opener, so resuming here replays only the
+    // assistant turn and the new messages instead of up to a checkpoint interval.
+    let turn_ckpt = m
+        .tokenizer
+        .as_ref()
+        .and_then(|tok| tok.special_token_id("<|im_start|>"))
+        .and_then(|id| prompt_tokens.iter().rposition(|&t| t == id))
+        .filter(|&q| q > 0);
     let spec = m.speculator.as_mut().unwrap();
+    spec.set_turn_checkpoint(turn_ckpt);
 
     // Divergent-render RESUME: restore the drafter-local + target recurrent
     // state to the latest checkpoint ≤ ckpt and drop the now-stale tail of the

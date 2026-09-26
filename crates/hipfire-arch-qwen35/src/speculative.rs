@@ -7413,6 +7413,9 @@ pub fn seed_target_hidden_from_prompt_abortable(
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    // Absolute position that gets a checkpoint regardless of `ckpt_interval`
+    // (a chunk boundary is cut there). See `Speculator::set_turn_checkpoint`.
+    force_ckpt_at: Option<usize>,
 ) -> HipResult<bool> {
     target.reset_state(gpu)?;
     target_hidden_host.clear();
@@ -7435,7 +7438,10 @@ pub fn seed_target_hidden_from_prompt_abortable(
             }
             return Ok(true);
         }
-        let end = (seq_pos + chunk_max).min(prompt_tokens.len());
+        let mut end = (seq_pos + chunk_max).min(prompt_tokens.len());
+        if let Some(force) = force_ckpt_at.filter(|&f| f > seq_pos && f < end) {
+            end = force;
+        }
         let chunk = &prompt_tokens[seq_pos..end];
         qwen35::forward_prefill_batch(
             gpu,
@@ -7455,7 +7461,8 @@ pub fn seed_target_hidden_from_prompt_abortable(
         target_hidden_host.extend_from_slice(&block);
         seq_pos = end;
         if let Some(cks) = checkpoints.as_deref_mut() {
-            take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+            let interval = if force_ckpt_at == Some(seq_pos) { 0 } else { ckpt_interval };
+            take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, interval, ckpt_cap);
         }
     }
     Ok(false)
@@ -7493,6 +7500,7 @@ pub fn seed_target_hidden_suffix_abortable(
     mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
     ckpt_interval: usize,
     ckpt_cap: usize,
+    force_ckpt_at: Option<usize>,
 ) -> HipResult<bool> {
     let chunk_max = qwen35::PREFILL_MAX_BATCH;
     let mut off: usize = 0;
@@ -7501,7 +7509,10 @@ pub fn seed_target_hidden_suffix_abortable(
         if abort_check() {
             return Ok(true);
         }
-        let end = (off + chunk_max).min(suffix.len());
+        let mut end = (off + chunk_max).min(suffix.len());
+        if let Some(force) = force_ckpt_at.filter(|&f| f > pos && f < pos + (end - off)) {
+            end = off + (force - pos);
+        }
         let chunk = &suffix[off..end];
         qwen35::forward_prefill_batch(
             gpu,
@@ -7520,7 +7531,8 @@ pub fn seed_target_hidden_suffix_abortable(
         pos += chunk.len();
         off = end;
         if let Some(cks) = checkpoints.as_deref_mut() {
-            take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+            let interval = if force_ckpt_at == Some(pos) { 0 } else { ckpt_interval };
+            take_dn_checkpoint(cks, &target.dn_state, gpu, pos, interval, ckpt_cap);
         }
     }
     Ok(false)

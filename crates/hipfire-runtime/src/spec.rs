@@ -668,6 +668,14 @@ pub trait Speculator {
         abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String>;
 
+    /// Absolute prompt position the next [`Self::prefill`] must checkpoint
+    /// exactly: the start of the final assistant-turn opener. Chat clients
+    /// re-render the prior assistant turn differently from the generated
+    /// stream, so the following request diverges just past this point; a
+    /// checkpoint here lets it resume instead of replaying up to a full
+    /// checkpoint interval. Consumed by the next `prefill`. Default: ignored.
+    fn set_turn_checkpoint(&mut self, _pos: Option<usize>) {}
+
     /// Whether this speculator's verify is distribution-correct at temp>0 (so the
     /// daemon may route temp>0 requests through it for the spec speedup). Default
     /// `false` — greedy-only drafters (n-gram, chain DFlash, MTP) keep temp>0 on

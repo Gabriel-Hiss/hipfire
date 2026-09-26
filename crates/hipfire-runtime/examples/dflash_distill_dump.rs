@@ -171,6 +171,7 @@ fn main() {
                     None,
                     0,
                     0,
+                    None,
                 )
                 .expect("prefill");
                 assert_eq!(host.len(), seq.len() * layers.len() * dim);
