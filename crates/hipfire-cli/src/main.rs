@@ -73,6 +73,7 @@ pub(crate) const MODEL_SUFFIXES: &[&str] = &[
     ".mq5",
     ".mq6",
     ".mfp4",
+    ".ptq1",
     ".q8",
 ];
 const BUILD_COMMIT: &str = env!("HIPFIRE_BUILD_COMMIT");
