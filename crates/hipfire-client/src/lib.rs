@@ -1119,6 +1119,15 @@ impl Engine {
     pub fn child_id(&self) -> u32 {
         self.inner.child.lock().unwrap().id()
     }
+
+    /// Kill the daemon process and wait for it to exit, so a replacement can
+    /// take the daemon singleton lock. Every clone of this engine is unusable
+    /// afterwards.
+    pub fn shutdown(&self) {
+        let mut child = self.inner.child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 impl Drop for EngineInner {

@@ -77,6 +77,9 @@ pub(crate) struct ServePidRecord {
 
 pub(crate) struct ServeRuntime {
     pub(crate) engine: Engine,
+    /// Daemon binary and process policy, kept to respawn `engine` on unload.
+    pub(crate) daemon: PathBuf,
+    pub(crate) process_config: hipfire_config::ProcessConfig,
     pub(crate) paths: Paths,
     pub(crate) registry: RegistryV1,
     pub(crate) current_path: Option<PathBuf>,
@@ -936,6 +939,8 @@ pub(crate) fn serve_foreground(
         metrics: metrics::Metrics::default(),
         runtime: Mutex::new(ServeRuntime {
             engine,
+            daemon: daemon.clone(),
+            process_config: process_config.clone(),
             paths: paths.clone(),
             registry: registry.clone(),
             current_path: None,
@@ -1048,36 +1053,9 @@ pub(crate) fn serve_foreground(
             if !expired {
                 continue;
             }
-            let unloaded = {
-                let mut runtime = shared
-                    .runtime
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                if runtime.current_path.is_some() {
-                    let result = runtime.engine.unload();
-                    if result.is_ok() {
-                        runtime.current_path = None;
-                        runtime.current_arch = None;
-                        runtime.current_reasoning_contract =
-                            saddle_core::caps::ReasoningContract::Unsupported;
-                        runtime.current_reasoning_effort_native = false;
-                        runtime.current_reasoning_efforts = Vec::new();
-                        runtime.current_max_seq = 0;
-                        runtime.cache_capable = false;
-                    }
-                    result
-                } else {
-                    Ok(())
-                }
-            };
-            if unloaded.is_ok() {
-                let mut meta = shared
-                    .meta
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                meta.current_model = None;
-                meta.loading_model = None;
-                meta.last_activity = Instant::now();
+            if let Err(error) = unload_current_model(&shared) {
+                eprintln!("[hipfire] idle unload failed: {error:#}");
+            } else {
                 eprintln!("[hipfire] unloaded idle model");
             }
         });
@@ -1088,6 +1066,44 @@ pub(crate) fn serve_foreground(
     ))?;
     let _ = fs::remove_file(pid_path);
     Ok(())
+}
+
+/// Unload the resident model by replacing the daemon with a fresh process and
+/// reset the per-model runtime state. After an in-process daemon `unload` of
+/// Bonsai 27B on gfx1100 the daemon still held ~2.7 GB of VRAM; process exit
+/// returns all of it. Returns the model name that was resident, or `None` when
+/// nothing was loaded. Shared by the idle-timeout thread and `POST /v1/unload`.
+pub(crate) fn unload_current_model(shared: &ServeShared) -> Result<Option<String>> {
+    {
+        let mut runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if runtime.current_path.is_some() {
+            runtime.current_path = None;
+            runtime.current_arch = None;
+            runtime.current_reasoning_contract = saddle_core::caps::ReasoningContract::Unsupported;
+            runtime.current_reasoning_effort_native = false;
+            runtime.current_reasoning_efforts = Vec::new();
+            runtime.current_max_seq = 0;
+            runtime.cache_capable = false;
+            // The daemon is a singleton: the old process must exit before the
+            // replacement starts.
+            runtime.engine.shutdown();
+            let fresh =
+                Engine::spawn_configured(&runtime.daemon, &BTreeMap::new(), &runtime.process_config)?;
+            fresh.ping()?;
+            runtime.engine = fresh;
+        }
+    }
+    let mut meta = shared
+        .meta
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let previous = meta.current_model.take();
+    meta.loading_model = None;
+    meta.last_activity = Instant::now();
+    Ok(previous)
 }
 
 pub(crate) fn format_bind(host: &str, port: u16) -> String {

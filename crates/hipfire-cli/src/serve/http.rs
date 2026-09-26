@@ -517,6 +517,28 @@ async fn handle_request(
             });
             json_response(body, 200)
         }
+        (Method::POST, "/v1/unload") => {
+            // Frees the resident model (and its prompt cache) from VRAM. Clients
+            // call it when their agent run ends; the next request reloads.
+            if shared.admission.inflight() != 0 {
+                return openai_error("unload refused: requests in flight", 409);
+            }
+            let unload_shared = Arc::clone(&shared);
+            match tokio::task::spawn_blocking(move || {
+                crate::serve::unload_current_model(&unload_shared)
+            })
+            .await
+            {
+                Ok(Ok(model)) => {
+                    if let Some(model) = &model {
+                        eprintln!("[hipfire] unloaded {model} on client request");
+                    }
+                    json_response(serde_json::json!({ "unloaded": model }), 200)
+                }
+                Ok(Err(error)) => openai_error(&format!("unload failed: {error:#}"), 500),
+                Err(error) => openai_error(&format!("unload task failed: {error}"), 500),
+            }
+        }
         (Method::OPTIONS, _) => {
             let mut resp = Response::builder()
                 .status(204)

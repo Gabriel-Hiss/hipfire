@@ -8888,6 +8888,8 @@ mod tests {
                 metrics: crate::serve::metrics::Metrics::default(),
                 runtime: Mutex::new(ServeRuntime {
                     engine,
+                    daemon: daemon.clone(),
+                    process_config: process_config.clone(),
                     paths: paths.clone(),
                     registry,
                     current_path: None,
